@@ -40,6 +40,17 @@ class BootConfig(BaseModel):
         )
 
 
+def check_path_template(v: str) -> str:
+    v = v.strip().strip("/")
+    if "{slug}" not in v:
+        raise ValueError("路径模板必须包含 {slug}，否则不同影片会互相覆盖")
+    try:
+        v.format(slug="x", code="x", actor="x", year="x")
+    except (KeyError, IndexError, ValueError) as e:
+        raise ValueError(f"路径模板无效：{e}") from e
+    return v
+
+
 class Settings(BaseModel):
     """运行时设置。字段说明会显示在 Web 设置页。"""
 
@@ -60,15 +71,14 @@ class Settings(BaseModel):
     max_attempts: int = Field(5, ge=1, le=20, description="单个任务最多尝试次数")
     retry_base_delay: int = Field(30, ge=1, le=3600, description="首次重试等待（秒），之后每次 ×4，上限 2 小时")
     # 任务
-    fetch_detail: bool = Field(True, description="列表任务是否继续抓详情页（女优、标签、上市日期、封面）")
-    incremental_interval: int = Field(60, ge=0, description="定时增量间隔（分钟），0 关闭")
-    incremental_stop_after_known: int = Field(48, ge=1, description="增量时连续遇到多少部已入库影片就停止")
-    incremental_max_pages: int = Field(20, ge=1, description="单次增量最多翻多少页")
+    fetch_detail: bool = Field(True, description="新建列表任务和订阅时，默认是否抓详情页（女优、标签、上市日期、封面）")
     # 输出
-    output_dir: str = Field("", description="strm 输出目录；留空使用 JABLE_OUTPUT_DIR 或 数据目录/strm")
+    output_dir: str = Field(
+        "", description="输出根目录，各输出库的相对目录都在它下面；留空使用 JABLE_OUTPUT_DIR 或 数据目录/strm"
+    )
     path_template: str = Field(
         "{slug}/{slug}",
-        description="输出路径模板（不含扩展名），必须包含 {slug}；可用变量 {slug} {code} {actor} {year}",
+        description="默认路径模板（不含扩展名，输出库可单独覆盖），必须包含 {slug}；可用变量 {slug} {code} {actor} {year}",
     )
     write_nfo: bool = Field(True, description="写 nfo（Kodi 格式，Emby/Jellyfin 通用）")
     download_cover: bool = Field(True, description="下载封面 fanart")
@@ -104,14 +114,7 @@ class Settings(BaseModel):
     @field_validator("path_template")
     @classmethod
     def _check_template(cls, v: str) -> str:
-        v = v.strip().strip("/")
-        if "{slug}" not in v:
-            raise ValueError("路径模板必须包含 {slug}，否则不同影片会互相覆盖")
-        try:
-            v.format(slug="x", code="x", actor="x", year="x")
-        except (KeyError, IndexError, ValueError) as e:
-            raise ValueError(f"路径模板无效：{e}") from e
-        return v
+        return check_path_template(v)
 
     @field_validator("public_base_url", "solver_url", "proxy")
     @classmethod

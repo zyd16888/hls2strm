@@ -1,6 +1,8 @@
 import asyncio
 import time
 
+import pytest
+
 from jable_strm.engine import Engine
 from jable_strm.fetcher import Blocked, FetchError
 from jable_strm.observability import Metrics
@@ -36,7 +38,6 @@ def model_fixture():
 def test_list_job_writes_strm_nfo_and_covers(make_store, boot):
     async def run():
         db, store = await make_store()
-        await store.update({"incremental_interval": 0})
         html, ids = model_fixture()
         fetcher = FakeFetcher(html, ids)
         engine = build(db, store, boot, fetcher)
@@ -51,7 +52,7 @@ def test_list_job_writes_strm_nfo_and_covers(make_store, boot):
         stats = await db.video_stats()
         assert stats["total"] == 24 and stats["with_detail"] == 24 and stats["with_strm"] == 24 and stats["with_cover"] == 24
         for slug in ids:
-            d = store.output_dir / slug.upper()
+            d = store.output_dir / "全部" / slug.upper()
             assert (d / f"{slug.upper()}.strm").read_text().strip() == f"http://jable-strm:8080/play/{slug}.m3u8"
             assert (d / f"{slug.upper()}.nfo").exists()
             assert (d / f"{slug.upper()}-poster.jpg").exists()
@@ -65,7 +66,7 @@ def test_list_job_writes_strm_nfo_and_covers(make_store, boot):
 def test_retry_gone_and_blocked(make_store, boot):
     async def run():
         db, store = await make_store()
-        await store.update({"incremental_interval": 0, "retry_base_delay": 1, "max_attempts": 2})
+        await store.update({"retry_base_delay": 1, "max_attempts": 2})
         html, ids = model_fixture()
         slugs = list(ids)
         fetcher = FakeFetcher(html, ids)
@@ -106,7 +107,6 @@ def test_retry_gone_and_blocked(make_store, boot):
 def test_resume_after_crash(make_store, boot):
     async def run():
         db, store = await make_store()
-        await store.update({"incremental_interval": 0})
         html, ids = model_fixture()
         job_id = await db.create_job("videos", "t", {})
         await db.add_tasks(job_id, "detail", list(ids)[:3])
@@ -151,6 +151,119 @@ def test_resolver_cache_and_single_flight(make_store):
         assert len(fetcher.calls) == 3
         await r.resolve(slug, stale="https://old")
         assert len(fetcher.calls) == 3
+        await db.close()
+
+    asyncio.run(run())
+
+
+def test_libraries_and_subscription(make_store, boot):
+    async def run():
+        db, store = await make_store()
+        html, ids = model_fixture()
+        fetcher = FakeFetcher(html, ids)
+        cover_calls = []
+        orig = fetcher.get_bytes
+
+        async def counting(url, **kw):
+            if url.endswith(".jpg"):
+                cover_calls.append(url)
+            return await orig(url, **kw)
+
+        fetcher.get_bytes = counting
+        engine = build(db, store, boot, fetcher)
+        await engine.start()
+
+        # 目录校验：不能为空、不能嵌套、不能是输出根目录
+        for bad in ("", "全部/子目录", str(store.output_dir)):
+            with pytest.raises(ValueError):
+                await engine.create_library("坏库", bad)
+        lib_id = await engine.create_library("中文字幕", "中文字幕")
+
+        # 订阅：首轮全量 → initialized
+        sub_id = await db.create_subscription(name="女优", source="/models/abc/", sort="post_date",
+                                              library_id=lib_id, max_pages=5)
+        job = await wait_job(db, await engine.run_subscription(sub_id))
+        assert job["kind"] == "crawl" and job["status"] == "done"
+        assert (await db.get_subscription(sub_id))["initialized"] == 1
+        assert len(cover_calls) == 24
+        lib_dir = store.output_dir / "中文字幕"
+        assert len(list(lib_dir.glob("*/*.strm"))) == 24
+
+        # 同一批影片再进默认库：已有详情，直接带 nfo，封面硬链接，不再下载
+        job = await wait_job(db, await engine.create_crawl("/models/abc/", end_page=1))
+        assert await db.task_counts(job["id"]) == {"done": 1}
+        assert len(cover_calls) == 24
+        slug = next(iter(ids))
+        v = await db.get_video(slug)
+        assert {o["library_name"] for o in await db.get_outputs(v["id"])} == {"全部", "中文字幕"}
+        assert (store.output_dir / "全部" / slug.upper() / f"{slug.upper()}.nfo").exists()
+
+        # 增量：都已在库里，连续 48 部后停止
+        job = await wait_job(db, await engine.run_subscription(sub_id))
+        assert job["kind"] == "incremental" and job["state"]["known_streak"] >= 48
+        assert await db.task_counts(job["id"]) == {"done": 2}
+        with pytest.raises(ValueError):  # 同一订阅不能并发
+            await db.update_job(job["id"], status="running")
+            await engine.run_subscription(sub_id)
+        await db.update_job(job["id"], status="done")
+
+        # 改库目录：自动重写，文件搬到新目录
+        rewrite_id = await engine.update_library(lib_id, "中文字幕", "zh/中文字幕")
+        await wait_job(db, rewrite_id)
+        assert not lib_dir.exists()
+        assert len(list((store.output_dir / "zh" / "中文字幕").glob("*/*-poster.jpg"))) == 24
+
+        # 删除库：有订阅时不让删；删掉订阅后连文件一起删
+        with pytest.raises(ValueError):
+            await engine.delete_library(lib_id, True)
+        await db.delete_subscription(sub_id)
+        await engine.reload_libraries()
+        await wait_job(db, await engine.delete_library(lib_id, True))
+        assert lib_id not in engine.libs and not (store.output_dir / "zh").exists()
+        assert {o["library_name"] for o in await db.get_outputs(v["id"])} == {"全部"}
+        await engine.stop()
+        await db.close()
+
+    asyncio.run(run())
+
+
+def test_migrate_v1_database(boot):
+    """v1 的库（影片上直接记 strm_path，全局增量设置）升级到 v2。"""
+    import json
+    import sqlite3
+
+    from jable_strm.db import SCHEMA_V1, Database
+
+    path = boot.data_dir / "old.db"
+    conn = sqlite3.connect(path)
+    for sql in SCHEMA_V1:
+        conn.execute(sql)
+    conn.execute("INSERT INTO videos(id, slug, code, strm_path, cover_done, output_at, created_at, updated_at) "
+                 "VALUES(1, 'abc-1', 'ABC-1', '/old/ABC-1/ABC-1.strm', 1, 5, 1, 1)")
+    conn.execute("INSERT INTO settings VALUES('settings', ?)",
+                 (json.dumps({"incremental_interval": 30, "fetch_detail": False}),))
+    conn.execute("INSERT INTO jobs(kind, name, params, status, created_at) "
+                 "VALUES('crawl', '全站', '{\"full\": true}', 'done', 1)")
+    conn.commit()
+    conn.close()
+
+    async def run():
+        db = Database(path)
+        await db.open()
+        assert (await db._one("PRAGMA user_version"))[0] == 2
+        assert [l["name"] for l in await db.list_libraries()] == ["全部"]
+        out = await db.get_output(1, 1)
+        assert out["strm_path"] == "/old/ABC-1/ABC-1.strm" and out["cover_done"] == 1
+        sub = (await db.list_subscriptions())[0]
+        assert (sub["interval"], sub["detail"], sub["initialized"]) == (30, 0, 1)
+        assert "strm_path" not in await db.get_video("abc-1")
+        jobs = await db.list_jobs()
+        assert jobs[0]["kind"] == "rewrite" and jobs[0]["tasks"] == {"pending": 1}
+        await db.close()
+        # 再次打开不重复迁移
+        db = Database(path)
+        await db.open()
+        assert len(await db.list_subscriptions()) == 1
         await db.close()
 
     asyncio.run(run())

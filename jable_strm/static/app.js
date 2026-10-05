@@ -1,7 +1,7 @@
 // Jable STRM 控制台（Alpine.js）
 
 const KIND_NAMES = {
-  list: "列表页", detail: "详情页", rewrite: "重写输出",
+  list: "列表页", detail: "详情页", rewrite: "重写输出", purge: "删除库",
   crawl: "列表抓取", incremental: "增量", videos: "指定影片",
 };
 const JOB_STATUS = { running: "运行中", paused: "已暂停", done: "已完成", cancelled: "已取消" };
@@ -11,7 +11,7 @@ const LEVELS = { DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50 };
 const SETTING_GROUPS = [
   { title: "抓取", keys: ["domains", "proxy", "impersonate", "rate_per_sec", "concurrency", "request_timeout", "domain_cooldown", "solver_url", "solver_timeout"] },
   { title: "重试", keys: ["max_attempts", "retry_base_delay"] },
-  { title: "任务", keys: ["fetch_detail", "incremental_interval", "incremental_stop_after_known", "incremental_max_pages"] },
+  { title: "任务", keys: ["fetch_detail"] },
   { title: "输出", keys: ["output_dir", "path_template", "write_nfo", "download_cover", "poster_crop"] },
   { title: "播放", keys: ["public_base_url", "play_mode", "proxy_user_agents", "play_token", "hls_margin"] },
 ];
@@ -19,8 +19,7 @@ const SETTING_LABELS = {
   domains: "站点域名", proxy: "抓取代理", impersonate: "浏览器指纹", rate_per_sec: "请求速率上限",
   concurrency: "并发数", request_timeout: "请求超时", domain_cooldown: "域名冷却", solver_url: "解题服务地址",
   solver_timeout: "解题超时", max_attempts: "最大尝试次数", retry_base_delay: "首次重试间隔",
-  fetch_detail: "抓取详情", incremental_interval: "定时增量间隔", incremental_stop_after_known: "增量停止阈值",
-  incremental_max_pages: "增量最多页数", output_dir: "输出目录", path_template: "路径模板", write_nfo: "写 nfo",
+  fetch_detail: "默认抓取详情", output_dir: "输出根目录", path_template: "默认路径模板", write_nfo: "写 nfo",
   download_cover: "下载封面", poster_crop: "裁剪 poster", public_base_url: "对外地址", play_mode: "播放模式",
   proxy_user_agents: "中转 UA 片段", play_token: "播放令牌", hls_margin: "有效期余量（分钟）",
 };
@@ -31,7 +30,7 @@ function app() {
   return {
     tabs: [
       { id: "overview", name: "概览" }, { id: "jobs", name: "任务" }, { id: "videos", name: "影片库" },
-      { id: "settings", name: "设置" }, { id: "logs", name: "日志" },
+      { id: "libraries", name: "输出库与订阅" }, { id: "settings", name: "设置" }, { id: "logs", name: "日志" },
     ],
     tab: "overview",
     s: {},
@@ -39,12 +38,16 @@ function app() {
     testing: false,
     testResult: null,
     meta: { presets: [], sorts: {} },
-    form: { kind: "list", source: "", sort: "post_date", start_page: 1, end_page: 0, detail: true, urls: "" },
+    form: { kind: "list", source: "", sort: "post_date", start_page: 1, end_page: 0, detail: true, urls: "", library_id: 1 },
+    libraries: [],
+    subscriptions: [],
+    libForm: {},
+    subForm: {},
     jobs: [],
     openJobId: null,
     taskFilter: "failed",
     tasks: [],
-    vq: { q: "", filter: "", page: 1, size: 50 },
+    vq: { q: "", filter: "", page: 1, size: 50, library_id: 0 },
     videos: { items: [], total: 0 },
     settings: {},
     draft: {},
@@ -69,6 +72,9 @@ function app() {
         if (this.tabs.some(t => t.id === h)) this.go(h);
       });
       this.meta = await this.get("/api/meta").catch(() => this.meta);
+      this.resetLibForm();
+      this.resetSubForm();
+      this.loadLibraries();
       this.refreshStatus();
       this.onTab();
       this.connectLogs();
@@ -81,8 +87,9 @@ function app() {
       this.onTab();
     },
     onTab() {
-      if (this.tab === "jobs") this.loadJobs();
-      if (this.tab === "videos") this.loadVideos();
+      if (this.tab === "jobs") { this.loadJobs(); this.loadLibraries(); }
+      if (this.tab === "videos") { this.loadVideos(); this.loadLibraries(); }
+      if (this.tab === "libraries") { this.loadLibraries(); this.loadSubs(); }
       if (this.tab === "settings") this.loadSettings();
       if (this.tab === "logs") this.$nextTick(() => this.scrollLogs(true));
     },
@@ -90,6 +97,7 @@ function app() {
       if (document.hidden) return;
       this.refreshStatus();
       if (this.tab === "jobs") { this.loadJobs(); if (this.openJobId) this.loadTasks(); }
+      if (this.tab === "libraries") { this.loadLibraries(); this.loadSubs(); }
     },
 
     // ---- HTTP ----
@@ -133,7 +141,6 @@ function app() {
       finally { this.testing = false; }
     },
     async quickJob(kind, extra = {}) {
-      if (kind === "full" && !confirm("全站约 3.9 万部：列表约 30 分钟，详情约 11 小时（每秒 1 次）。中途可以暂停或重启，会自动续跑。确定开始？")) return;
       if (kind === "rewrite" && !confirm("按当前设置重写全部 strm / nfo？")) return;
       const r = await this.post("/api/jobs", { kind, ...extra });
       this.notify(`已创建任务 #${r.id}`);
@@ -145,21 +152,18 @@ function app() {
     async loadJobs() { this.jobs = await this.get("/api/jobs").catch(() => this.jobs); },
     jobHint() {
       return {
-        full: "从最新更新翻完全部页：先写 strm，再逐个补详情（女优、标签、上市日期、封面）。",
-        incremental: "从最新更新第 1 页往后翻，连续遇到已入库影片就停。跑完全站后会按设置定时自动执行。",
-        list: "分类 /categories/xxx/、标签 /tags/xxx/、女优 /models/xxx/、搜索 /search/关键词/、热门 /hot/ 都可以，直接粘贴站点网址也行。",
-        videos: "抓取指定影片的详情并输出，优先级高于批量任务。",
-        backfill: "为所有还没有详情的影片排队抓详情。",
-        rewrite: "修改对外地址、播放模式、令牌或路径模板后，用它重写已有的 strm / nfo（不联网）。",
+        list: "一次性抓取某个列表并输出到所选的库。分类 /categories/xxx/、标签 /tags/xxx/、女优 /models/xxx/、搜索 /search/关键词/、热门 /hot/ 都可以，直接粘贴站点网址也行。需要定时更新请用「输出库与订阅」里的订阅；全站抓取就是默认订阅的首轮全量。",
+        videos: "抓取指定影片的详情并加入所选的库，优先级高于批量任务。",
+        backfill: "为所有还没有详情的影片排队抓详情，写入它们所在的各个库。",
+        rewrite: "修改对外地址、播放模式、令牌或路径模板后，用它重写已有的 strm / nfo（不联网），路径变了会搬动文件。",
       }[this.form.kind];
     },
     async createJob() {
       const f = this.form;
       const body = { kind: f.kind };
-      if (f.kind === "list") Object.assign(body, { source: f.source, sort: f.sort, start_page: f.start_page || 1, end_page: f.end_page || 0 });
-      if (["full", "list"].includes(f.kind)) body.detail = f.detail;
+      if (f.kind === "list") Object.assign(body, { source: f.source, sort: f.sort, start_page: f.start_page || 1, end_page: f.end_page || 0, detail: f.detail });
       if (f.kind === "videos") body.urls = f.urls;
-      if (f.kind === "full") return this.quickJob("full", { detail: f.detail });
+      if (["list", "videos", "rewrite"].includes(f.kind) && f.library_id) body.library_id = f.library_id;
       const r = await this.post("/api/jobs", body);
       this.notify(`已创建任务 #${r.id}`);
       this.loadJobs();
@@ -206,6 +210,7 @@ function app() {
     // ---- 影片 ----
     async loadVideos() {
       const p = new URLSearchParams({ q: this.vq.q, filter: this.vq.filter, page: this.vq.page, size: this.vq.size });
+      if (this.vq.library_id) p.set("library_id", this.vq.library_id);
       this.videos = await this.get("/api/videos?" + p).catch(() => this.videos);
     },
     async refreshVideo(v) {
@@ -274,6 +279,68 @@ function app() {
     closePlayer() {
       if (this.hls) { this.hls.destroy(); this.hls = null; }
       this.player = null;
+    },
+
+    // ---- 输出库与订阅 ----
+    async loadLibraries() { this.libraries = await this.get("/api/libraries").catch(() => this.libraries); },
+    async loadSubs() { this.subscriptions = await this.get("/api/subscriptions").catch(() => this.subscriptions); },
+    resetLibForm() { this.libForm = { id: null, name: "", dir: "", path_template: "" }; },
+    editLibrary(l) { this.libForm = { id: l.id, name: l.name, dir: l.dir, path_template: l.path_template }; },
+    async saveLibrary() {
+      const f = this.libForm, body = { name: f.name, dir: f.dir, path_template: f.path_template };
+      try {
+        const r = f.id ? await this.req("PUT", `/api/libraries/${f.id}`, body) : await this.req("POST", "/api/libraries", body);
+        this.notify(f.id ? (r.rewrite_job_id ? `已保存，重写任务 #${r.rewrite_job_id} 会把文件搬到新位置` : "已保存") : "已新建输出库");
+        this.resetLibForm();
+        this.loadLibraries();
+      } catch (e) { this.notify(e.message, true); }
+    },
+    async deleteLibrary(l) {
+      if (!confirm(`删除输出库「${l.name}」？`)) return;
+      const files = confirm(`同时删除「${l.name}」目录下本程序生成的 ${l.videos} 部影片的文件吗？\n确定 = 删除文件；取消 = 只删记录，保留文件`);
+      try {
+        const r = await this.req("DELETE", `/api/libraries/${l.id}?delete_files=${files}`);
+        this.notify(`已排队删除任务 #${r.job_id}`);
+        setTimeout(() => this.loadLibraries(), 1500);
+      } catch (e) { this.notify(e.message, true); }
+    },
+    resetSubForm() {
+      this.subForm = { id: null, name: "", source: "", sort: "post_date", library_id: 1, interval: 60, stop_after_known: 48,
+                       max_pages: 20, detail: true, enabled: true, initial_full: true };
+    },
+    editSub(sub) {
+      this.subForm = { id: sub.id, name: sub.name, source: sub.source, sort: sub.sort, library_id: sub.library_id,
+                       interval: sub.interval, stop_after_known: sub.stop_after_known, max_pages: sub.max_pages,
+                       detail: !!sub.detail, enabled: !!sub.enabled, initial_full: false };
+    },
+    async saveSub() {
+      const { id, ...body } = this.subForm;
+      try {
+        if (id) await this.req("PUT", `/api/subscriptions/${id}`, body);
+        else await this.req("POST", "/api/subscriptions", body);
+        this.notify(id ? "订阅已保存" : "订阅已新建");
+        this.resetSubForm();
+        this.loadSubs();
+        this.refreshStatus();
+      } catch (e) { this.notify(e.message, true); }
+    },
+    async deleteSub(sub) {
+      if (!confirm(`删除订阅「${sub.name}」？（不影响已输出的文件）`)) return;
+      try { await this.req("DELETE", `/api/subscriptions/${sub.id}`); this.loadSubs(); this.refreshStatus(); }
+      catch (e) { this.notify(e.message, true); }
+    },
+    async runSub(sub, mode) {
+      if (mode === "full" && !confirm(`对订阅「${sub.name}」跑一轮全量（翻完全部页）？全站约 3.9 万部：列表约 30 分钟，详情约 11 小时。中途可以暂停或重启，会自动续跑。`)) return;
+      const r = await this.post(`/api/subscriptions/${sub.id}/run?mode=${mode}`);
+      this.notify(`已创建任务 #${r.job_id}`);
+      this.loadSubs();
+      this.refreshStatus();
+    },
+    subState(sub) {
+      if (sub.active_job_id) return { text: "执行中", cls: "warn" };
+      if (!sub.enabled) return { text: "已停用", cls: "" };
+      if (!sub.initialized) return { text: "未跑首轮全量", cls: "" };
+      return { text: sub.interval ? "定时增量" : "仅手动", cls: "ok" };
     },
 
     // ---- 设置 ----

@@ -1,5 +1,7 @@
+import asyncio
 import io
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -42,6 +44,8 @@ class FakeFetcher:
             if slug not in self.ids:
                 raise NotFound(path)
             html = re.sub(r"videoId: '\d+'", f"videoId: '{self.ids[slug]}'", self.detail_html)
+            # 样本里的播放地址早已过期：换成「现在 + 3 小时」，模拟刚抓到的地址
+            html = re.sub(r"(/hls/[^/]+/)\d{9,11}/", rf"\g<1>{int(time.time()) + 10800}/", html)
             return Page(html, "https://fs1.app" + path, "https://fs1.app")
         return Page(self.list_html, "https://fs1.app" + path, "https://fs1.app")
 
@@ -58,11 +62,18 @@ def boot(tmp_path) -> BootConfig:
 
 @pytest.fixture
 def make_store(boot):
+    opened: list[Database] = []
+
     async def _make():
         db = Database(boot.data_dir / "test.db")
         await db.open()
+        opened.append(db)
         store = SettingsStore(boot, db)
         await store.load()
         return db, store
 
-    return _make
+    yield _make
+    # 测试中途失败时也要关库：aiosqlite 的后台线程不是守护线程，不关会让进程退出时卡住
+    for db in opened:
+        if db.conn is not None:
+            asyncio.run(db.close())

@@ -6,16 +6,18 @@ import asyncio
 import json
 import re
 import secrets
+import sqlite3
 import time
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__, sources
 from .config import Settings
+from .db import DEFAULT_LIBRARY_ID
 from .engine import snapshot_path
 from .fetcher import Blocked, FetchError, NotFound
 from .observability import ring
@@ -59,6 +61,7 @@ async def status(request: Request):
         "queue": await c.db.queue_stats(),
         "metrics": c.metrics.snapshot(),
         "failures": await c.db.recent_failures(8),
+        "subscriptions": await c.db.list_subscriptions(),
         "output_dir": str(c.store.output_dir),
         "public_base_url": c.store.public_base_url,
         "play_mode": c.store.current.play_mode,
@@ -96,13 +99,14 @@ async def fetcher_test(request: Request):
 
 
 class JobCreate(BaseModel):
-    kind: Literal["full", "incremental", "list", "videos", "backfill", "rewrite"]
+    kind: Literal["list", "videos", "backfill", "rewrite"]
     source: str = ""
     sort: str = ""
     start_page: int = 1
     end_page: int = 0
     detail: bool | None = None
     urls: str = ""
+    library_id: int | None = None
 
 
 def _parse_slugs(text: str) -> list[str]:
@@ -122,20 +126,16 @@ def _parse_slugs(text: str) -> list[str]:
 async def create_job(body: JobCreate, request: Request):
     e = _ctx(request).engine
     try:
-        if body.kind == "full":
-            job_id = await e.create_crawl(sources.LATEST, sort="post_date", detail=body.detail, name="全站：最新更新",
-                                          full=True)
-        elif body.kind == "incremental":
-            job_id = await e.create_crawl(sources.LATEST, sort="post_date", incremental=True, name="增量：最新更新")
-        elif body.kind == "list":
+        lib_id = body.library_id or DEFAULT_LIBRARY_ID
+        if body.kind == "list":
             job_id = await e.create_crawl(body.source, sort=body.sort, start_page=body.start_page,
-                                          end_page=body.end_page, detail=body.detail)
+                                          end_page=body.end_page, detail=body.detail, library_id=lib_id)
         elif body.kind == "videos":
-            job_id = await e.create_videos(_parse_slugs(body.urls))
+            job_id = await e.create_videos(_parse_slugs(body.urls), library_id=lib_id)
         elif body.kind == "backfill":
             job_id = await e.create_backfill()
         else:
-            job_id = await e.create_rewrite()
+            job_id = await e.create_rewrite(body.library_id)
     except ValueError as err:
         raise HTTPException(400, str(err)) from None
     return {"id": job_id}
@@ -193,18 +193,18 @@ def _video_view(c, v: dict) -> dict:
 
 
 @router.get("/videos")
-async def list_videos(request: Request, q: str = "", filter: str = "", page: int = 1, size: int = 50):
+async def list_videos(request: Request, q: str = "", filter: str = "", page: int = 1, size: int = 50,
+                      library_id: int | None = None):
     c = _ctx(request)
     size = max(1, min(size, 200))
-    items, total = await c.db.search_videos(q, filter, (max(page, 1) - 1) * size, size)
-    return {"items": [_video_view(c, v) for v in items], "total": total, "page": page, "size": size}
-
-
-async def _get_video(c, slug: str) -> dict:
-    v = await c.db.get_video(slug)
-    if v is None:
-        raise HTTPException(404, "影片不存在")
-    return v
+    items, total = await c.db.search_videos(q, filter, (max(page, 1) - 1) * size, size, library_id)
+    outputs = await c.db.outputs_for([v["id"] for v in items])
+    views = []
+    for v in items:
+        view = _video_view(c, v)
+        view["outputs"] = outputs.get(v["id"], [])
+        views.append(view)
+    return {"items": views, "total": total, "page": page, "size": size}
 
 
 @router.post("/videos/{slug}/refresh")
@@ -219,16 +219,137 @@ async def refresh_video(slug: str, request: Request):
         raise HTTPException(503, str(err)) from None
     except (FetchError, ParseError) as err:
         raise HTTPException(502, str(err)) from None
-    return _video_view(c, v)
+    view = _video_view(c, v)
+    view["outputs"] = await c.db.get_outputs(v["id"])
+    return view
 
 
-@router.post("/videos/{slug}/rewrite")
-async def rewrite_video(slug: str, request: Request):
+# ---- 输出库 ----
+
+
+class LibraryBody(BaseModel):
+    name: str
+    dir: str
+    path_template: str = ""
+
+
+@router.get("/libraries")
+async def list_libraries(request: Request):
     c = _ctx(request)
-    v = await _get_video(c, slug.lower())
-    strm = await asyncio.to_thread(c.writer.write, v)
-    await c.db.set_output(v["id"], str(strm))
-    return {"strm_path": str(strm)}
+    libs = await c.db.list_libraries()
+    for lib in libs:
+        lib["root"] = str(c.writer.library_root(lib))
+    return libs
+
+
+@router.post("/libraries")
+async def create_library(body: LibraryBody, request: Request):
+    try:
+        return {"id": await _ctx(request).engine.create_library(body.name, body.dir, body.path_template)}
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from None
+    except sqlite3.IntegrityError:
+        raise HTTPException(400, f"库名「{body.name}」已存在") from None
+
+
+@router.put("/libraries/{lib_id}")
+async def update_library(lib_id: int, body: LibraryBody, request: Request):
+    try:
+        job_id = await _ctx(request).engine.update_library(lib_id, body.name, body.dir, body.path_template)
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from None
+    except sqlite3.IntegrityError:
+        raise HTTPException(400, f"库名「{body.name}」已存在") from None
+    return {"rewrite_job_id": job_id}
+
+
+@router.delete("/libraries/{lib_id}")
+async def delete_library(lib_id: int, request: Request, delete_files: bool = False):
+    try:
+        return {"job_id": await _ctx(request).engine.delete_library(lib_id, delete_files)}
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from None
+
+
+# ---- 订阅 ----
+
+
+class SubscriptionBody(BaseModel):
+    name: str
+    source: str
+    sort: str = ""
+    library_id: int = DEFAULT_LIBRARY_ID
+    detail: bool = True
+    interval: int = Field(60, ge=0)
+    stop_after_known: int = Field(48, ge=1)
+    max_pages: int = Field(20, ge=1)
+    enabled: bool = True
+    initial_full: bool = True  # 仅新建时有效：false 表示跳过首轮全量，只跟进以后的更新
+
+
+def _subscription_fields(c, body: SubscriptionBody) -> dict:
+    if not body.name.strip():
+        raise ValueError("订阅名称不能为空")
+    if body.library_id not in c.engine.libs:
+        raise ValueError(f"输出库 #{body.library_id} 不存在")
+    return {
+        "name": body.name.strip(),
+        "source": sources.normalize_source(body.source),
+        "sort": body.sort,
+        "library_id": body.library_id,
+        "detail": int(body.detail),
+        "interval": body.interval,
+        "stop_after_known": body.stop_after_known,
+        "max_pages": body.max_pages,
+        "enabled": int(body.enabled),
+    }
+
+
+@router.get("/subscriptions")
+async def list_subscriptions(request: Request):
+    return await _ctx(request).db.list_subscriptions()
+
+
+@router.post("/subscriptions")
+async def create_subscription(body: SubscriptionBody, request: Request):
+    c = _ctx(request)
+    try:
+        fields = _subscription_fields(c, body)
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from None
+    sub_id = await c.db.create_subscription(**fields, initialized=int(not body.initial_full))
+    return {"id": sub_id}
+
+
+@router.put("/subscriptions/{sub_id}")
+async def update_subscription(sub_id: int, body: SubscriptionBody, request: Request):
+    c = _ctx(request)
+    if await c.db.get_subscription(sub_id) is None:
+        raise HTTPException(404, "订阅不存在")
+    try:
+        await c.db.update_subscription(sub_id, **_subscription_fields(c, body))
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from None
+    return {"ok": True}
+
+
+@router.delete("/subscriptions/{sub_id}")
+async def delete_subscription(sub_id: int, request: Request):
+    c = _ctx(request)
+    if await c.db.subscription_active_job(sub_id):
+        raise HTTPException(400, "订阅有任务在执行，先取消任务")
+    await c.db.delete_subscription(sub_id)
+    return {"ok": True}
+
+
+@router.post("/subscriptions/{sub_id}/run")
+async def run_subscription(sub_id: int, request: Request, mode: Literal["auto", "full", "incremental"] = "auto"):
+    try:
+        return {"job_id": await _ctx(request).engine.run_subscription(sub_id, mode)}
+    except KeyError:
+        raise HTTPException(404, "订阅不存在") from None
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from None
 
 
 # ---- 设置 ----

@@ -25,6 +25,15 @@ log = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 
 
+class NoCacheStaticFiles(StaticFiles):
+    """前端文件每次都按 ETag 重新校验，升级后不会用到旧的 app.js。"""
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
 @dataclass
 class Context:
     boot: BootConfig
@@ -70,7 +79,7 @@ def create_app(boot: BootConfig | None = None) -> FastAPI:
     app = FastAPI(title="jable-strm", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.include_router(play.router)
     app.include_router(api.router)
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.mount("/static", NoCacheStaticFiles(directory=STATIC_DIR), name="static")
 
     @app.get("/", dependencies=[Depends(api.require_auth)], include_in_schema=False)
     async def index():

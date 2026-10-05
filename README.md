@@ -61,30 +61,38 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
 
 ## 使用流程
 
-1. 在「设置」里确认**对外地址**（Emby/Jellyfin 能访问到的本服务地址）、**输出目录**和**代理**。
-2. 在「概览」点「开始全站抓取」。流程是先翻完全部列表页、马上写 strm（每秒 1 次请求约 30 分钟），再逐部补详情、写 nfo、下载封面（约 11 小时）。中途可以暂停、取消或重启，都能续跑。
-3. 在 Emby/Jellyfin 里新建一个「电影」媒体库，路径指向输出目录。
-4. 全站任务完成后，服务会按「定时增量间隔」（默认 60 分钟）自动抓最新更新：连续遇到 48 部已入库影片就停。
+1. 在「设置」里确认**对外地址**（Emby/Jellyfin 能访问到的本服务地址）、**输出根目录**和**代理**。
+2. 在「输出库与订阅」里，对默认订阅「全站：最新更新」点「首轮全量」。流程是先翻完全部列表页、马上写 strm（每秒 1 次请求约 30 分钟），再逐部补详情、写 nfo、下载封面（约 11 小时）。中途可以暂停、取消或重启，都能续跑。
+3. 在 Emby/Jellyfin 里给每个输出库各建一个「电影」媒体库，比如 `{输出根目录}/全部`、`{输出根目录}/中文字幕`。
+4. 首轮全量完成后，订阅会按周期（默认 60 分钟）自动增量：从第 1 页往后翻，连续遇到 48 部已在该库里的影片就停。
 
-其他任务类型：
+### 输出库与订阅
 
-- **列表地址**：分类 `/categories/x/`、标签 `/tags/x/`、女优 `/models/x/`、搜索 `/search/关键词/`、热门 `/hot/`，可以指定排序和页码范围
-- **指定影片**：粘贴影片网址或 slug，每行一个
+- **输出库**：一个名称加一个目录。目录可以写相对输出根目录的路径，也可以写绝对路径；还可以单独设置路径模板。库目录之间不能互相嵌套。默认库叫「全部」，目录是 `全部`。
+- 同一部影片可以同时出现在多个库里。nfo 每个库各写一份；封面在同一文件系统下用硬链接，不额外占空间。
+- **订阅**：列表来源 + 输出库 + 周期。第一次跑「首轮全量」，翻完全部页；之后按周期增量。新建时不勾「首轮全量」，就只跟进以后的更新。
+- 例子：新建库「中文字幕」（目录 `中文字幕`），再新建订阅，来源填 `/categories/chinese-subtitle/`，输出库选「中文字幕」。
+- 修改库的目录或模板时，会自动排一个重写任务，把已有文件搬到新位置。删除库时可以选择是否连同文件一起删除。
+
+### 其他任务类型（「任务」页）
+
+- **列表地址**：一次性抓取分类 `/categories/x/`、标签 `/tags/x/`、女优 `/models/x/`、搜索 `/search/关键词/`、热门 `/hot/`，可以指定排序、页码范围和输出库
+- **指定影片**：粘贴影片网址或 slug（每行一个），加入所选的输出库
 - **补全缺失详情**：给所有缺详情的影片排队
-- **重写全部输出**：改了对外地址、播放模式、令牌或路径模板后执行（不联网）
+- **重写输出**：改了对外地址、播放模式、令牌或路径模板后执行（不联网），可以只重写某个库
 
 ## 输出
 
 默认路径模板是 `{slug}/{slug}`，生成的文件如下：
 
 ```
-<输出目录>/IPZZ-983/IPZZ-983.strm         http://<服务地址>/play/ipzz-983.m3u8
-                    IPZZ-983.nfo          标题、番号、女优、类型、标签、上市日期、时长
-                    IPZZ-983-fanart.jpg   原始封面（DVD 封套）
-                    IPZZ-983-poster.jpg   从封面右侧裁出的竖版海报
+<输出根目录>/全部/IPZZ-983/IPZZ-983.strm         http://<服务地址>/play/ipzz-983.m3u8
+                         IPZZ-983.nfo          标题、番号、女优、类型、标签、上市日期、时长
+                         IPZZ-983-fanart.jpg   原始封面（DVD 封套）
+                         IPZZ-983-poster.jpg   从封面右侧裁出的竖版海报
 ```
 
-模板可用的变量有 `{slug}`、`{code}`、`{actor}`、`{year}`，必须包含 `{slug}`，例如 `{actor}/{slug}`。改模板后执行「重写全部输出」，旧位置的文件会被清理。
+模板可用的变量有 `{slug}`、`{code}`、`{actor}`、`{year}`，必须包含 `{slug}`，例如 `{actor}/{slug}`。模板改了以后执行「重写输出」，nfo 和封面会跟着搬到新位置，旧目录会被清理。
 
 ## 播放模式
 
@@ -111,10 +119,13 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/status` | 引擎、域名、队列、计数、最近失败 |
-| POST | `/api/jobs` | 新建任务：`{"kind": "full\|incremental\|list\|videos\|backfill\|rewrite", ...}` |
+| POST | `/api/jobs` | 新建任务：`{"kind": "list\|videos\|backfill\|rewrite", "library_id": 1, ...}` |
 | GET | `/api/jobs`、`/api/jobs/{id}/tasks?status=failed` | 任务列表、子任务列表 |
 | POST | `/api/jobs/{id}/pause\|resume\|cancel\|retry` | 控制任务 |
-| GET | `/api/videos?q=&filter=no_detail&page=` | 影片库 |
+| GET | `/api/videos?q=&filter=no_detail&library_id=&page=` | 影片库（每部影片带所在的库和 strm 路径） |
+| GET / POST / PUT / DELETE | `/api/libraries`、`/api/libraries/{id}` | 输出库；DELETE 可带 `?delete_files=true` |
+| GET / POST / PUT / DELETE | `/api/subscriptions`、`/api/subscriptions/{id}` | 订阅 |
+| POST | `/api/subscriptions/{id}/run?mode=auto\|full\|incremental` | 立即运行订阅 |
 | POST | `/api/videos/{slug}/refresh` | 立即重抓详情 |
 | GET / PUT | `/api/settings` | 读取或修改设置（PUT 只需要传改动的字段） |
 | POST | `/api/engine/pause\|resume`、`/api/fetcher/test\|reset` | 引擎和抓取通道控制 |

@@ -121,10 +121,25 @@
 
     <div class="grid two section">
       <div class="card">
-        <h3>快捷操作</h3>
-        <div class="toolbar">
-          <button class="primary" @click="quickJob('full')">开始全站抓取</button>
-          <button @click="quickJob('incremental')">立即增量</button>
+        <h3>订阅 <span class="actions"><a href="#" @click.prevent="go('libraries')">管理</a></span></h3>
+        <table>
+          <thead><tr><th>订阅</th><th>输出库</th><th>状态</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="sub in s.subscriptions || []" :key="sub.id">
+              <tr>
+                <td><div x-text="sub.name"></div><div class="small muted mono" x-text="sub.source"></div></td>
+                <td class="small" x-text="sub.library_name"></td>
+                <td class="small"><span class="chip" :class="subState(sub).cls" x-text="subState(sub).text"></span></td>
+                <td class="nowrap">
+                  <button class="sm primary" x-show="!sub.initialized && !sub.active_job_id" @click="runSub(sub, 'full')">开始首轮全量</button>
+                  <button class="sm" x-show="sub.initialized && !sub.active_job_id" @click="runSub(sub, 'incremental')">立即增量</button>
+                </td>
+              </tr>
+            </template>
+            <tr x-show="!(s.subscriptions || []).length"><td colspan="4" class="muted">没有订阅</td></tr>
+          </tbody>
+        </table>
+        <div class="toolbar section">
           <button @click="quickJob('backfill')">补全缺失详情</button>
           <button @click="quickJob('rewrite')">重写全部输出</button>
         </div>
@@ -170,14 +185,20 @@
       <div class="form-row">
         <label class="field"><span>类型</span>
           <select x-model="form.kind">
-            <option value="full">全站（最新更新全部页）</option>
-            <option value="incremental">增量（最新更新）</option>
             <option value="list">列表地址</option>
             <option value="videos">指定影片</option>
             <option value="backfill">补全缺失详情</option>
-            <option value="rewrite">重写全部输出</option>
+            <option value="rewrite">重写输出</option>
           </select>
         </label>
+        <template x-if="['list', 'videos', 'rewrite'].includes(form.kind)">
+          <label class="field"><span>输出库</span>
+            <select x-model.number="form.library_id">
+              <option value="0" x-show="form.kind === 'rewrite'">全部库</option>
+              <template x-for="l in libraries" :key="l.id"><option :value="l.id" x-text="l.name" :selected="l.id === form.library_id"></option></template>
+            </select>
+          </label>
+        </template>
         <template x-if="form.kind === 'list'">
           <div class="form-row grow" style="flex:1">
             <label class="field grow"><span>列表地址（站点网址或路径）</span>
@@ -191,7 +212,7 @@
             <label class="field"><span>结束页（0=最后）</span><input type="number" min="0" style="width:110px" x-model.number="form.end_page"></label>
           </div>
         </template>
-        <template x-if="['full', 'list'].includes(form.kind)">
+        <template x-if="form.kind === 'list'">
           <label class="field"><span>抓详情</span><input type="checkbox" x-model="form.detail" style="margin:7px 0"></label>
         </template>
         <button class="primary" @click="createJob()">创建</button>
@@ -276,6 +297,10 @@
     <div class="card">
       <div class="toolbar">
         <input style="flex:1;min-width:200px" placeholder="搜索番号、标题、女优、标签" x-model="vq.q" @input.debounce.400ms="vq.page = 1; loadVideos()">
+        <select x-model.number="vq.library_id" @change="vq.page = 1; loadVideos()">
+          <option value="0">全部输出库</option>
+          <template x-for="l in libraries" :key="l.id"><option :value="l.id" x-text="l.name"></option></template>
+        </select>
         <select x-model="vq.filter" @change="vq.page = 1; loadVideos()">
           <option value="">全部</option><option value="no_detail">缺详情</option><option value="no_output">未输出</option><option value="gone">已下架</option>
         </select>
@@ -283,7 +308,7 @@
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th></th><th>番号</th><th>标题</th><th>女优</th><th class="num">时长</th><th>上市</th><th>详情</th><th>原站播放地址（缓存）</th><th></th></tr></thead>
+          <thead><tr><th></th><th>番号</th><th>标题</th><th>女优</th><th class="num">时长</th><th>上市</th><th>详情 / 所在库</th><th>原站播放地址（缓存）</th><th></th></tr></thead>
           <tbody>
             <template x-for="v in videos.items" :key="v.id">
               <tr>
@@ -295,7 +320,8 @@
                 <td class="small" x-text="(v.models || []).map(m => m.name).join('、')"></td>
                 <td class="num small" x-text="fmtClockDur(v.duration)"></td>
                 <td class="small nowrap" x-text="v.release_date"></td>
-                <td><span class="chip" :class="v.detail_at ? 'ok' : ''" x-text="v.detail_at ? '已补' : '缺'"></span></td>
+                <td><span class="chip" :class="v.detail_at ? 'ok' : ''" x-text="v.detail_at ? '已补' : '缺'"></span>
+                  <div><template x-for="o in v.outputs || []" :key="o.library_id"><span class="chip" x-text="o.library_name"></span></template></div></td>
                 <td class="small nowrap">
                   <span class="chip" :class="hlsState(v).cls" x-text="hlsState(v).text"></span>
                   <button class="sm" x-show="v.hls_url" @click="copy(v.hls_url)" :title="v.hls_url">复制</button>
@@ -316,6 +342,97 @@
         <span class="small muted">第 <span x-text="vq.page"></span> / <span x-text="Math.max(1, Math.ceil(videos.total / vq.size))"></span> 页</span>
         <button class="sm" :disabled="vq.page * vq.size >= videos.total" @click="vq.page++; loadVideos()">下一页</button>
       </div>
+    </div>
+  </section>
+
+  <!-- ================= 输出库与订阅 ================= -->
+  <section x-show="tab === 'libraries'">
+    <div class="card">
+      <h3>输出库 <span class="actions small muted" x-text="'输出根目录：' + (s.output_dir || '')"></span></h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>#</th><th>名称</th><th>目录</th><th>路径模板</th><th class="num">影片</th><th class="num">订阅</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="l in libraries" :key="l.id">
+              <tr>
+                <td class="num" x-text="l.id"></td>
+                <td x-text="l.name"></td>
+                <td><div class="mono" x-text="l.dir"></div><div class="small muted mono" x-text="l.root"></div></td>
+                <td class="mono small" x-text="l.path_template || '（默认）'"></td>
+                <td class="num" x-text="fmtNum(l.videos)"></td>
+                <td class="num" x-text="l.subscriptions"></td>
+                <td class="nowrap">
+                  <button class="sm" @click="editLibrary(l)">编辑</button>
+                  <button class="sm" @click="post('/api/jobs', {kind: 'rewrite', library_id: l.id}).then(() => notify('已排队重写'))">重写</button>
+                  <button class="sm danger" x-show="l.id !== 1" @click="deleteLibrary(l)">删除</button>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+      <h3 class="section" x-text="libForm.id ? '编辑输出库 #' + libForm.id : '新建输出库'"></h3>
+      <div class="form-row">
+        <label class="field"><span>名称</span><input x-model="libForm.name" placeholder="中文字幕"></label>
+        <label class="field grow"><span>目录（相对输出根目录，或绝对路径）</span><input x-model="libForm.dir" placeholder="中文字幕"></label>
+        <label class="field grow"><span>路径模板（留空用默认）</span><input x-model="libForm.path_template" placeholder="{actor}/{slug}"></label>
+        <button class="primary" @click="saveLibrary()" x-text="libForm.id ? '保存' : '新建'"></button>
+        <button x-show="libForm.id" @click="resetLibForm()">取消</button>
+      </div>
+      <div class="small muted section">库目录不能互相嵌套。修改目录或模板会自动排一个重写任务，把已有文件搬到新位置。</div>
+    </div>
+
+    <div class="card section">
+      <h3>订阅</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>#</th><th>名称 / 来源</th><th>输出库</th><th>周期</th><th>增量规则</th><th>状态</th><th>上次运行</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="sub in subscriptions" :key="sub.id">
+              <tr>
+                <td class="num" x-text="sub.id"></td>
+                <td><div x-text="sub.name"></div><div class="small muted mono" x-text="sub.source + (sub.sort ? ' · ' + (meta.sorts[sub.sort] || sub.sort) : '')"></div></td>
+                <td x-text="sub.library_name"></td>
+                <td class="small" x-text="sub.interval ? '每 ' + sub.interval + ' 分钟' : '手动'"></td>
+                <td class="small" x-text="'连续 ' + sub.stop_after_known + ' 部已在库停 · 最多 ' + sub.max_pages + ' 页' + (sub.detail ? '' : ' · 不抓详情')"></td>
+                <td><span class="chip" :class="subState(sub).cls" x-text="subState(sub).text"></span>
+                  <a href="#" class="small" x-show="sub.active_job_id" @click.prevent="go('jobs'); openJobId = sub.active_job_id; loadTasks()" x-text="'#' + sub.active_job_id"></a></td>
+                <td class="small nowrap" x-text="sub.last_run_at ? fmtTime(sub.last_run_at) : '-'"></td>
+                <td class="nowrap">
+                  <button class="sm primary" x-show="!sub.initialized && !sub.active_job_id" @click="runSub(sub, 'full')">首轮全量</button>
+                  <button class="sm" x-show="sub.initialized && !sub.active_job_id" @click="runSub(sub, 'incremental')">立即增量</button>
+                  <button class="sm" x-show="sub.initialized && !sub.active_job_id" @click="runSub(sub, 'full')">重跑全量</button>
+                  <button class="sm" @click="editSub(sub)">编辑</button>
+                  <button class="sm danger" @click="deleteSub(sub)">删除</button>
+                </td>
+              </tr>
+            </template>
+            <tr x-show="!subscriptions.length"><td colspan="8" class="muted">没有订阅</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h3 class="section" x-text="subForm.id ? '编辑订阅 #' + subForm.id : '新建订阅'"></h3>
+      <div class="form-row">
+        <label class="field"><span>名称</span><input x-model="subForm.name" placeholder="中文字幕"></label>
+        <label class="field grow"><span>列表地址</span>
+          <input x-model="subForm.source" list="presets" placeholder="/categories/chinese-subtitle/"></label>
+        <label class="field"><span>排序</span>
+          <select x-model="subForm.sort"><template x-for="[k, v] in Object.entries(meta.sorts || {})" :key="k"><option :value="k" x-text="v" :selected="k === subForm.sort"></option></template></select></label>
+        <label class="field"><span>输出库</span>
+          <select x-model.number="subForm.library_id"><template x-for="l in libraries" :key="l.id"><option :value="l.id" x-text="l.name" :selected="l.id === subForm.library_id"></option></template></select></label>
+      </div>
+      <div class="form-row section">
+        <label class="field"><span>周期（分钟，0=只手动）</span><input type="number" min="0" style="width:120px" x-model.number="subForm.interval"></label>
+        <label class="field"><span>连续多少部已在库就停</span><input type="number" min="1" style="width:120px" x-model.number="subForm.stop_after_known"></label>
+        <label class="field"><span>单次最多页数</span><input type="number" min="1" style="width:100px" x-model.number="subForm.max_pages"></label>
+        <label class="field"><span>抓详情</span><input type="checkbox" x-model="subForm.detail" style="margin:7px 0"></label>
+        <label class="field"><span>启用</span><input type="checkbox" x-model="subForm.enabled" style="margin:7px 0"></label>
+        <label class="field" x-show="!subForm.id"><span>首轮全量</span><input type="checkbox" x-model="subForm.initial_full" style="margin:7px 0"></label>
+        <button class="primary" @click="saveSub()" x-text="subForm.id ? '保存' : '新建'"></button>
+        <button x-show="subForm.id" @click="resetSubForm()">取消</button>
+      </div>
+      <div class="small muted section">首轮全量会翻完来源的全部页；之后按周期增量：从第 1 页往后翻，连续遇到这么多部已在该库里的影片就停。
+        不勾「首轮全量」则只跟进以后的更新。分类 /categories/xxx/、标签 /tags/xxx/、女优 /models/xxx/、搜索 /search/关键词/ 都可以订阅。</div>
     </div>
   </section>
 
@@ -437,8 +554,12 @@
           </template>
         </div>
         <div class="url-row">
-          <div class="url-label">strm 文件</div>
-          <div class="url-box"><code x-text="detail.strm_path || '尚未输出'"></code><button class="sm" x-show="detail.strm_path" @click="copy(detail.strm_path)">复制</button></div>
+          <div class="url-label">strm 文件（按输出库）</div>
+          <template x-for="o in detail.outputs || []" :key="o.library_id">
+            <div class="url-box"><span class="chip" style="margin-top:6px" x-text="o.library_name"></span>
+              <code x-text="o.strm_path || '尚未输出'"></code><button class="sm" x-show="o.strm_path" @click="copy(o.strm_path)">复制</button></div>
+          </template>
+          <div class="small muted" x-show="!(detail.outputs || []).length">不在任何输出库里</div>
         </div>
       </div>
     </div>

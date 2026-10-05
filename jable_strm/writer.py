@@ -7,6 +7,7 @@ import io
 import logging
 import os
 import re
+import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import quote
@@ -101,7 +102,12 @@ class OutputWriter:
             url += f"?t={quote(s.play_token)}"
         return url
 
-    def base_path(self, v: dict) -> Path:
+    def library_root(self, lib: dict) -> Path:
+        """输出库目录：相对路径挂在输出根目录下，绝对路径原样使用。"""
+        d = Path(lib["dir"])
+        return d if d.is_absolute() else self.store.output_dir / d
+
+    def base_path(self, v: dict, lib: dict) -> Path:
         """不含扩展名的输出路径。"""
         models = v.get("models") or []
         values = {
@@ -110,51 +116,81 @@ class OutputWriter:
             "actor": models[0]["name"] if models else "未知演员",
             "year": (v.get("release_date") or "")[:4] or "未知年份",
         }
-        rel = self.store.current.path_template.format(**{k: sanitize(x) for k, x in values.items()})
+        template = lib.get("path_template") or self.store.current.path_template
+        rel = template.format(**{k: sanitize(x) for k, x in values.items()})
         parts = [sanitize(p) for p in rel.split("/") if p.strip()]
-        root = self.store.output_dir
+        root = self.library_root(lib)
         path = root.joinpath(*parts)
         if root not in path.parents:
             raise ValueError(f"输出路径越界：{path}")
         return path
 
-    def write(self, v: dict) -> Path:
-        """写 strm（有详情时一并写 nfo），返回 strm 路径。同步函数，调用方放到线程里跑。"""
-        base = self.base_path(v)
+    def write(self, v: dict, lib: dict, old_strm: str = "", keep_dirs: frozenset[Path] = frozenset()) -> Path:
+        """写 strm（有详情时一并写 nfo），返回 strm 路径。同步函数，调用方放到线程里跑。
+
+        old_strm 和新位置不同（模板或库目录改了）时，把 nfo、封面搬到新位置，再清掉旧文件和空目录；
+        keep_dirs 里的目录（各输出库根目录）不会被删。
+        """
+        base = self.base_path(v, lib)
         base.parent.mkdir(parents=True, exist_ok=True)
         strm = base.with_name(base.name + ".strm")
+        if old_strm and Path(old_strm) != strm:
+            self._relocate(Path(old_strm), base, keep_dirs)
         write_atomic(strm, (self.play_url(v) + "\n").encode())
         if self.store.current.write_nfo and v.get("detail_at"):
             write_atomic(base.with_name(base.name + ".nfo"), build_nfo(v).encode())
-        old = v.get("strm_path")
-        if old and Path(old) != strm:
-            self._remove_old(Path(old))
         return strm
 
-    def _remove_old(self, old_strm: Path) -> None:
-        """路径模板变化后清理旧位置的输出文件（只删本程序生成的文件）。"""
-        stem = old_strm.with_name(old_strm.name.removesuffix(".strm"))
+    def _relocate(self, old_strm: Path, new_base: Path, keep_dirs: frozenset[Path]) -> None:
+        old_base = old_strm.with_name(old_strm.name.removesuffix(".strm"))
         for suffix in OUTPUT_SUFFIXES:
-            stem.with_name(stem.name + suffix).unlink(missing_ok=True)
-        parent = old_strm.parent
-        root = self.store.output_dir
-        while parent != root and root in parent.parents:
-            try:
-                parent.rmdir()
-            except OSError:
-                break
-            parent = parent.parent
+            src = old_base.with_name(old_base.name + suffix)
+            if not src.exists():
+                continue
+            dst = new_base.with_name(new_base.name + suffix)
+            if suffix == ".strm" or dst.exists():
+                src.unlink()
+            else:
+                shutil.move(src, dst)
+        self.remove_empty_dirs(old_strm.parent, keep_dirs)
 
-    async def write_cover(self, fetcher: Fetcher, v: dict, strm: Path) -> bool:
-        """下载封面并裁 poster，返回是否已具备封面。网络失败抛 FetchError 由任务重试。"""
+    def remove(self, strm: Path, keep_dirs: frozenset[Path] = frozenset()) -> None:
+        """删除一部影片在某个库里的全部输出文件（只删本程序生成的文件）。"""
+        base = strm.with_name(strm.name.removesuffix(".strm"))
+        for suffix in OUTPUT_SUFFIXES:
+            base.with_name(base.name + suffix).unlink(missing_ok=True)
+        self.remove_empty_dirs(strm.parent, keep_dirs)
+
+    def remove_empty_dirs(self, start: Path, keep_dirs: frozenset[Path]) -> None:
+        """向上清理空目录：不越过输出根目录和各库根目录；输出根目录之外最多清一层。"""
+        out_root = self.store.output_dir
+        d = start
+        for level in range(4):
+            if d in keep_dirs or d == out_root or (level and out_root not in d.parents):
+                return
+            try:
+                d.rmdir()
+            except OSError:
+                return
+            d = d.parent
+
+    async def write_cover(self, fetcher: Fetcher, v: dict, strm: Path, siblings: list[Path] = ()) -> bool:
+        """准备封面，返回是否已具备封面。网络失败抛 FetchError 由任务重试。
+
+        siblings 是同一部影片在其他库里的 strm；那边已有封面就硬链接过来（跨文件系统时复制），不再下载。
+        """
         s = self.store.current
         if not s.download_cover or not v.get("cover_url"):
             return False
-        base = strm.with_name(strm.name.removesuffix(".strm"))
-        fanart = base.with_name(base.name + "-fanart.jpg")
-        poster = base.with_name(base.name + "-poster.jpg")
-        if fanart.exists() and (poster.exists() or not s.poster_crop):
+        names = ["-fanart.jpg"] + (["-poster.jpg"] if s.poster_crop else [])
+        targets = [cover_path(strm, n) for n in names]
+        if all(t.exists() for t in targets):
             return True
+        for other in siblings:
+            sources = [cover_path(other, n) for n in names]
+            if all(p.exists() for p in sources):
+                await asyncio.to_thread(lambda: [link_or_copy(a, b) for a, b in zip(sources, targets)])
+                return True
         try:
             data = await fetcher.get_bytes(v["cover_url"])
         except NotFound:
@@ -162,9 +198,22 @@ class OutputWriter:
             return False
 
         def save() -> None:
-            write_atomic(fanart, data)
+            write_atomic(targets[0], data)
             if s.poster_crop:
-                write_atomic(poster, crop_poster(data))
+                write_atomic(targets[1], crop_poster(data))
 
         await asyncio.to_thread(save)
         return True
+
+
+def cover_path(strm: Path, suffix: str) -> Path:
+    return strm.with_name(strm.name.removesuffix(".strm") + suffix)
+
+
+def link_or_copy(src: Path, dst: Path) -> None:
+    if dst.exists():
+        return
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
