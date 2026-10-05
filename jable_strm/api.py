@@ -23,6 +23,7 @@ from .engine import snapshot_path
 from .fetcher import Blocked, FetchError, NotFound
 from .observability import ring
 from .parser import ParseError, VideoGone, slug_from_url
+from .rules import describe_rule
 
 _basic = HTTPBasic(auto_error=False)
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
@@ -232,6 +233,7 @@ class LibraryBody(BaseModel):
     name: str
     dir: str
     path_template: str = ""
+    rule: dict | None = None
 
 
 @router.get("/libraries")
@@ -240,13 +242,14 @@ async def list_libraries(request: Request):
     libs = await c.db.list_libraries()
     for lib in libs:
         lib["root"] = str(c.writer.library_root(lib))
+        lib["rule_text"] = describe_rule(lib["rule"])
     return libs
 
 
 @router.post("/libraries")
 async def create_library(body: LibraryBody, request: Request):
     try:
-        return {"id": await _ctx(request).engine.create_library(body.name, body.dir, body.path_template)}
+        return await _ctx(request).engine.create_library(body.name, body.dir, body.path_template, body.rule)
     except ValueError as err:
         raise HTTPException(400, str(err)) from None
     except sqlite3.IntegrityError:
@@ -256,12 +259,24 @@ async def create_library(body: LibraryBody, request: Request):
 @router.put("/libraries/{lib_id}")
 async def update_library(lib_id: int, body: LibraryBody, request: Request):
     try:
-        job_id = await _ctx(request).engine.update_library(lib_id, body.name, body.dir, body.path_template)
+        return await _ctx(request).engine.update_library(lib_id, body.name, body.dir, body.path_template, body.rule)
     except ValueError as err:
         raise HTTPException(400, str(err)) from None
     except sqlite3.IntegrityError:
         raise HTTPException(400, f"库名「{body.name}」已存在") from None
-    return {"rewrite_job_id": job_id}
+
+
+@router.post("/libraries/{lib_id}/reclassify")
+async def reclassify_library(lib_id: int, request: Request):
+    try:
+        return {"job_id": await _ctx(request).engine.create_reclassify(lib_id)}
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from None
+
+
+@router.get("/facets")
+async def facets(request: Request):
+    return await _ctx(request).db.facets()
 
 
 @router.delete("/libraries/{lib_id}")

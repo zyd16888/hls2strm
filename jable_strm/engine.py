@@ -22,6 +22,7 @@ from .db import DEFAULT_LIBRARY_ID, Database
 from .fetcher import Blocked, FetchError, Fetcher, NotFound
 from .observability import Metrics
 from .parser import ParseError, VideoGone, m3u8_duration, parse_detail, parse_list
+from .rules import describe_rule, match_rule, normalize_rule
 from .strm_manage import StrmManager
 from .writer import OutputWriter
 
@@ -150,7 +151,8 @@ class Engine:
                 await self.db.finish_task(tid, "pending", refund_attempt=True)
                 return
             handler = {"list": self._do_list, "detail": self._do_detail, "rewrite": self._do_rewrite,
-                       "purge": self._do_purge, "scan": self.strm.do_scan, "adopt": self.strm.do_adopt,
+                       "purge": self._do_purge, "reclassify": self._do_reclassify,
+                       "scan": self.strm.do_scan, "adopt": self.strm.do_adopt,
                        "prefix": self.strm.do_prefix, "revert": self.strm.do_revert}[task["kind"]]
             await handler(job, task)
             await self.db.finish_task(tid, "done", duration_ms=int((time.monotonic() - t0) * 1000))
@@ -329,6 +331,7 @@ class Engine:
         if library_id:
             await self.db.ensure_output(v["id"], library_id)
         await self._output_all(v, cover=True)
+        await self.apply_rules(v)
         self.metrics.inc("videos_detail")
         log.info("详情 %s：%s，女优 %s，%d 个标签", slug, v["release_date"] or "无日期",
                  "、".join(m["name"] for m in v["models"]) or "无", len(v["tags"]))
@@ -356,6 +359,44 @@ class Engine:
             if n % 1000 == 0:
                 log.info("重写输出：已完成 %d 个", n)
         log.info("重写输出完成：共 %d 个", n)
+
+    async def apply_rules(self, v: dict, only_library: int | None = None) -> tuple[int, int]:
+        """按规则库调整影片归属：命中就加入（via=rule），不再命中就移除规则加入的输出。返回 (加入, 移除)。"""
+        added = removed = 0
+        for lib in list(self.libs.values()):
+            if not lib["rule"] or (only_library and lib["id"] != only_library):
+                continue
+            should = v["status"] == "active" and match_rule(lib["rule"], v)
+            out = await self.db.get_output(v["id"], lib["id"])
+            if should and out is None:
+                await self.db.ensure_output(v["id"], lib["id"], via="rule")
+                await self._output_one(v, lib["id"], cover=bool(v["detail_at"]), old_strm="")
+                added += 1
+            elif not should and out is not None and out["via"] == "rule":
+                if out["strm_path"]:
+                    await asyncio.to_thread(self.writer.remove, Path(out["strm_path"]), self.keep_dirs())
+                await self.db.delete_output(v["id"], lib["id"])
+                removed += 1
+        return added, removed
+
+    async def _do_reclassify(self, job: dict, task: dict) -> None:
+        lib_id = job["params"].get("library_id")
+        n = added = removed = 0
+        async for v in self.db.iter_videos():
+            a, r = await self.apply_rules(v, only_library=lib_id)
+            added, removed, n = added + a, removed + r, n + 1
+            if n % 2000 == 0:
+                log.info("重新归库：已检查 %d 部，加入 %d，移除 %d", n, added, removed)
+        await self.db.update_job(job["id"], state={"checked": n, "added": added, "removed": removed})
+        log.info("重新归库完成：检查 %d 部，加入 %d，移除 %d", n, added, removed)
+
+    async def create_reclassify(self, library_id: int | None = None) -> int:
+        name = f"重新归库：{self._library(library_id)['name']}" if library_id else "重新归库：全部规则库"
+        job_id = await self.db.create_job("reclassify", name, {"library_id": library_id})
+        await self.db.add_tasks(job_id, "reclassify", ["all"], PRIORITY_USER)
+        log.info("新建任务 #%d「%s」", job_id, name)
+        self.notify()
+        return job_id
 
     async def _do_purge(self, job: dict, task: dict) -> None:
         lib_id = int(task["target"])
@@ -493,22 +534,30 @@ class Engine:
                 raise ValueError(f"目录和输出库「{other['name']}」（{o}）重叠，库目录不能互相嵌套")
         return name, dir, template
 
-    async def create_library(self, name: str, dir: str, path_template: str = "") -> int:
+    async def create_library(self, name: str, dir: str, path_template: str = "", rule: dict | None = None) -> dict:
+        """新建输出库；带规则时自动排一个重新归库任务。"""
         name, dir, template = self._check_library(name, dir, path_template)
-        lib_id = await self.db.create_library(name, dir, template)
+        rule = normalize_rule(rule)
+        lib_id = await self.db.create_library(name, dir, template, rule)
         await self.reload_libraries()
-        log.info("新建输出库「%s」：%s", name, self.writer.library_root(self.libs[lib_id]))
-        return lib_id
+        log.info("新建输出库「%s」：%s%s", name, self.writer.library_root(self.libs[lib_id]),
+                 f"，规则 {describe_rule(rule)}" if rule else "")
+        return {"id": lib_id, "reclassify_job_id": await self.create_reclassify(lib_id) if rule else None}
 
-    async def update_library(self, lib_id: int, name: str, dir: str, path_template: str = "") -> int | None:
-        """修改输出库；目录或模板变了会自动排一个重写任务搬文件，返回其任务 id。"""
+    async def update_library(self, lib_id: int, name: str, dir: str, path_template: str = "",
+                             rule: dict | None = None) -> dict:
+        """修改输出库：目录或模板变了排重写任务搬文件，规则变了排重新归库任务。"""
         old = self._library(lib_id)
         name, dir, template = self._check_library(name, dir, path_template, exclude_id=lib_id)
-        await self.db.update_library(lib_id, name=name, dir=dir, path_template=template)
+        rule = normalize_rule(rule)
+        await self.db.update_library(lib_id, name=name, dir=dir, path_template=template, rule=rule)
         await self.reload_libraries()
+        jobs = {"rewrite_job_id": None, "reclassify_job_id": None}
         if (dir, template) != (old["dir"], old["path_template"]):
-            return await self.create_rewrite(lib_id)
-        return None
+            jobs["rewrite_job_id"] = await self.create_rewrite(lib_id)
+        if rule != old["rule"]:
+            jobs["reclassify_job_id"] = await self.create_reclassify(lib_id)
+        return jobs
 
     async def delete_library(self, lib_id: int, delete_files: bool) -> int:
         lib = self._library(lib_id)

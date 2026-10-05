@@ -351,7 +351,7 @@
       <h3>输出库 <span class="actions small muted" x-text="'输出根目录：' + (s.output_dir || '')"></span></h3>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>#</th><th>名称</th><th>目录</th><th>路径模板</th><th class="num">影片</th><th class="num">订阅</th><th></th></tr></thead>
+          <thead><tr><th>#</th><th>名称</th><th>目录</th><th>路径模板</th><th>规则</th><th class="num">影片</th><th class="num">订阅</th><th></th></tr></thead>
           <tbody>
             <template x-for="l in libraries" :key="l.id">
               <tr>
@@ -359,11 +359,13 @@
                 <td x-text="l.name"></td>
                 <td><div class="mono" x-text="l.dir"></div><div class="small muted mono" x-text="l.root"></div></td>
                 <td class="mono small" x-text="l.path_template || '（默认）'"></td>
+                <td class="small" x-text="l.rule_text || '-'"></td>
                 <td class="num" x-text="fmtNum(l.videos)"></td>
                 <td class="num" x-text="l.subscriptions"></td>
                 <td class="nowrap">
                   <button class="sm" @click="editLibrary(l)">编辑</button>
                   <button class="sm" @click="post('/api/jobs', {kind: 'rewrite', library_id: l.id}).then(() => notify('已排队重写'))">重写</button>
+                  <button class="sm" x-show="l.rule" @click="post('/api/libraries/' + l.id + '/reclassify').then(() => notify('已排队重新归库'))">重新归库</button>
                   <button class="sm danger" x-show="l.id !== 1" @click="deleteLibrary(l)">删除</button>
                 </td>
               </tr>
@@ -376,10 +378,33 @@
         <label class="field"><span>名称</span><input x-model="libForm.name" placeholder="中文字幕"></label>
         <label class="field grow"><span>目录（相对输出根目录，或绝对路径）</span><input x-model="libForm.dir" placeholder="中文字幕"></label>
         <label class="field grow"><span>路径模板（留空用默认）</span><input x-model="libForm.path_template" placeholder="{actor}/{slug}"></label>
+      </div>
+      <details class="section" :open="libForm.useRule">
+        <summary class="small" @click.prevent="libForm.useRule = !libForm.useRule">
+          <input type="checkbox" :checked="libForm.useRule" style="vertical-align:middle"> 规则库：按条件自动归入（抓到详情后生效）</summary>
+        <div class="form-row section" x-show="libForm.useRule">
+          <label class="field grow"><span>分类（名称或 slug，逗号分隔）</span><input x-model="libForm.rule.categories" list="facet-categories" placeholder="中文字幕"></label>
+          <label class="field grow"><span>标签</span><input x-model="libForm.rule.tags" list="facet-tags" placeholder="巨乳, 人妻"></label>
+          <label class="field grow"><span>女优（名字或 id）</span><input x-model="libForm.rule.models" list="facet-models"></label>
+        </div>
+        <div class="form-row section" x-show="libForm.useRule">
+          <label class="field"><span>画质</span><input x-model="libForm.rule.quality" list="facet-quality" placeholder="中文字幕"></label>
+          <label class="field grow"><span>关键词（番号或标题，逗号分隔）</span><input x-model="libForm.rule.keywords" placeholder="SONE-, IPZZ-"></label>
+          <label class="field"><span>各组条件</span>
+            <select x-model="libForm.rule.match"><option value="any">满足任一组</option><option value="all">每组都满足</option></select></label>
+        </div>
+        <datalist id="facet-categories"><template x-for="f in facets.categories || []" :key="f.item"><option :value="f.name" x-text="f.item + ' · ' + f.n + ' 部'"></option></template></datalist>
+        <datalist id="facet-tags"><template x-for="f in facets.tags || []" :key="f.item"><option :value="f.name" x-text="f.n + ' 部'"></option></template></datalist>
+        <datalist id="facet-models"><template x-for="f in facets.models || []" :key="f.item"><option :value="f.name" x-text="f.n + ' 部'"></option></template></datalist>
+        <datalist id="facet-quality"><template x-for="f in facets.quality || []" :key="f.name"><option :value="f.name" x-text="f.n + ' 部'"></option></template></datalist>
+      </details>
+      <div class="toolbar section">
         <button class="primary" @click="saveLibrary()" x-text="libForm.id ? '保存' : '新建'"></button>
         <button x-show="libForm.id" @click="resetLibForm()">取消</button>
       </div>
-      <div class="small muted section">库目录不能互相嵌套。修改目录或模板会自动排一个重写任务，把已有文件搬到新位置。</div>
+      <div class="small muted">库目录不能互相嵌套。修改目录或模板会自动排一个重写任务，把已有文件搬到新位置；
+        修改规则会自动排一个重新归库任务，不再符合规则的影片会从库里移除（只移除规则加入的，任务和订阅加入的保留）。
+        组内多个值满足任一即可；分类、标签按站点上的名称或 slug 匹配。</div>
     </div>
 
     <div class="card section">

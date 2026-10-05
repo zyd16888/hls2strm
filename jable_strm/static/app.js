@@ -1,7 +1,7 @@
 // Jable STRM 控制台（Alpine.js）
 
 const KIND_NAMES = {
-  list: "列表页", detail: "详情页", rewrite: "重写输出", purge: "删除库",
+  list: "列表页", detail: "详情页", rewrite: "重写输出", purge: "删除库", reclassify: "重新归库",
   scan: "扫描", adopt: "纳管", prefix: "改前缀", revert: "回滚",
   crawl: "列表抓取", incremental: "增量", videos: "指定影片",
 };
@@ -45,7 +45,8 @@ function app() {
     form: { kind: "list", source: "", sort: "post_date", start_page: 1, end_page: 0, detail: true, urls: "", library_id: 1 },
     libraries: [],
     subscriptions: [],
-    libForm: {},
+    libForm: { rule: {} },
+    facets: {},
     subForm: {},
     strmKinds: STRM_KINDS,
     scans: [],
@@ -105,7 +106,7 @@ function app() {
     onTab() {
       if (this.tab === "jobs") { this.loadJobs(); this.loadLibraries(); }
       if (this.tab === "videos") { this.loadVideos(); this.loadLibraries(); }
-      if (this.tab === "libraries") { this.loadLibraries(); this.loadSubs(); }
+      if (this.tab === "libraries") { this.loadLibraries(); this.loadSubs(); this.loadFacets(); }
       if (this.tab === "strm") { this.loadLibraries(); this.loadScans(); this.loadChangeSets(); }
       if (this.tab === "settings") this.loadSettings();
       if (this.tab === "logs") this.$nextTick(() => this.scrollLogs(true));
@@ -302,13 +303,21 @@ function app() {
     // ---- 输出库与订阅 ----
     async loadLibraries() { this.libraries = await this.get("/api/libraries").catch(() => this.libraries); },
     async loadSubs() { this.subscriptions = await this.get("/api/subscriptions").catch(() => this.subscriptions); },
-    resetLibForm() { this.libForm = { id: null, name: "", dir: "", path_template: "" }; },
-    editLibrary(l) { this.libForm = { id: l.id, name: l.name, dir: l.dir, path_template: l.path_template }; },
+    emptyRule() { return { categories: "", tags: "", models: "", quality: "", keywords: "", match: "any" }; },
+    resetLibForm() { this.libForm = { id: null, name: "", dir: "", path_template: "", useRule: false, rule: this.emptyRule() }; },
+    editLibrary(l) {
+      const rule = this.emptyRule();
+      if (l.rule) for (const k of Object.keys(rule)) rule[k] = Array.isArray(l.rule[k]) ? l.rule[k].join(", ") : (l.rule[k] || rule[k]);
+      this.libForm = { id: l.id, name: l.name, dir: l.dir, path_template: l.path_template, useRule: !!l.rule, rule };
+    },
+    async loadFacets() { this.facets = await this.get("/api/facets").catch(() => this.facets); },
     async saveLibrary() {
-      const f = this.libForm, body = { name: f.name, dir: f.dir, path_template: f.path_template };
+      const f = this.libForm;
+      const body = { name: f.name, dir: f.dir, path_template: f.path_template, rule: f.useRule ? f.rule : null };
       try {
         const r = f.id ? await this.req("PUT", `/api/libraries/${f.id}`, body) : await this.req("POST", "/api/libraries", body);
-        this.notify(f.id ? (r.rewrite_job_id ? `已保存，重写任务 #${r.rewrite_job_id} 会把文件搬到新位置` : "已保存") : "已新建输出库");
+        const jobs = [r.rewrite_job_id && `重写 #${r.rewrite_job_id}`, r.reclassify_job_id && `重新归库 #${r.reclassify_job_id}`].filter(Boolean);
+        this.notify((f.id ? "已保存" : "已新建输出库") + (jobs.length ? `，已排队：${jobs.join("、")}` : ""));
         this.resetLibForm();
         this.loadLibraries();
       } catch (e) { this.notify(e.message, true); }

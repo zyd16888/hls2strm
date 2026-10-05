@@ -388,6 +388,37 @@ class Database:
         )
         return [_video_row(r) for r in rows], total
 
+    async def iter_videos(self, batch: int = 500):
+        last = -1
+        while True:
+            rows = await self._all(
+                "SELECT * FROM videos WHERE status='active' AND id>? ORDER BY id LIMIT ?", (last, batch)
+            )
+            if not rows:
+                return
+            for r in rows:
+                yield _video_row(r)
+            last = rows[-1]["id"]
+
+    async def facets(self, limit: int = 300) -> dict:
+        """库里已有的分类、标签、女优及影片数，给规则编辑做候选。"""
+        out = {}
+        for field, key in (("categories", "slug"), ("tags", "slug"), ("models", "id")):
+            # 别名不能叫 key：json_each 自带 key 列（数组下标），GROUP BY 会按它分组
+            rows = await self._all(
+                f"""SELECT json_extract(j.value, '$.{key}') AS item, MAX(json_extract(j.value, '$.name')) AS name,
+                           COUNT(*) AS n
+                    FROM videos v, json_each(v.{field}) j WHERE v.status='active'
+                    GROUP BY item ORDER BY n DESC LIMIT ?""",
+                (limit,),
+            )
+            out[field] = [dict(r) for r in rows]
+        rows = await self._all(
+            "SELECT quality AS name, COUNT(*) AS n FROM videos WHERE quality != '' GROUP BY quality ORDER BY n DESC"
+        )
+        out["quality"] = [dict(r) for r in rows]
+        return out
+
     async def slugs_missing_detail(self) -> list[str]:
         rows = await self._all("SELECT slug FROM videos WHERE detail_at IS NULL AND status='active' ORDER BY id DESC")
         return [r["slug"] for r in rows]

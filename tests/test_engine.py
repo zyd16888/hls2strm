@@ -177,7 +177,7 @@ def test_libraries_and_subscription(make_store, boot):
         for bad in ("", "全部/子目录", str(store.output_dir)):
             with pytest.raises(ValueError):
                 await engine.create_library("坏库", bad)
-        lib_id = await engine.create_library("中文字幕", "中文字幕")
+        lib_id = (await engine.create_library("中文字幕", "中文字幕"))["id"]
 
         # 订阅：首轮全量 → initialized
         sub_id = await db.create_subscription(name="女优", source="/models/abc/", sort="post_date",
@@ -208,8 +208,9 @@ def test_libraries_and_subscription(make_store, boot):
         await db.update_job(job["id"], status="done")
 
         # 改库目录：自动重写，文件搬到新目录
-        rewrite_id = await engine.update_library(lib_id, "中文字幕", "zh/中文字幕")
-        await wait_job(db, rewrite_id)
+        jobs = await engine.update_library(lib_id, "中文字幕", "zh/中文字幕")
+        assert jobs["reclassify_job_id"] is None
+        await wait_job(db, jobs["rewrite_job_id"])
         assert not lib_dir.exists()
         assert len(list((store.output_dir / "zh" / "中文字幕").glob("*/*-poster.jpg"))) == 24
 
