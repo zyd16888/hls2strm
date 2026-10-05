@@ -104,6 +104,18 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
 
 设置了「播放令牌」后，strm 地址会带上 `?t=令牌`，不带令牌的 `/play` 请求返回 403。
 
+浏览器跨域请求（带 `Origin` 头，比如网页播放器直接读 strm 地址）也会走中转，`/play` 和 `/hls` 会返回 CORS 头，因为 CDN 本身不返回 CORS 头。
+
+### 给网关用的 resolve 接口
+
+`GET /api/resolve/{slug}.m3u8?ua=<客户端 UA>&origin=<客户端 Origin>`，用 `Authorization: Bearer <resolve_token>` 认证（也可以用 `?token=`）。在设置里填了「网关解析令牌」之后才开放。
+
+- 客户端能直连 CDN：返回 200 和 `{"slug", "url", "expires_at", "ttl", "duration"}`。
+- 客户端不能直连（UA 命中中转片段，或者带了 `origin`）：返回 409 和 `{"reason"}`，由网关回退为反代 Emby。
+- 影片不存在：404；站点拦截中：503。
+
+路径的最后一段就是影片，所以网关的 objectKey 可以原样传，比如 `/api/resolve/play/ipzz-983.m3u8`。
+
 ## 被拦截了怎么办
 
 - 某个域名被拦截时，它会进入冷却（默认 5 分钟，连续被拦就翻倍，最长 1 小时），限速减半，并切换到下一个域名。

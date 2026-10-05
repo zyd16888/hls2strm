@@ -94,6 +94,9 @@ class Settings(BaseModel):
         description="redirect 模式下，User-Agent 含这些片段的客户端改走本服务中转（CDN 会拒绝它们，如 ffmpeg 默认的 Lavf）",
     )
     play_token: str = Field("", description="播放地址访问令牌；设置后 strm 地址带 ?t=令牌")
+    resolve_token: str = Field(
+        "", description="供 embyGateway 等调用 /api/resolve 的令牌（Bearer）；留空则不开放该接口"
+    )
     hls_margin: int = Field(15, ge=0, le=120, description="302 前要求播放地址剩余有效期 ≥ 影片时长 + 该值（分钟）")
 
     @field_validator("domains")

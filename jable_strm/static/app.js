@@ -15,7 +15,7 @@ const SETTING_GROUPS = [
   { title: "重试", keys: ["max_attempts", "retry_base_delay"] },
   { title: "任务", keys: ["fetch_detail"] },
   { title: "输出", keys: ["output_dir", "path_template", "write_nfo", "download_cover", "poster_crop"] },
-  { title: "播放", keys: ["public_base_url", "play_mode", "proxy_user_agents", "play_token", "hls_margin"] },
+  { title: "播放", keys: ["public_base_url", "play_mode", "proxy_user_agents", "play_token", "hls_margin", "resolve_token"] },
 ];
 const SETTING_LABELS = {
   domains: "站点域名", proxy: "抓取代理", impersonate: "浏览器指纹", rate_per_sec: "请求速率上限",
@@ -24,6 +24,7 @@ const SETTING_LABELS = {
   fetch_detail: "默认抓取详情", output_dir: "输出根目录", path_template: "默认路径模板", write_nfo: "写 nfo",
   download_cover: "下载封面", poster_crop: "裁剪 poster", public_base_url: "对外地址", play_mode: "播放模式",
   proxy_user_agents: "中转 UA 片段", play_token: "播放令牌", hls_margin: "有效期余量（分钟）",
+  resolve_token: "网关解析令牌",
 };
 const REWRITE_KEYS = ["public_base_url", "play_mode", "play_token", "path_template", "output_dir", "write_nfo"];
 const PLAY_MODES = { redirect: "302 跳转（ffmpeg 类客户端自动中转）", proxy: "全部中转", direct: "直写 CDN 地址（仅调试）" };

@@ -10,7 +10,7 @@ import time
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import RedirectResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 
 from .config import SettingsStore
 from .db import Database
@@ -76,10 +76,31 @@ def _ctx(request: Request):
     return request.app.state.ctx
 
 
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Expose-Headers": "Content-Length, Content-Type",
+}
+
+
 def _check_token(request: Request, t: str) -> None:
     token = _ctx(request).store.current.play_token
     if token and not secrets.compare_digest(t.encode(), token.encode()):
         raise HTTPException(403, "播放令牌错误")
+
+
+def direct_blocker(proxy_user_agents: list[str], ua: str, origin: str) -> str:
+    """客户端不能直连 CDN 的原因；能直连返回空串。
+
+    CDN 拒绝 UA 含 Lavf / python-requests 的请求，也不返回 CORS 头（浏览器跨域请求会失败）。
+    """
+    for p in proxy_user_agents:
+        if p and p in ua:
+            return f"客户端 UA 含 {p}，CDN 会拒绝"
+    if origin:
+        return "浏览器跨域请求，CDN 不返回 CORS 头"
+    return ""
 
 
 async def _resolve_or_http(request: Request, slug: str, **kw) -> dict:
@@ -96,7 +117,7 @@ async def _resolve_or_http(request: Request, slug: str, **kw) -> dict:
 
 @router.api_route("/play/{name}", methods=["GET", "HEAD"])
 async def play(name: str, request: Request, t: str = "", proxy: int = 0):
-    """proxy=1 强制中转（网页试播用：CDN 不带 CORS 头）。"""
+    """proxy=1 强制中转（网页试播用）。浏览器跨域请求（带 Origin）也走中转并返回 CORS 头。"""
     ctx = _ctx(request)
     _check_token(request, t)
     slug = name.lower().removesuffix(".m3u8")
@@ -106,15 +127,58 @@ async def play(name: str, request: Request, t: str = "", proxy: int = 0):
     v = await _resolve_or_http(request, slug)
     s = ctx.store.current
     ua = request.headers.get("user-agent", "")
-    proxied = bool(proxy) or s.play_mode == "proxy" or any(p and p in ua for p in s.proxy_user_agents)
+    origin = request.headers.get("origin", "")
+    proxied = bool(proxy) or s.play_mode == "proxy" or bool(direct_blocker(s.proxy_user_agents, ua, origin))
     left = int((v.get("hls_expires") or 0) - time.time())
     log.info("播放 %s：%s（地址剩余 %d 分钟，客户端 %s，UA %s）", slug, "中转" if proxied else "302",
              left // 60, request.client.host if request.client else "?", ua[:60])
     if proxied:
         ctx.metrics.inc("play_proxy")
-        return await _proxy_playlist(request, v, t)
-    ctx.metrics.inc("play_redirect")
-    return RedirectResponse(v["hls_url"], status_code=302)
+        resp = await _proxy_playlist(request, v, t)
+    else:
+        ctx.metrics.inc("play_redirect")
+        resp = RedirectResponse(v["hls_url"], status_code=302)
+    if origin:
+        resp.headers.update(CORS_HEADERS)
+    return resp
+
+
+@router.options("/play/{name}")
+@router.options("/hls/{slug}/{file}")
+async def cors_preflight():
+    return Response(status_code=204, headers=CORS_HEADERS)
+
+
+@router.get("/api/resolve/{name:path}")
+async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin: str = "",
+                              min_remaining: int | None = None):
+    """给 embyGateway 的 http_resolver 后端用：返回可直连的 CDN 地址；客户端不能直连时返回 409，由网关回退。
+
+    name 可以是 slug、slug.m3u8，也可以是网关 objectKey 原样（如 play/ipzz-983.m3u8），取最后一段。
+    """
+    ctx = _ctx(request)
+    s = ctx.store.current
+    if not s.resolve_token:
+        raise HTTPException(403, "未设置 resolve_token，接口未开放")
+    auth = request.headers.get("authorization", "")
+    given = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else request.query_params.get("token", "")
+    if not secrets.compare_digest(given.encode(), s.resolve_token.encode()):
+        raise HTTPException(401, "resolve_token 错误")
+    slug = name.rsplit("/", 1)[-1].lower().removesuffix(".m3u8")
+    if not SLUG_RE.fullmatch(slug):
+        raise HTTPException(404, f"无法识别的影片：{name}")
+    ctx.metrics.inc("resolve_requests")
+    reason = direct_blocker(s.proxy_user_agents, ua, origin)
+    if reason:
+        ctx.metrics.inc("resolve_fallback")
+        log.info("resolve %s：%s，让网关回退（UA %s）", slug, reason, ua[:60])
+        return JSONResponse({"slug": slug, "reason": reason}, status_code=409)
+    v = await _resolve_or_http(request, slug, min_remaining=min_remaining)
+    ctx.metrics.inc("resolve_direct")
+    expires = v.get("hls_expires") or 0
+    log.info("resolve %s：直连 CDN（地址剩余 %d 分钟，UA %s）", slug, (expires - time.time()) // 60, ua[:60])
+    return {"slug": slug, "url": v["hls_url"], "expires_at": expires,
+            "ttl": max(0, int(expires - time.time())), "duration": v.get("duration")}
 
 
 async def _proxy_playlist(request: Request, v: dict, t: str) -> Response:
@@ -170,7 +234,7 @@ async def hls_file(slug: str, file: str, request: Request, t: str = ""):
             finally:
                 await r.aclose()
 
-        headers = {}
+        headers = dict(CORS_HEADERS) if request.headers.get("origin") else {}
         if cl := resp.headers.get("content-length"):
             headers["Content-Length"] = cl
         return StreamingResponse(body(), media_type=resp.headers.get("content-type") or "video/mp2t", headers=headers)
