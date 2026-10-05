@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jable-strm"
+version = "0.1.0"
+description = "抓取 Jable 影片并生成 Emby/Jellyfin 可用的 strm，带 Web 控制台"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "curl_cffi>=0.11",
+  "selectolax>=0.3.27",
+  "aiosqlite>=0.20",
+  "pillow>=10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+jable-strm = "jable_strm.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["jable_strm*"]
+
+[tool.setuptools.package-data]
+jable_strm = ["static/*", "static/vendor/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

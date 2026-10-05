@@ -1,0 +1,25 @@
+services:
+  jable-strm:
+    build: .
+    image: jable-strm:latest
+    container_name: jable-strm
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      JABLE_UI_PASSWORD: "change-me"                     # Web 控制台密码，用户名默认 admin（JABLE_UI_USER）
+      JABLE_PUBLIC_BASE_URL: "http://192.168.1.10:8080"  # Emby/Jellyfin 访问本服务的地址，会写进 strm
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/data              # 数据库、日志、解析失败快照
+      - /srv/media/jable:/strm    # strm 输出目录；Emby/Jellyfin 挂载同一个宿主机目录
+    # user: "1000:1000"           # 需要和媒体服务器保持同一属主时打开
+
+  # 可选：所有域名都被 Cloudflare 拦截时的兜底解题服务。
+  # 启用：docker compose --profile solver up -d，然后在「设置 → 解题服务地址」填 http://byparr:8191
+  byparr:
+    image: ghcr.io/thephaseless/byparr:latest
+    container_name: byparr
+    restart: unless-stopped
+    profiles: ["solver"]
+    shm_size: 512mb

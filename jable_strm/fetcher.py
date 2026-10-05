@@ -1,0 +1,370 @@
+"""分层抓取器。
+
+L1：curl_cffi 模拟浏览器指纹，按顺序轮换多个域名；某个域名被拦就冷却（连续被拦翻倍），切到下一个。
+L2：全部域名都被拦时，如果配置了 Byparr / FlareSolverr，用它拿 cookie 和页面；成功后 cookie 注入 L1 会话。
+全部失败抛 Blocked，由任务引擎暂停等待冷却结束。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import random
+import time
+from dataclasses import asdict, dataclass, field
+from urllib.parse import urlsplit, urlunsplit
+
+from curl_cffi.requests import AsyncSession
+
+from .config import Settings, SettingsStore
+from .observability import Metrics
+
+log = logging.getLogger(__name__)
+
+MAX_COOLDOWN = 3600
+
+
+class FetchError(Exception):
+    """可重试的失败：网络错误、超时、5xx 等。"""
+
+
+class NotFound(Exception):
+    """页面不存在（404），不再重试。"""
+
+
+class Blocked(Exception):
+    """所有渠道都被拦截。"""
+
+    def __init__(self, message: str, retry_after: float) -> None:
+        super().__init__(message)
+        self.retry_after = max(5.0, retry_after)
+
+
+@dataclass
+class Page:
+    html: str
+    url: str
+    domain: str
+    via: str = "curl"
+
+
+@dataclass
+class DomainState:
+    base: str
+    cooldown_until: float = 0.0
+    block_streak: int = 0
+    ok: int = 0
+    blocked: int = 0
+    errors: int = 0
+    last_status: str = ""
+    last_ok_at: float = 0.0
+    cookies: dict[str, str] = field(default_factory=dict)
+    user_agent: str = ""
+
+    @property
+    def host(self) -> str:
+        return urlsplit(self.base).hostname or self.base
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d.pop("cookies")
+        d["host"] = self.host
+        d["cooling"] = max(0, int(self.cooldown_until - time.time()))
+        d["solver_cookie"] = bool(self.cookies)
+        return d
+
+
+class RateLimiter:
+    """按间隔放行的限速器（带 ±20% 抖动）；被拦时速率减半，连续成功后缓慢回升到上限。"""
+
+    def __init__(self, limit: float) -> None:
+        self.limit = limit
+        self.rate = limit
+        self._next_at = 0.0
+        self._streak = 0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            wait = self._next_at - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+                now = time.monotonic()
+            self._next_at = now + random.uniform(0.8, 1.2) / self.rate
+
+    def penalize(self) -> None:
+        self.rate = max(self.limit / 16, self.rate / 2)
+        self._streak = 0
+
+    def slow_down(self) -> None:
+        """超时等软错误：降到 3/4，可能是对方在软限流。"""
+        self.rate = max(self.limit / 16, self.rate * 0.75)
+        self._streak = 0
+
+    def reward(self) -> None:
+        self._streak += 1
+        if self._streak >= 30 and self.rate < self.limit:
+            self.rate = min(self.limit, self.rate * 1.25)
+            self._streak = 0
+
+    def set_limit(self, limit: float) -> None:
+        self.limit = limit
+        self.rate = limit
+        self._streak = 0
+
+
+def looks_like_challenge(html: str) -> bool:
+    head = html[:8000]
+    return "<title>Just a moment" in head or "_cf_chl_opt" in head or "<title>请稍候" in head
+
+
+def split_proxy(proxy: str) -> tuple[str, str, str]:
+    """'socks5://u:p@h:1080' -> ('socks5://h:1080', 'u', 'p')。"""
+    parts = urlsplit(proxy)
+    netloc = parts.hostname or ""
+    if parts.port:
+        netloc += f":{parts.port}"
+    server = urlunsplit((parts.scheme, netloc, "", "", ""))
+    return server, parts.username or "", parts.password or ""
+
+
+@dataclass
+class SolverResult:
+    status: int
+    html: str
+    url: str
+    cookies: dict[str, str]
+    user_agent: str
+
+
+async def call_solver(solver_url: str, url: str, proxy: str, timeout: int) -> SolverResult:
+    """调用 Byparr / FlareSolverr 的 /v1 接口。"""
+    body: dict = {"cmd": "request.get", "url": url, "maxTimeout": timeout * 1000}
+    headers = {}
+    if proxy:
+        server, user, password = split_proxy(proxy)
+        body["proxy"] = {"url": server, **({"username": user, "password": password} if user else {})}
+        headers["X-Proxy-Server"] = server
+        if user:
+            headers["X-Proxy-Username"] = user
+            headers["X-Proxy-Password"] = password
+    async with AsyncSession(trust_env=False) as s:
+        resp = await s.post(f"{solver_url}/v1", json=body, headers=headers, timeout=timeout + 15)
+    if resp.status_code != 200:
+        raise FetchError(f"解题服务返回 HTTP {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    sol = data.get("solution") or {}
+    if data.get("status") != "ok" or not sol:
+        raise FetchError(f"解题失败：{data.get('message', '')[:200]}")
+    cookies = {c["name"]: c["value"] for c in sol.get("cookies") or [] if "name" in c}
+    return SolverResult(
+        status=int(sol.get("status") or 0),
+        html=sol.get("response") or "",
+        url=sol.get("url") or url,
+        cookies=cookies,
+        user_agent=sol.get("userAgent") or "",
+    )
+
+
+class Fetcher:
+    def __init__(self, store: SettingsStore, metrics: Metrics) -> None:
+        self.store = store
+        self.metrics = metrics
+        self.domains: list[DomainState] = []
+        self.limiter = RateLimiter(store.current.rate_per_sec)
+        self._session: AsyncSession | None = None
+        self._solver_lock = asyncio.Lock()
+        self._sync_domains(store.current)
+        store.on_change(self._on_settings)
+
+    # ---- 会话与设置 ----
+
+    def _on_settings(self, old: Settings, new: Settings) -> None:
+        if old.domains != new.domains:
+            self._sync_domains(new)
+        if old.proxy != new.proxy or old.impersonate != new.impersonate:
+            self._reset_session()
+        if old.rate_per_sec != new.rate_per_sec:
+            self.limiter.set_limit(new.rate_per_sec)
+
+    def _sync_domains(self, s: Settings) -> None:
+        existing = {d.base: d for d in self.domains}
+        self.domains = [existing.get(base) or DomainState(base) for base in s.domains]
+
+    @property
+    def session(self) -> AsyncSession:
+        if self._session is None:
+            s = self.store.current
+            self._session = AsyncSession(
+                impersonate=s.impersonate or "chrome",
+                proxy=s.proxy or None,
+                trust_env=False,
+                max_clients=32,
+            )
+        return self._session
+
+    def _reset_session(self) -> None:
+        old, self._session = self._session, None
+        if old is not None:
+            asyncio.get_running_loop().create_task(self._close_later(old))
+
+    @staticmethod
+    async def _close_later(session: AsyncSession) -> None:
+        await asyncio.sleep(120)  # 等进行中的请求（例如播放中转）结束
+        await session.close()
+
+    async def close(self) -> None:
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+
+    def reset_cooldowns(self) -> None:
+        for d in self.domains:
+            d.cooldown_until = 0
+            d.block_streak = 0
+        self.limiter.set_limit(self.store.current.rate_per_sec)
+
+    def blocked_for(self) -> float:
+        """距离最早一个域名解除冷却还有多少秒；有可用域名时为 0。"""
+        now = time.time()
+        if any(d.cooldown_until <= now for d in self.domains):
+            return 0.0
+        return min(d.cooldown_until for d in self.domains) - now
+
+    # ---- 站点页面 ----
+
+    @staticmethod
+    def _to_path(path_or_url: str) -> str:
+        if "://" in path_or_url:
+            p = urlsplit(path_or_url)
+            return p.path + (f"?{p.query}" if p.query else "")
+        return path_or_url if path_or_url.startswith("/") else "/" + path_or_url
+
+    def _mark_blocked(self, dom: DomainState, reason: str) -> None:
+        dom.blocked += 1
+        dom.block_streak += 1
+        cool = min(MAX_COOLDOWN, self.store.current.domain_cooldown * 2 ** (dom.block_streak - 1))
+        dom.cooldown_until = time.time() + cool
+        dom.last_status = f"被拦截（{reason}），冷却 {cool}s"
+        self.limiter.penalize()
+        self.metrics.inc("fetch_blocked")
+        log.warning("%s 被拦截（%s），冷却 %ss，限速降到 %.2f 次/秒", dom.host, reason, cool, self.limiter.rate)
+
+    async def get_page(self, path: str, *, priority: bool = False) -> Page:
+        """抓取站点页面。priority=True 时跳过限速（播放请求用）。"""
+        path = self._to_path(path)
+        s = self.store.current
+        now = time.time()
+        candidates = [d for d in self.domains if d.cooldown_until <= now]
+        errors: list[str] = []
+        for dom in candidates:
+            if not priority:
+                await self.limiter.acquire()
+            url = dom.base + path
+            headers = {"User-Agent": dom.user_agent} if dom.user_agent else None
+            try:
+                resp = await self.session.get(
+                    url, timeout=s.request_timeout, headers=headers, cookies=dom.cookies or None
+                )
+            except Exception as e:
+                dom.errors += 1
+                dom.last_status = f"网络错误：{e}"[:200]
+                self.metrics.inc("fetch_error")
+                self.limiter.slow_down()
+                errors.append(f"{dom.host}: {e}")
+                log.info("请求失败 %s：%s", url, e)
+                continue
+            self.metrics.request()
+            status = resp.status_code
+            mitigated = (resp.headers.get("cf-mitigated") or "").lower()
+            if "challenge" in mitigated or status in (403, 429, 503) or looks_like_challenge(resp.text):
+                self._mark_blocked(dom, f"HTTP {status}" + (" challenge" if mitigated else ""))
+                continue
+            if status == 404:
+                dom.ok += 1
+                self.metrics.inc("fetch_404")
+                raise NotFound(url)
+            if status != 200:
+                dom.errors += 1
+                dom.last_status = f"HTTP {status}"
+                self.metrics.inc("fetch_error")
+                errors.append(f"{dom.host}: HTTP {status}")
+                continue
+            dom.ok += 1
+            dom.block_streak = 0
+            dom.last_ok_at = time.time()
+            dom.last_status = "正常"
+            self.limiter.reward()
+            self.metrics.inc("fetch_ok")
+            return Page(resp.text, str(resp.url), dom.base)
+
+        if errors:
+            raise FetchError("；".join(errors))
+        page = await self._solve(path)
+        if page is not None:
+            return page
+        raise Blocked("所有域名都被拦截", self.blocked_for())
+
+    async def _solve(self, path: str) -> Page | None:
+        s = self.store.current
+        if not s.solver_url:
+            return None
+        async with self._solver_lock:  # 解题慢且占资源，串行
+            dom = self.domains[0]
+            url = dom.base + path
+            log.info("L1 全部被拦，调用解题服务：%s", url)
+            try:
+                result = await call_solver(s.solver_url, url, s.proxy, s.solver_timeout)
+            except Exception as e:
+                self.metrics.inc("solver_error")
+                log.warning("解题服务失败：%s", e)
+                return None
+            if result.status == 404:
+                raise NotFound(url)
+            if result.status != 200 or looks_like_challenge(result.html):
+                self.metrics.inc("solver_fail")
+                log.warning("解题服务未能通过挑战（HTTP %s）", result.status)
+                return None
+            dom.cookies = result.cookies
+            dom.user_agent = result.user_agent
+            dom.cooldown_until = 0
+            dom.block_streak = 0
+            dom.last_status = "解题成功，已注入 cookie"
+            self.metrics.inc("solver_ok")
+            log.info("解题成功，%s 恢复使用（cookie %d 个）", dom.host, len(result.cookies))
+            return Page(result.html, result.url, dom.base, via="solver")
+
+    async def test_domains(self) -> list[dict]:
+        """逐个测试域名连通性（忽略冷却），成功的解除冷却。"""
+        out = []
+        for dom in self.domains:
+            t0 = time.monotonic()
+            try:
+                resp = await self.session.get(dom.base + "/", timeout=self.store.current.request_timeout)
+                ms = int((time.monotonic() - t0) * 1000)
+                blocked = "challenge" in (resp.headers.get("cf-mitigated") or "") or looks_like_challenge(resp.text)
+                ok = resp.status_code == 200 and not blocked
+                if ok:
+                    dom.cooldown_until = 0
+                    dom.block_streak = 0
+                    dom.last_status = "正常"
+                out.append({"host": dom.host, "status": resp.status_code, "blocked": blocked, "ok": ok, "ms": ms})
+            except Exception as e:
+                out.append({"host": dom.host, "status": 0, "blocked": False, "ok": False, "error": str(e)[:200]})
+        return out
+
+    # ---- CDN / 封面 ----
+
+    async def get_bytes(self, url: str, *, referer: str | None = None) -> bytes:
+        try:
+            resp = await self.session.get(
+                url, timeout=self.store.current.request_timeout, headers={"Referer": referer} if referer else None
+            )
+        except Exception as e:
+            raise FetchError(f"{urlsplit(url).hostname}: {e}") from e
+        if resp.status_code == 404:
+            raise NotFound(url)
+        if resp.status_code != 200:
+            raise FetchError(f"{urlsplit(url).hostname}: HTTP {resp.status_code}")
+        return resp.content

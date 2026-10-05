@@ -1,0 +1,113 @@
+"""日志（stdout + 滚动文件 + 内存环形缓冲推给 Web）与运行指标。"""
+
+from __future__ import annotations
+
+import asyncio
+import itertools
+import logging
+import sys
+import time
+from collections import Counter, deque
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+
+
+class RingHandler(logging.Handler):
+    """保留最近 N 条日志，并推送给订阅者（SSE）。"""
+
+    def __init__(self, capacity: int = 2000) -> None:
+        super().__init__()
+        self.records: deque[dict] = deque(maxlen=capacity)
+        self._ids = itertools.count(1)
+        self._subscribers: set[asyncio.Queue] = set()
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        self._loop = loop
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()
+            if record.exc_info:
+                msg += "\n" + logging.Formatter().formatException(record.exc_info)
+            item = {
+                "id": next(self._ids),
+                "ts": record.created,
+                "level": record.levelname,
+                "name": record.name.removeprefix("jable_strm."),
+                "msg": msg,
+            }
+            self.records.append(item)
+            if self._loop is not None and self._subscribers:
+                for q in list(self._subscribers):
+                    self._loop.call_soon_threadsafe(self._offer, q, item)
+        except Exception:
+            self.handleError(record)
+
+    @staticmethod
+    def _offer(q: asyncio.Queue, item: dict) -> None:
+        if q.full():
+            return
+        q.put_nowait(item)
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self._subscribers.discard(q)
+
+    def since(self, after_id: int = 0, limit: int = 500) -> list[dict]:
+        items = [r for r in self.records if r["id"] > after_id]
+        return items[-limit:]
+
+
+ring = RingHandler()
+
+
+def setup_logging(data_dir: Path, level: str = "INFO") -> None:
+    log_dir = data_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    fmt = logging.Formatter(LOG_FORMAT)
+    stdout = logging.StreamHandler(sys.stdout)
+    stdout.setFormatter(fmt)
+    file = RotatingFileHandler(log_dir / "jable-strm.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    file.setFormatter(fmt)
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(logging.WARNING)
+    for h in (stdout, file, ring):
+        root.addHandler(h)
+    logging.getLogger("jable_strm").setLevel(level)
+    for name in ("uvicorn", "uvicorn.error"):
+        logging.getLogger(name).setLevel(logging.INFO)
+
+
+class Metrics:
+    """进程内计数器 + 最近一段时间的请求速率。"""
+
+    def __init__(self) -> None:
+        self.counters: Counter[str] = Counter()
+        self.started_at = time.time()
+        self._requests: deque[float] = deque(maxlen=10000)
+
+    def inc(self, key: str, n: int = 1) -> None:
+        self.counters[key] += n
+
+    def request(self) -> None:
+        self._requests.append(time.time())
+
+    def requests_per_minute(self) -> int:
+        cutoff = time.time() - 60
+        return sum(1 for t in self._requests if t >= cutoff)
+
+    def snapshot(self) -> dict:
+        return {
+            "uptime": int(time.time() - self.started_at),
+            "requests_per_minute": self.requests_per_minute(),
+            "counters": dict(self.counters),
+        }

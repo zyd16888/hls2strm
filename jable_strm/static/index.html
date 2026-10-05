@@ -1,0 +1,467 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jable STRM</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js"></script>
+<script defer src="/static/vendor/alpine.min.js"></script>
+</head>
+<body x-data="app()" x-init="init()" x-cloak>
+
+<header>
+  <div class="brand">Jable STRM</div>
+  <nav>
+    <template x-for="t in tabs" :key="t.id">
+      <a href="#" :class="{active: tab === t.id}" @click.prevent="go(t.id)" x-text="t.name"></a>
+    </template>
+  </nav>
+  <div class="spacer"></div>
+  <span class="pill" :class="engineState().cls" x-text="engineState().text"></span>
+</header>
+
+<main>
+  <!-- ================= 概览 ================= -->
+  <section x-show="tab === 'overview'">
+    <template x-if="s.engine && s.engine.blocked_for > 0">
+      <div class="notice warn">
+        <span>所有抓取通道都被拦截，<b x-text="fmtDur(s.engine.blocked_for)"></b> 后自动重试。</span>
+        <button class="sm" @click="testDomains()">测试连通性</button>
+        <button class="sm" @click="post('/api/fetcher/reset').then(refreshStatus)">立即重试</button>
+      </div>
+    </template>
+
+    <div class="grid stats">
+      <div class="card stat"><div class="label">影片总数</div><div class="value" x-text="fmtNum(s.videos?.total)"></div>
+        <div class="sub">下架 <span x-text="fmtNum(s.videos?.gone)"></span></div></div>
+      <div class="card stat"><div class="label">已补详情</div><div class="value" x-text="fmtNum(s.videos?.with_detail)"></div>
+        <div class="sub" x-text="pct(s.videos?.with_detail, s.videos?.total)"></div></div>
+      <div class="card stat"><div class="label">已写 strm</div><div class="value" x-text="fmtNum(s.videos?.with_strm)"></div>
+        <div class="sub">封面 <span x-text="fmtNum(s.videos?.with_cover)"></span></div></div>
+      <div class="card stat"><div class="label">待处理子任务</div><div class="value" x-text="fmtNum(queueSum('pending'))"></div>
+        <div class="sub">运行中 <span x-text="queueSum('running')"></span></div></div>
+      <div class="card stat"><div class="label">失败子任务</div><div class="value" :style="queueSum('failed') ? 'color:var(--err)' : ''" x-text="fmtNum(queueSum('failed'))"></div>
+        <div class="sub">活动任务内</div></div>
+      <div class="card stat"><div class="label">请求 / 分钟</div><div class="value" x-text="s.metrics?.requests_per_minute ?? '-'"></div>
+        <div class="sub">限速 <span x-text="s.rate ? s.rate.current + ' / ' + s.rate.limit : '-'"></span> 次/秒</div></div>
+      <div class="card stat"><div class="label">被拦截次数</div><div class="value" x-text="fmtNum(c('fetch_blocked'))"></div>
+        <div class="sub">网络错误 <span x-text="fmtNum(c('fetch_error'))"></span></div></div>
+      <div class="card stat"><div class="label">播放请求</div><div class="value" x-text="fmtNum(c('play_requests'))"></div>
+        <div class="sub">302 <span x-text="c('play_redirect')"></span> · 中转 <span x-text="c('play_proxy')"></span> · 换新 <span x-text="c('play_refresh')"></span></div></div>
+    </div>
+
+    <div class="grid two section">
+      <div class="card">
+        <h3>引擎
+          <span class="actions">
+            <button class="sm" x-show="!s.engine?.paused" @click="post('/api/engine/pause').then(refreshStatus)">暂停全部</button>
+            <button class="sm primary" x-show="s.engine?.paused" @click="post('/api/engine/resume').then(refreshStatus)">恢复</button>
+          </span>
+        </h3>
+        <dl class="kv">
+          <dt>状态</dt><dd><span class="pill" :class="engineState().cls" x-text="engineState().text"></span></dd>
+          <dt>Worker</dt><dd x-text="s.engine?.workers"></dd>
+          <dt>运行时长</dt><dd x-text="fmtDur(s.metrics?.uptime)"></dd>
+          <dt>输出目录</dt><dd class="mono" x-text="s.output_dir"></dd>
+          <dt>strm 地址</dt><dd class="mono" x-text="s.public_base_url + '/play/…'"></dd>
+          <dt>播放模式</dt><dd x-text="playModeName(s.play_mode)"></dd>
+        </dl>
+        <div class="section small muted" x-show="!(s.engine?.running?.length)">当前没有执行中的子任务</div>
+        <div class="table-wrap section" x-show="s.engine?.running?.length">
+          <table>
+            <thead><tr><th>任务</th><th>类型</th><th>目标</th><th class="num">第几次</th><th class="num">已用时</th></tr></thead>
+            <tbody>
+              <template x-for="r in s.engine?.running || []" :key="r.id">
+                <tr><td>#<span x-text="r.job_id"></span></td><td x-text="kindName(r.kind)"></td>
+                  <td class="mono" x-text="r.target"></td><td class="num" x-text="r.attempt"></td>
+                  <td class="num" x-text="fmtDur(s.now - r.started)"></td></tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>抓取通道
+          <span class="actions">
+            <button class="sm" @click="testDomains()" :disabled="testing">测试连通性</button>
+            <button class="sm" @click="post('/api/fetcher/reset').then(refreshStatus)">重置冷却</button>
+          </span>
+        </h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>域名</th><th>状态</th><th class="num">成功</th><th class="num">被拦</th><th class="num">错误</th></tr></thead>
+            <tbody>
+              <template x-for="d in s.domains || []" :key="d.base">
+                <tr>
+                  <td class="mono" x-text="d.host"></td>
+                  <td>
+                    <span class="pill" :class="d.cooling ? 'warn' : (d.ok ? 'ok' : '')" x-text="d.cooling ? '冷却 ' + fmtDur(d.cooling) : (d.ok ? '可用' : '未使用')"></span>
+                    <div class="small muted ellipsis" :title="d.last_status" x-text="d.last_status"></div>
+                  </td>
+                  <td class="num" x-text="fmtNum(d.ok)"></td><td class="num" x-text="fmtNum(d.blocked)"></td><td class="num" x-text="fmtNum(d.errors)"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+        <template x-if="testResult">
+          <div class="section small">
+            <template x-for="r in testResult" :key="r.host">
+              <div><span class="chip" :class="r.ok ? 'ok' : 'err'" x-text="r.ok ? '通' : '不通'"></span>
+                <span class="mono" x-text="r.host"></span>
+                <span class="muted" x-text="r.error ? r.error : ('HTTP ' + r.status + (r.blocked ? '，被 CF 拦截' : '') + '，' + r.ms + 'ms')"></span></div>
+            </template>
+          </div>
+        </template>
+        <div class="section small muted">解题服务（Byparr/FlareSolverr）：<span x-text="s.solver || '未配置'"></span></div>
+      </div>
+    </div>
+
+    <div class="grid two section">
+      <div class="card">
+        <h3>快捷操作</h3>
+        <div class="toolbar">
+          <button class="primary" @click="quickJob('full')">开始全站抓取</button>
+          <button @click="quickJob('incremental')">立即增量</button>
+          <button @click="quickJob('backfill')">补全缺失详情</button>
+          <button @click="quickJob('rewrite')">重写全部输出</button>
+        </div>
+        <h3 class="section">队列</h3>
+        <table>
+          <thead><tr><th>类型</th><th class="num">待处理</th><th class="num">运行中</th><th class="num">完成</th><th class="num">失败</th><th class="num">下架</th></tr></thead>
+          <tbody>
+            <template x-for="[k, q] in Object.entries(s.queue || {})" :key="k">
+              <tr><td x-text="kindName(k)"></td><td class="num" x-text="fmtNum(q.pending)"></td><td class="num" x-text="fmtNum(q.running)"></td>
+                <td class="num" x-text="fmtNum(q.done)"></td><td class="num" x-text="fmtNum(q.failed)"></td><td class="num" x-text="fmtNum(q.gone)"></td></tr>
+            </template>
+            <tr x-show="!Object.keys(s.queue || {}).length"><td colspan="6" class="muted">没有活动任务</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h3>最近失败</h3>
+        <div class="muted small" x-show="!(s.failures?.length)">暂无</div>
+        <template x-for="f in s.failures || []" :key="f.id">
+          <div class="small" style="padding:6px 0;border-bottom:1px solid var(--border)">
+            <span class="chip" x-text="kindName(f.kind)"></span><span class="mono" x-text="f.target"></span>
+            <span class="muted">· 任务 #<span x-text="f.job_id"></span> · <span x-text="fmtTime(f.updated_at)"></span></span>
+            <div class="err-text" x-text="f.last_error"></div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <div class="card section">
+      <h3>最近日志 <span class="actions"><a href="#" @click.prevent="go('logs')">全部日志</a></span></h3>
+      <div class="logs short" x-ref="miniLogs">
+        <template x-for="l in logs.slice(-80)" :key="l.id">
+          <div class="log-line"><span class="ts" x-text="fmtClock(l.ts)"></span> <span :class="'lv-' + l.level" x-text="l.level.padEnd(7)"></span> <span x-text="l.msg"></span></div>
+        </template>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 任务 ================= -->
+  <section x-show="tab === 'jobs'">
+    <div class="card">
+      <h3>新建任务</h3>
+      <div class="form-row">
+        <label class="field"><span>类型</span>
+          <select x-model="form.kind">
+            <option value="full">全站（最新更新全部页）</option>
+            <option value="incremental">增量（最新更新）</option>
+            <option value="list">列表地址</option>
+            <option value="videos">指定影片</option>
+            <option value="backfill">补全缺失详情</option>
+            <option value="rewrite">重写全部输出</option>
+          </select>
+        </label>
+        <template x-if="form.kind === 'list'">
+          <div class="form-row grow" style="flex:1">
+            <label class="field grow"><span>列表地址（站点网址或路径）</span>
+              <input x-model="form.source" list="presets" placeholder="/tags/creampie/ 或 https://jable.tv/models/xxx/">
+              <datalist id="presets"><template x-for="p in meta.presets" :key="p.source"><option :value="p.source" x-text="p.name"></option></template></datalist>
+            </label>
+            <label class="field"><span>排序</span>
+              <select x-model="form.sort"><template x-for="[k, v] in Object.entries(meta.sorts || {})" :key="k"><option :value="k" x-text="v" :selected="k === form.sort"></option></template></select>
+            </label>
+            <label class="field"><span>起始页</span><input type="number" min="1" style="width:80px" x-model.number="form.start_page"></label>
+            <label class="field"><span>结束页（0=最后）</span><input type="number" min="0" style="width:110px" x-model.number="form.end_page"></label>
+          </div>
+        </template>
+        <template x-if="['full', 'list'].includes(form.kind)">
+          <label class="field"><span>抓详情</span><input type="checkbox" x-model="form.detail" style="margin:7px 0"></label>
+        </template>
+        <button class="primary" @click="createJob()">创建</button>
+      </div>
+      <template x-if="form.kind === 'videos'">
+        <label class="field section"><span>影片网址或番号 slug，每行一个</span>
+          <textarea x-model="form.urls" placeholder="https://jable.tv/videos/ipzz-983/&#10;sone-001-c"></textarea></label>
+      </template>
+      <div class="small muted section" x-text="jobHint()"></div>
+    </div>
+
+    <div class="card section">
+      <h3>任务列表 <span class="actions"><button class="sm" @click="loadJobs()">刷新</button></span></h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>#</th><th>名称</th><th>状态</th><th>进度</th><th>子任务</th><th>创建</th><th>耗时</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="j in jobs" :key="j.id">
+              <tr style="cursor:pointer" @click="openJob(j)" :style="openJobId === j.id ? 'background:var(--panel-2)' : ''">
+                <td class="num" x-text="j.id"></td>
+                <td><div x-text="j.name"></div><div class="small muted" x-text="kindName(j.kind)"></div></td>
+                <td><span class="pill" :class="jobCls(j.status)" x-text="jobStatusName(j.status)"></span></td>
+                <td style="min-width:140px"><div class="progress"><div :style="'width:' + jobPct(j) + '%'"></div></div>
+                  <div class="small muted" x-text="jobProgressText(j)"></div></td>
+                <td class="small">
+                  <template x-for="[st, n] in Object.entries(j.tasks || {})" :key="st">
+                    <span class="chip" :class="taskCls(st)" x-text="taskStatusName(st) + ' ' + fmtNum(n)"></span>
+                  </template>
+                </td>
+                <td class="nowrap small" x-text="fmtTime(j.created_at)"></td>
+                <td class="nowrap small" x-text="fmtDur((j.finished_at || s.now) - j.created_at)"></td>
+                <td class="nowrap" @click.stop>
+                  <button class="sm" x-show="j.status === 'running'" @click="jobAction(j, 'pause')">暂停</button>
+                  <button class="sm" x-show="j.status === 'paused'" @click="jobAction(j, 'resume')">恢复</button>
+                  <button class="sm" x-show="(j.tasks?.failed || 0) > 0" @click="jobAction(j, 'retry')">重试失败</button>
+                  <button class="sm danger" x-show="['running','paused'].includes(j.status)" @click="jobAction(j, 'cancel')">取消</button>
+                  <button class="sm danger" x-show="!['running','paused'].includes(j.status)" @click="deleteJob(j)">删除</button>
+                </td>
+              </tr>
+            </template>
+            <tr x-show="!jobs.length"><td colspan="8" class="muted">还没有任务</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <template x-if="openJobId">
+      <div class="card section">
+        <h3>任务 #<span x-text="openJobId"></span> 的子任务
+          <span class="actions">
+            <select x-model="taskFilter" @change="loadTasks()">
+              <option value="">全部</option><option value="failed">失败</option><option value="pending">待处理</option>
+              <option value="running">运行中</option><option value="done">完成</option><option value="gone">下架</option><option value="cancelled">已取消</option>
+            </select>
+            <button class="sm" @click="openJobId = null">关闭</button>
+          </span>
+        </h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>ID</th><th>类型</th><th>目标</th><th>状态</th><th class="num">尝试</th><th>下次执行</th><th class="num">耗时</th><th>错误</th></tr></thead>
+            <tbody>
+              <template x-for="t in tasks" :key="t.id">
+                <tr>
+                  <td class="num" x-text="t.id"></td><td x-text="kindName(t.kind)"></td><td class="mono" x-text="t.target"></td>
+                  <td><span class="chip" :class="taskCls(t.status)" x-text="taskStatusName(t.status)"></span></td>
+                  <td class="num" x-text="t.attempts"></td>
+                  <td class="small nowrap" x-text="t.status === 'pending' && t.next_run_at > s.now ? fmtTime(t.next_run_at) : ''"></td>
+                  <td class="num small" x-text="t.duration_ms != null ? t.duration_ms + 'ms' : ''"></td>
+                  <td class="small err-text" x-html="errorHtml(t.last_error)"></td>
+                </tr>
+              </template>
+              <tr x-show="!tasks.length"><td colspan="8" class="muted">没有子任务</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </template>
+  </section>
+
+  <!-- ================= 影片库 ================= -->
+  <section x-show="tab === 'videos'">
+    <div class="card">
+      <div class="toolbar">
+        <input style="flex:1;min-width:200px" placeholder="搜索番号、标题、女优、标签" x-model="vq.q" @input.debounce.400ms="vq.page = 1; loadVideos()">
+        <select x-model="vq.filter" @change="vq.page = 1; loadVideos()">
+          <option value="">全部</option><option value="no_detail">缺详情</option><option value="no_output">未输出</option><option value="gone">已下架</option>
+        </select>
+        <span class="muted small">共 <b x-text="fmtNum(videos.total)"></b> 部</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th></th><th>番号</th><th>标题</th><th>女优</th><th class="num">时长</th><th>上市</th><th>详情</th><th>原站播放地址（缓存）</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="v in videos.items" :key="v.id">
+              <tr>
+                <td><img class="thumb" loading="lazy" referrerpolicy="no-referrer" :src="v.thumb_url || v.cover_url" alt="" style="cursor:pointer" @click="openDetail(v)"></td>
+                <td class="mono nowrap"><span x-text="v.slug.toUpperCase()"></span>
+                  <div x-show="v.status === 'gone'"><span class="chip err">已下架</span></div></td>
+                <td><div class="ellipsis" :title="v.title" x-text="v.title"></div>
+                  <div class="small muted ellipsis" x-text="(v.categories || []).map(x => x.name).join(' · ')"></div></td>
+                <td class="small" x-text="(v.models || []).map(m => m.name).join('、')"></td>
+                <td class="num small" x-text="fmtClockDur(v.duration)"></td>
+                <td class="small nowrap" x-text="v.release_date"></td>
+                <td><span class="chip" :class="v.detail_at ? 'ok' : ''" x-text="v.detail_at ? '已补' : '缺'"></span></td>
+                <td class="small nowrap">
+                  <span class="chip" :class="hlsState(v).cls" x-text="hlsState(v).text"></span>
+                  <button class="sm" x-show="v.hls_url" @click="copy(v.hls_url)" :title="v.hls_url">复制</button>
+                </td>
+                <td class="nowrap">
+                  <button class="sm" @click="playVideo(v)">试播</button>
+                  <button class="sm" @click="openDetail(v)">详情</button>
+                  <button class="sm" @click="refreshVideo(v)">刷新</button>
+                </td>
+              </tr>
+            </template>
+            <tr x-show="!videos.items.length"><td colspan="9" class="muted">没有影片</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button class="sm" :disabled="vq.page <= 1" @click="vq.page--; loadVideos()">上一页</button>
+        <span class="small muted">第 <span x-text="vq.page"></span> / <span x-text="Math.max(1, Math.ceil(videos.total / vq.size))"></span> 页</span>
+        <button class="sm" :disabled="vq.page * vq.size >= videos.total" @click="vq.page++; loadVideos()">下一页</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 设置 ================= -->
+  <section x-show="tab === 'settings'">
+    <template x-if="needRewrite">
+      <div class="notice warn">
+        <span>改了影响 strm 内容或位置的设置，已有文件需要按新设置重写。</span>
+        <button class="sm primary" @click="quickJob('rewrite'); needRewrite = false">重写全部输出</button>
+      </div>
+    </template>
+    <div class="toolbar">
+      <button class="primary" @click="saveSettings()" :disabled="!changedKeys().length">保存（<span x-text="changedKeys().length"></span> 项改动）</button>
+      <button @click="loadSettings()">放弃改动</button>
+      <span class="small muted">生效输出目录：<code x-text="settings.effective?.output_dir"></code> · 生效对外地址：<code x-text="settings.effective?.public_base_url"></code></span>
+    </div>
+    <template x-for="g in settingGroups" :key="g.title">
+      <div class="card settings-group">
+        <h3 x-text="g.title"></h3>
+        <template x-for="k in g.keys" :key="k">
+          <div class="setting" :class="{changed: isChanged(k)}" x-show="settings.schema?.[k]">
+            <div class="name"><span x-text="labels[k] || k"></span><code x-text="k"></code></div>
+            <div class="control">
+              <template x-if="fieldType(k) === 'bool'">
+                <input type="checkbox" x-model="draft[k]">
+              </template>
+              <template x-if="fieldType(k) === 'enum'">
+                <select x-model="draft[k]"><template x-for="o in settings.schema[k].enum" :key="o"><option :value="o" x-text="enumName(k, o)" :selected="o === draft[k]"></option></template></select>
+              </template>
+              <template x-if="fieldType(k) === 'number'">
+                <input type="number" :step="settings.schema[k].type === 'integer' ? 1 : 0.1" :min="settings.schema[k].minimum ?? settings.schema[k].exclusiveMinimum" :max="settings.schema[k].maximum" x-model.number="draft[k]">
+              </template>
+              <template x-if="fieldType(k) === 'list'">
+                <textarea :value="(draft[k] || []).join('\n')" @input="draft[k] = $event.target.value.split('\n').map(x => x.trim()).filter(Boolean)"></textarea>
+              </template>
+              <template x-if="fieldType(k) === 'text'">
+                <input type="text" x-model="draft[k]" spellcheck="false">
+              </template>
+              <div class="desc" x-text="settings.schema[k].description"></div>
+            </div>
+          </div>
+        </template>
+      </div>
+    </template>
+  </section>
+
+  <!-- ================= 日志 ================= -->
+  <section x-show="tab === 'logs'">
+    <div class="card">
+      <div class="toolbar">
+        <select x-model="logLevel"><option value="">全部级别</option><option value="INFO">INFO 及以上</option><option value="WARNING">WARNING 及以上</option><option value="ERROR">ERROR</option></select>
+        <input placeholder="过滤关键字" x-model="logFilter" style="flex:1;min-width:160px">
+        <label class="small"><input type="checkbox" x-model="logFollow"> 自动滚动</label>
+        <span class="pill" :class="logConnected ? 'ok' : 'err'" x-text="logConnected ? '实时' : '断开'"></span>
+        <button class="sm" @click="logs = []">清空</button>
+      </div>
+      <div class="logs" x-ref="logBox">
+        <template x-for="l in filteredLogs()" :key="l.id">
+          <div class="log-line"><span class="ts" x-text="fmtTime(l.ts)"></span> <span :class="'lv-' + l.level" x-text="l.level.padEnd(7)"></span> <span class="src" x-text="l.name"></span> <span x-text="l.msg"></span></div>
+        </template>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- 影片详情 -->
+<template x-if="detail">
+  <div class="modal-bg" @click.self="detail = null" @keydown.escape.window="detail = null">
+    <div class="modal detail-modal">
+      <h3 style="margin:0 0 12px;display:flex;gap:8px;align-items:center">
+        <span class="mono" x-text="detail.slug.toUpperCase()"></span>
+        <span class="chip err" x-show="detail.status === 'gone'">已下架</span>
+        <span style="margin-left:auto;display:flex;gap:6px">
+          <button class="sm" @click="playVideo(detail)">试播</button>
+          <button class="sm" @click="refreshVideo(detail)" :disabled="detail._busy">刷新（重新抓详情和地址）</button>
+          <button class="sm" @click="detail = null">关闭</button>
+        </span>
+      </h3>
+      <div class="detail-head">
+        <img class="detail-cover" referrerpolicy="no-referrer" :src="detail.cover_url || detail.thumb_url" alt="">
+        <div style="min-width:0">
+          <div style="font-weight:600;margin-bottom:6px" x-text="detail.title"></div>
+          <dl class="kv">
+            <dt>女优</dt><dd x-text="(detail.models || []).map(m => m.name).join('、') || '-'"></dd>
+            <dt>分类</dt><dd x-text="(detail.categories || []).map(x => x.name).join(' · ') || '-'"></dd>
+            <dt>标签</dt><dd x-text="(detail.tags || []).map(x => x.name).join(' · ') || '-'"></dd>
+            <dt>上市</dt><dd x-text="detail.release_date || '-'"></dd>
+            <dt>时长</dt><dd x-text="fmtClockDur(detail.duration) || '-'"></dd>
+            <dt>画质</dt><dd x-text="detail.quality || '-'"></dd>
+            <dt>观看 / 收藏</dt><dd x-text="fmtNum(detail.views) + ' / ' + fmtNum(detail.favs)"></dd>
+            <dt>videoId</dt><dd class="mono" x-text="detail.id"></dd>
+            <dt>入库 / 详情</dt><dd x-text="fmtTime(detail.created_at) + ' / ' + (detail.detail_at ? fmtTime(detail.detail_at) : '未抓')"></dd>
+          </dl>
+        </div>
+      </div>
+
+      <div class="url-list">
+        <div class="url-row">
+          <div class="url-label">原站播放地址（CDN，缓存）
+            <span class="chip" :class="hlsState(detail).cls" x-text="hlsState(detail).text"></span>
+          </div>
+          <template x-if="detail.hls_url">
+            <div class="url-box"><code x-text="detail.hls_url"></code><button class="sm" @click="copy(detail.hls_url)">复制</button></div>
+          </template>
+          <div class="small muted" x-show="!detail.hls_url">还没有缓存，播放或点「刷新」时获取。</div>
+          <div class="small muted" x-show="detail.hls_url">
+            获取于 <span x-text="fmtTime(detail.detail_at)"></span>，过期于 <span x-text="fmtTime(detail.hls_expires)"></span>（约 3 小时有效）。
+            CDN 不接受 UA 含 Lavf / python-requests 的请求，外部播放器用 ffmpeg 拉流时需要换 UA。
+          </div>
+        </div>
+        <div class="url-row">
+          <div class="url-label">本服务播放地址（strm 内容）</div>
+          <div class="url-box"><code x-text="detail.play_url"></code><button class="sm" @click="copy(detail.play_url)">复制</button></div>
+        </div>
+        <div class="url-row">
+          <div class="url-label">原站页面</div>
+          <template x-for="u in siteUrls(detail)" :key="u">
+            <div class="url-box"><a :href="u" target="_blank" rel="noreferrer" class="mono" x-text="u"></a><button class="sm" @click="copy(u)">复制</button></div>
+          </template>
+        </div>
+        <div class="url-row">
+          <div class="url-label">strm 文件</div>
+          <div class="url-box"><code x-text="detail.strm_path || '尚未输出'"></code><button class="sm" x-show="detail.strm_path" @click="copy(detail.strm_path)">复制</button></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<!-- 试播 -->
+<template x-if="player">
+  <div class="modal-bg" @click.self="closePlayer()">
+    <div class="modal">
+      <h3 style="margin:0 0 10px;display:flex;gap:8px;align-items:center">
+        <span class="mono" x-text="player.slug.toUpperCase()"></span>
+        <span class="small muted ellipsis" x-text="player.title"></span>
+        <button class="sm" style="margin-left:auto" @click="closePlayer()">关闭</button>
+      </h3>
+      <video x-ref="video" controls autoplay playsinline></video>
+      <div class="small muted" style="margin-top:6px">网页试播经本服务中转；Emby/Jellyfin 按设置的播放模式访问。</div>
+    </div>
+  </div>
+</template>
+
+<template x-if="toast">
+  <div class="toast" :class="toast.err ? 'err' : ''" x-text="toast.msg"></div>
+</template>
+</body>
+</html>

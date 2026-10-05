@@ -1,0 +1,363 @@
+// Jable STRM 控制台（Alpine.js）
+
+const KIND_NAMES = {
+  list: "列表页", detail: "详情页", rewrite: "重写输出",
+  crawl: "列表抓取", incremental: "增量", videos: "指定影片",
+};
+const JOB_STATUS = { running: "运行中", paused: "已暂停", done: "已完成", cancelled: "已取消" };
+const TASK_STATUS = { pending: "待处理", running: "运行中", done: "完成", failed: "失败", gone: "下架", cancelled: "已取消" };
+const LEVELS = { DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50 };
+
+const SETTING_GROUPS = [
+  { title: "抓取", keys: ["domains", "proxy", "impersonate", "rate_per_sec", "concurrency", "request_timeout", "domain_cooldown", "solver_url", "solver_timeout"] },
+  { title: "重试", keys: ["max_attempts", "retry_base_delay"] },
+  { title: "任务", keys: ["fetch_detail", "incremental_interval", "incremental_stop_after_known", "incremental_max_pages"] },
+  { title: "输出", keys: ["output_dir", "path_template", "write_nfo", "download_cover", "poster_crop"] },
+  { title: "播放", keys: ["public_base_url", "play_mode", "proxy_user_agents", "play_token", "hls_margin"] },
+];
+const SETTING_LABELS = {
+  domains: "站点域名", proxy: "抓取代理", impersonate: "浏览器指纹", rate_per_sec: "请求速率上限",
+  concurrency: "并发数", request_timeout: "请求超时", domain_cooldown: "域名冷却", solver_url: "解题服务地址",
+  solver_timeout: "解题超时", max_attempts: "最大尝试次数", retry_base_delay: "首次重试间隔",
+  fetch_detail: "抓取详情", incremental_interval: "定时增量间隔", incremental_stop_after_known: "增量停止阈值",
+  incremental_max_pages: "增量最多页数", output_dir: "输出目录", path_template: "路径模板", write_nfo: "写 nfo",
+  download_cover: "下载封面", poster_crop: "裁剪 poster", public_base_url: "对外地址", play_mode: "播放模式",
+  proxy_user_agents: "中转 UA 片段", play_token: "播放令牌", hls_margin: "有效期余量（分钟）",
+};
+const REWRITE_KEYS = ["public_base_url", "play_mode", "play_token", "path_template", "output_dir", "write_nfo"];
+const PLAY_MODES = { redirect: "302 跳转（ffmpeg 类客户端自动中转）", proxy: "全部中转", direct: "直写 CDN 地址（仅调试）" };
+
+function app() {
+  return {
+    tabs: [
+      { id: "overview", name: "概览" }, { id: "jobs", name: "任务" }, { id: "videos", name: "影片库" },
+      { id: "settings", name: "设置" }, { id: "logs", name: "日志" },
+    ],
+    tab: "overview",
+    s: {},
+    offline: false,
+    testing: false,
+    testResult: null,
+    meta: { presets: [], sorts: {} },
+    form: { kind: "list", source: "", sort: "post_date", start_page: 1, end_page: 0, detail: true, urls: "" },
+    jobs: [],
+    openJobId: null,
+    taskFilter: "failed",
+    tasks: [],
+    vq: { q: "", filter: "", page: 1, size: 50 },
+    videos: { items: [], total: 0 },
+    settings: {},
+    draft: {},
+    needRewrite: false,
+    settingGroups: SETTING_GROUPS,
+    labels: SETTING_LABELS,
+    logs: [],
+    logLevel: "INFO",
+    logFilter: "",
+    logFollow: true,
+    logConnected: false,
+    detail: null,
+    player: null,
+    hls: null,
+    toast: null,
+
+    async init() {
+      const fromHash = location.hash.slice(1);
+      if (this.tabs.some(t => t.id === fromHash)) this.tab = fromHash;
+      window.addEventListener("hashchange", () => {
+        const h = location.hash.slice(1);
+        if (this.tabs.some(t => t.id === h)) this.go(h);
+      });
+      this.meta = await this.get("/api/meta").catch(() => this.meta);
+      this.refreshStatus();
+      this.onTab();
+      this.connectLogs();
+      setInterval(() => this.tick(), 3000);
+    },
+
+    go(id) {
+      this.tab = id;
+      if (location.hash.slice(1) !== id) history.replaceState(null, "", "#" + id);
+      this.onTab();
+    },
+    onTab() {
+      if (this.tab === "jobs") this.loadJobs();
+      if (this.tab === "videos") this.loadVideos();
+      if (this.tab === "settings") this.loadSettings();
+      if (this.tab === "logs") this.$nextTick(() => this.scrollLogs(true));
+    },
+    tick() {
+      if (document.hidden) return;
+      this.refreshStatus();
+      if (this.tab === "jobs") { this.loadJobs(); if (this.openJobId) this.loadTasks(); }
+    },
+
+    // ---- HTTP ----
+    async req(method, url, body) {
+      const opt = { method, headers: {} };
+      if (body !== undefined) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+      const r = await fetch(url, opt);
+      const text = await r.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+      if (!r.ok) throw new Error((data && data.detail) || `HTTP ${r.status}`);
+      return data;
+    },
+    get(url) { return this.req("GET", url); },
+    post(url, body) { return this.req("POST", url, body ?? {}).catch(e => { this.notify(e.message, true); throw e; }); },
+    notify(msg, err = false) {
+      this.toast = { msg, err };
+      clearTimeout(this._toastTimer);
+      this._toastTimer = setTimeout(() => (this.toast = null), err ? 6000 : 2500);
+    },
+
+    // ---- 概览 ----
+    async refreshStatus() {
+      try { this.s = await this.get("/api/status"); this.offline = false; }
+      catch { this.offline = true; }
+    },
+    engineState() {
+      if (this.offline) return { text: "服务离线", cls: "err" };
+      const e = this.s.engine;
+      if (!e) return { text: "加载中", cls: "" };
+      if (e.paused) return { text: "已暂停", cls: "" };
+      if (e.blocked_for > 0) return { text: "被拦截，" + this.fmtDur(e.blocked_for) + "后重试", cls: "warn" };
+      if (e.running.length) return { text: "运行中", cls: "ok" };
+      return { text: "空闲", cls: "info" };
+    },
+    c(key) { return this.s.metrics?.counters?.[key] || 0; },
+    queueSum(st) { return Object.values(this.s.queue || {}).reduce((a, q) => a + (q[st] || 0), 0); },
+    async testDomains() {
+      this.testing = true;
+      try { this.testResult = await this.post("/api/fetcher/test"); this.refreshStatus(); }
+      finally { this.testing = false; }
+    },
+    async quickJob(kind, extra = {}) {
+      if (kind === "full" && !confirm("全站约 3.9 万部：列表约 30 分钟，详情约 11 小时（每秒 1 次）。中途可以暂停或重启，会自动续跑。确定开始？")) return;
+      if (kind === "rewrite" && !confirm("按当前设置重写全部 strm / nfo？")) return;
+      const r = await this.post("/api/jobs", { kind, ...extra });
+      this.notify(`已创建任务 #${r.id}`);
+      this.refreshStatus();
+      if (this.tab === "jobs") this.loadJobs();
+    },
+
+    // ---- 任务 ----
+    async loadJobs() { this.jobs = await this.get("/api/jobs").catch(() => this.jobs); },
+    jobHint() {
+      return {
+        full: "从最新更新翻完全部页：先写 strm，再逐个补详情（女优、标签、上市日期、封面）。",
+        incremental: "从最新更新第 1 页往后翻，连续遇到已入库影片就停。跑完全站后会按设置定时自动执行。",
+        list: "分类 /categories/xxx/、标签 /tags/xxx/、女优 /models/xxx/、搜索 /search/关键词/、热门 /hot/ 都可以，直接粘贴站点网址也行。",
+        videos: "抓取指定影片的详情并输出，优先级高于批量任务。",
+        backfill: "为所有还没有详情的影片排队抓详情。",
+        rewrite: "修改对外地址、播放模式、令牌或路径模板后，用它重写已有的 strm / nfo（不联网）。",
+      }[this.form.kind];
+    },
+    async createJob() {
+      const f = this.form;
+      const body = { kind: f.kind };
+      if (f.kind === "list") Object.assign(body, { source: f.source, sort: f.sort, start_page: f.start_page || 1, end_page: f.end_page || 0 });
+      if (["full", "list"].includes(f.kind)) body.detail = f.detail;
+      if (f.kind === "videos") body.urls = f.urls;
+      if (f.kind === "full") return this.quickJob("full", { detail: f.detail });
+      const r = await this.post("/api/jobs", body);
+      this.notify(`已创建任务 #${r.id}`);
+      this.loadJobs();
+    },
+    async jobAction(j, action) {
+      if (action === "cancel" && !confirm(`取消任务 #${j.id}？未执行的子任务将不再执行。`)) return;
+      await this.post(`/api/jobs/${j.id}/${action}`);
+      this.loadJobs();
+    },
+    async deleteJob(j) {
+      if (!confirm(`删除任务 #${j.id} 及其子任务记录？（不影响已入库的影片和已生成的文件）`)) return;
+      await this.req("DELETE", `/api/jobs/${j.id}`).catch(e => this.notify(e.message, true));
+      if (this.openJobId === j.id) this.openJobId = null;
+      this.loadJobs();
+    },
+    openJob(j) {
+      this.openJobId = j.id;
+      this.taskFilter = (j.tasks?.failed || 0) > 0 ? "failed" : "";
+      this.loadTasks();
+    },
+    async loadTasks() {
+      if (!this.openJobId) return;
+      this.tasks = await this.get(`/api/jobs/${this.openJobId}/tasks?status=${this.taskFilter}&limit=200`).catch(() => []);
+    },
+    jobTotal(j) { return Object.values(j.tasks || {}).reduce((a, b) => a + b, 0); },
+    jobFinished(j) { const t = j.tasks || {}; return (t.done || 0) + (t.failed || 0) + (t.gone || 0) + (t.cancelled || 0); },
+    jobPct(j) { const total = this.jobTotal(j); return total ? Math.round(this.jobFinished(j) * 100 / total) : 0; },
+    jobProgressText(j) {
+      let text = `${this.fmtNum(this.jobFinished(j))} / ${this.fmtNum(this.jobTotal(j))}`;
+      if (j.state?.last_page) text += ` · 共 ${j.state.last_page} 页`;
+      return text;
+    },
+    jobCls(st) { return { running: "ok", paused: "warn", done: "info", cancelled: "" }[st] || ""; },
+    taskCls(st) { return { done: "ok", failed: "err", running: "warn", gone: "" }[st] || ""; },
+    jobStatusName(st) { return JOB_STATUS[st] || st; },
+    taskStatusName(st) { return TASK_STATUS[st] || st; },
+    kindName(k) { return KIND_NAMES[k] || k; },
+    errorHtml(msg) {
+      if (!msg) return "";
+      const esc = msg.replace(/[&<>"]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch]));
+      return esc.replace(/快照 ([\w.\-]+\.html)/, (_, n) => `快照 <a target="_blank" href="/api/snapshots/${encodeURIComponent(n)}">${n}</a>`);
+    },
+
+    // ---- 影片 ----
+    async loadVideos() {
+      const p = new URLSearchParams({ q: this.vq.q, filter: this.vq.filter, page: this.vq.page, size: this.vq.size });
+      this.videos = await this.get("/api/videos?" + p).catch(() => this.videos);
+    },
+    async refreshVideo(v) {
+      this.notify(`正在刷新 ${v.slug} …`);
+      v._busy = true;
+      try {
+        const nv = await this.post(`/api/videos/${v.slug}/refresh`);
+        Object.assign(v, nv);
+        const row = this.videos.items.find(x => x.slug === v.slug);
+        if (row && row !== v) Object.assign(row, nv);
+        if (this.detail && this.detail.slug === v.slug && this.detail !== v) Object.assign(this.detail, nv);
+        this.notify(`${v.slug} 已刷新`);
+      } finally { v._busy = false; }
+    },
+    openDetail(v) { this.detail = v; },
+    hlsState(v) {
+      if (!v.hls_url) return { text: "未缓存", cls: "" };
+      const left = (v.hls_expires || 0) - Date.now() / 1000;
+      if (left <= 0) return { text: "已过期", cls: "err" };
+      return { text: "剩 " + this.fmtDur(left), cls: left > 3600 ? "ok" : "warn" };
+    },
+    siteUrls(v) {
+      const bases = (this.s.domains || []).map(d => d.base);
+      if (!bases.length) bases.push("https://jable.tv");
+      return bases.map(b => `${b}/videos/${v.slug}/`);
+    },
+    async copy(text) {
+      let ok = false;
+      if (navigator.clipboard && window.isSecureContext) {
+        try { await navigator.clipboard.writeText(text); ok = true; } catch {}
+      }
+      if (!ok) {
+        // 非 https / 非 localhost 访问时 clipboard API 不可用，退回 execCommand
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.cssText = "position:fixed;left:-9999px;top:0";
+        document.body.appendChild(ta);
+        ta.select();
+        try { ok = document.execCommand("copy"); } catch {}
+        ta.remove();
+      }
+      if (ok) this.notify("已复制：" + text);
+      else prompt("复制失败，请手动复制", text);
+    },
+    async playVideo(v) {
+      this.player = { slug: v.slug, title: v.title };
+      const token = new URL(v.play_url, location.href).searchParams.get("t");
+      const src = `/play/${v.slug}.m3u8?proxy=1` + (token ? `&t=${encodeURIComponent(token)}` : "");
+      await this.$nextTick();
+      const video = this.$refs.video;
+      if (video.canPlayType("application/vnd.apple.mpegurl")) { video.src = src; return; }
+      if (!window.Hls) {
+        await new Promise((ok, fail) => {
+          const sc = document.createElement("script");
+          sc.src = "https://cdn.jsdelivr.net/npm/hls.js@1.5.20/dist/hls.min.js";
+          sc.onload = ok; sc.onerror = () => fail(new Error("hls.js 加载失败"));
+          document.head.appendChild(sc);
+        }).catch(e => this.notify(e.message, true));
+      }
+      if (!window.Hls) return;
+      this.hls = new Hls();
+      this.hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) this.notify("播放失败：" + d.details, true); });
+      this.hls.loadSource(src);
+      this.hls.attachMedia(video);
+    },
+    closePlayer() {
+      if (this.hls) { this.hls.destroy(); this.hls = null; }
+      this.player = null;
+    },
+
+    // ---- 设置 ----
+    async loadSettings() {
+      this.settings = await this.get("/api/settings");
+      this.draft = JSON.parse(JSON.stringify(this.settings.values));
+    },
+    fieldType(k) {
+      const sc = this.settings.schema?.[k];
+      if (!sc) return "text";
+      if (sc.enum) return "enum";
+      if (sc.type === "boolean") return "bool";
+      if (sc.type === "integer" || sc.type === "number") return "number";
+      if (sc.type === "array") return "list";
+      return "text";
+    },
+    enumName(k, v) { return k === "play_mode" ? PLAY_MODES[v] || v : v; },
+    isChanged(k) { return JSON.stringify(this.draft[k]) !== JSON.stringify(this.settings.values?.[k]); },
+    changedKeys() { return Object.keys(this.draft).filter(k => this.isChanged(k)); },
+    async saveSettings() {
+      const keys = this.changedKeys();
+      const patch = Object.fromEntries(keys.map(k => [k, this.draft[k]]));
+      try {
+        const r = await this.req("PUT", "/api/settings", patch);
+        this.settings.values = r.values;
+        this.settings.effective = r.effective;
+        this.draft = JSON.parse(JSON.stringify(r.values));
+        if (keys.some(k => REWRITE_KEYS.includes(k))) this.needRewrite = true;
+        this.notify("设置已保存并生效");
+        this.refreshStatus();
+      } catch (e) { this.notify(e.message, true); }
+    },
+    playModeName(m) { return PLAY_MODES[m] || m || "-"; },
+
+    // ---- 日志 ----
+    connectLogs() {
+      const after = this.logs.length ? this.logs[this.logs.length - 1].id : 0;
+      const es = new EventSource(`/api/logs/stream?after=${after}`);
+      es.onopen = () => (this.logConnected = true);
+      es.onmessage = ev => {
+        const item = JSON.parse(ev.data);
+        if (this.logs.length && item.id <= this.logs[this.logs.length - 1].id) return;
+        this.logs.push(item);
+        if (this.logs.length > 3000) this.logs.splice(0, this.logs.length - 3000);
+        this.$nextTick(() => this.scrollLogs());
+      };
+      es.onerror = () => {
+        this.logConnected = false;
+        es.close();
+        setTimeout(() => this.connectLogs(), 3000);
+      };
+    },
+    filteredLogs() {
+      const min = LEVELS[this.logLevel] || 0;
+      const kw = this.logFilter.trim().toLowerCase();
+      return this.logs.filter(l => (LEVELS[l.level] || 0) >= min && (!kw || l.msg.toLowerCase().includes(kw) || l.name.includes(kw)));
+    },
+    scrollLogs(force = false) {
+      for (const el of [this.$refs.logBox, this.$refs.miniLogs]) {
+        if (el && (force || this.logFollow)) el.scrollTop = el.scrollHeight;
+      }
+    },
+
+    // ---- 格式化 ----
+    fmtNum(n) { return n == null ? "-" : Number(n).toLocaleString("zh-CN"); },
+    pct(a, b) { return b ? Math.round((a || 0) * 100 / b) + "%" : "-"; },
+    fmtTime(ts) {
+      if (!ts) return "";
+      const d = new Date(ts * 1000), p = x => String(x).padStart(2, "0");
+      return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    },
+    fmtClock(ts) { return this.fmtTime(ts).slice(6); },
+    fmtDur(sec) {
+      if (sec == null || isNaN(sec)) return "-";
+      sec = Math.max(0, Math.round(sec));
+      if (sec < 60) return sec + " 秒";
+      if (sec < 3600) return Math.floor(sec / 60) + " 分 " + (sec % 60) + " 秒";
+      if (sec < 86400) return Math.floor(sec / 3600) + " 小时 " + Math.floor(sec % 3600 / 60) + " 分";
+      return Math.floor(sec / 86400) + " 天 " + Math.floor(sec % 86400 / 3600) + " 小时";
+    },
+    fmtClockDur(sec) {
+      if (!sec) return "";
+      const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60, p = x => String(x).padStart(2, "0");
+      return h ? `${h}:${p(m)}:${p(s)}` : `${m}:${p(s)}`;
+    },
+  };
+}
