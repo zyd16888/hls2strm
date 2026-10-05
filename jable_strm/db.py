@@ -168,7 +168,38 @@ async def _migrate_v2(conn: aiosqlite.Connection) -> None:
         )
 
 
-MIGRATIONS = [_migrate_v1, _migrate_v2]
+async def _migrate_v3(conn: aiosqlite.Connection) -> None:
+    """strm 扫描结果与改前缀记录。"""
+    for sql in (
+        """CREATE TABLE strm_files (
+          path TEXT PRIMARY KEY,
+          scan_id INTEGER NOT NULL,
+          url TEXT NOT NULL DEFAULT '',
+          prefix TEXT NOT NULL DEFAULT '',
+          kind TEXT NOT NULL,
+          slug TEXT NOT NULL DEFAULT '',
+          video_id INTEGER,
+          expired INTEGER NOT NULL DEFAULT 0,
+          managed INTEGER NOT NULL DEFAULT 0,
+          library_id INTEGER,
+          mtime INTEGER,
+          note TEXT NOT NULL DEFAULT '',
+          scanned_at INTEGER NOT NULL)""",
+        "CREATE INDEX strm_files_scan ON strm_files(scan_id, kind)",
+        """CREATE TABLE strm_changes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          change_set INTEGER NOT NULL,
+          path TEXT NOT NULL,
+          old TEXT NOT NULL,
+          new TEXT NOT NULL,
+          reverted INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL)""",
+        "CREATE INDEX strm_changes_set ON strm_changes(change_set)",
+    ):
+        await conn.execute(sql)
+
+
+MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3]
 
 
 def now() -> int:
@@ -475,6 +506,154 @@ class Database:
                 v.pop("output_rowid")
                 yield v, out
             last = rows[-1]["output_rowid"]
+
+    async def all_output_paths(self) -> list[str]:
+        rows = await self._all("SELECT strm_path FROM outputs WHERE strm_path != ''")
+        return [r["strm_path"] for r in rows]
+
+    async def video_keys(self) -> list[tuple[int, str]]:
+        rows = await self._all("SELECT id, slug FROM videos")
+        return [(r["id"], r["slug"]) for r in rows]
+
+    # ---- strm 扫描 ----
+
+    STRM_COLUMNS = ("path", "scan_id", "url", "prefix", "kind", "slug", "video_id", "expired", "managed",
+                    "library_id", "mtime", "note", "scanned_at")
+
+    async def replace_strm_files(self, dir_prefix: str, rows: list[tuple]) -> None:
+        """用一次扫描的结果替换该目录下的旧记录。"""
+        cols = ", ".join(self.STRM_COLUMNS)
+        marks = ", ".join("?" * len(self.STRM_COLUMNS))
+        async with self._lock:
+            await self.conn.execute("BEGIN")
+            try:
+                await self.conn.execute("DELETE FROM strm_files WHERE path >= ? AND path < ?",
+                                        (dir_prefix, dir_prefix + "\U0010ffff"))
+                await self.conn.executemany(f"INSERT OR REPLACE INTO strm_files({cols}) VALUES({marks})", rows)
+                await self.conn.execute("COMMIT")
+            except BaseException:
+                await self.conn.execute("ROLLBACK")
+                raise
+
+    async def strm_summary(self, scan_id: int) -> dict:
+        kinds = await self._all(
+            "SELECT kind, managed, COUNT(*) AS n FROM strm_files WHERE scan_id=? GROUP BY kind, managed", (scan_id,)
+        )
+        prefixes = await self._all(
+            """SELECT prefix, COUNT(*) AS n, SUM(managed) AS managed, MIN(path) AS sample_path, MIN(url) AS sample_url
+               FROM strm_files WHERE scan_id=? GROUP BY prefix ORDER BY n DESC LIMIT 100""",
+            (scan_id,),
+        )
+        adoptable = await self._one(
+            """SELECT COUNT(*) AS n, COALESCE(SUM(video_id IS NULL), 0) AS unknown FROM strm_files
+               WHERE scan_id=? AND managed=0 AND kind IN ('ours', 'cdn', 'named') AND slug != ''""",
+            (scan_id,),
+        )
+        by_kind: dict[str, dict] = {}
+        for r in kinds:
+            k = by_kind.setdefault(r["kind"], {"total": 0, "managed": 0})
+            k["total"] += r["n"]
+            if r["managed"]:
+                k["managed"] += r["n"]
+        return {"kinds": by_kind, "prefixes": [dict(r) for r in prefixes],
+                "adoptable": adoptable["n"], "adoptable_unknown": adoptable["unknown"]}
+
+    async def list_strm_files(self, scan_id: int, kind: str = "", managed: str = "", prefix: str = "",
+                              q: str = "", offset: int = 0, limit: int = 50):
+        where, params = ["scan_id=?"], [scan_id]
+        if kind:
+            where.append("kind=?")
+            params.append(kind)
+        if managed in ("0", "1"):
+            where.append("managed=?")
+            params.append(int(managed))
+        if prefix:
+            where.append("prefix=?")
+            params.append(prefix)
+        if q:
+            where.append("(path LIKE ? OR url LIKE ? OR slug LIKE ? OR note LIKE ?)")
+            params += [f"%{q}%"] * 4
+        cond = " AND ".join(where)
+        total = (await self._one(f"SELECT COUNT(*) AS n FROM strm_files WHERE {cond}", params))["n"]
+        rows = await self._all(f"SELECT * FROM strm_files WHERE {cond} ORDER BY path LIMIT ? OFFSET ?",
+                               params + [limit, offset])
+        return [dict(r) for r in rows], total
+
+    async def adopt_candidates(self, scan_id: int, kinds: tuple[str, ...], prefix: str = "") -> list[str]:
+        marks = ",".join("?" * len(kinds))
+        sql = f"SELECT path FROM strm_files WHERE scan_id=? AND managed=0 AND slug != '' AND kind IN ({marks})"
+        params: list = [scan_id, *kinds]
+        if prefix:
+            sql += " AND prefix=?"
+            params.append(prefix)
+        rows = await self._all(sql + " ORDER BY path", params)
+        return [r["path"] for r in rows]
+
+    async def get_strm_file(self, path: str) -> dict | None:
+        row = await self._one("SELECT * FROM strm_files WHERE path=?", (path,))
+        return dict(row) if row else None
+
+    async def update_strm_file(self, path: str, **fields) -> None:
+        cols = ", ".join(f"{k}=?" for k in fields)
+        await self._write(f"UPDATE strm_files SET {cols} WHERE path=?", (*fields.values(), path))
+
+    async def strm_prefix_matches(self, scan_id: int, prefix: str, limit: int | None = None) -> list[dict]:
+        sql = "SELECT * FROM strm_files WHERE scan_id=? AND substr(url, 1, ?)=? ORDER BY path"
+        params: list = [scan_id, len(prefix), prefix]
+        if limit:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return [dict(r) for r in await self._all(sql, params)]
+
+    async def count_strm_prefix(self, scan_id: int, prefix: str) -> dict:
+        row = await self._one(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(managed), 0) AS managed FROM strm_files "
+            "WHERE scan_id=? AND substr(url, 1, ?)=?",
+            (scan_id, len(prefix), prefix),
+        )
+        return dict(row)
+
+    async def missing_outputs(self, dir_prefix: str, offset: int = 0, limit: int = 50):
+        """库里有记录、但扫描时在该目录下没找到文件的输出。"""
+        cond = """o.strm_path >= ? AND o.strm_path < ?
+                  AND NOT EXISTS (SELECT 1 FROM strm_files f WHERE f.path=o.strm_path)"""
+        params = [dir_prefix, dir_prefix + "\U0010ffff"]
+        total = (await self._one(f"SELECT COUNT(*) AS n FROM outputs o WHERE {cond}", params))["n"]
+        rows = await self._all(
+            f"""SELECT o.video_id, o.library_id, o.strm_path, v.slug, l.name AS library_name
+                FROM outputs o JOIN videos v ON v.id=o.video_id JOIN libraries l ON l.id=o.library_id
+                WHERE {cond} ORDER BY o.strm_path LIMIT ? OFFSET ?""",
+            params + [limit, offset],
+        )
+        return [dict(r) for r in rows], total
+
+    async def add_strm_change(self, change_set: int, path: str, old: str, new: str) -> None:
+        await self._write(
+            "INSERT INTO strm_changes(change_set, path, old, new, created_at) VALUES(?, ?, ?, ?, ?)",
+            (change_set, path, old, new, now()),
+        )
+
+    async def strm_changes(self, change_set: int, only_active: bool = True) -> list[dict]:
+        cond = "AND reverted=0" if only_active else ""
+        rows = await self._all(f"SELECT * FROM strm_changes WHERE change_set=? {cond} ORDER BY id", (change_set,))
+        return [dict(r) for r in rows]
+
+    async def mark_change_reverted(self, change_id: int) -> None:
+        await self._write("UPDATE strm_changes SET reverted=1 WHERE id=?", (change_id,))
+
+    async def list_change_sets(self) -> list[dict]:
+        rows = await self._all(
+            """SELECT c.change_set, COUNT(*) AS files, SUM(c.reverted) AS reverted, MIN(c.created_at) AS created_at,
+                      j.params, j.status
+               FROM strm_changes c LEFT JOIN jobs j ON j.id=c.change_set
+               GROUP BY c.change_set ORDER BY c.change_set DESC LIMIT 100"""
+        )
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["params"] = json.loads(d["params"] or "{}")
+            out.append(d)
+        return out
 
     # ---- 订阅 ----
 

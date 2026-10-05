@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import secrets
 import sqlite3
@@ -348,6 +349,116 @@ async def run_subscription(sub_id: int, request: Request, mode: Literal["auto", 
         return {"job_id": await _ctx(request).engine.run_subscription(sub_id, mode)}
     except KeyError:
         raise HTTPException(404, "订阅不存在") from None
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from None
+
+
+# ---- strm 扫描 / 纳管 / 改前缀 ----
+
+
+class ScanBody(BaseModel):
+    dir: str = ""
+
+
+class AdoptBody(BaseModel):
+    scan_id: int
+    library_id: int | None = None
+    fetch_missing: bool = True
+    kinds: list[str] = ["ours", "cdn"]
+    prefix: str = ""
+
+
+class PrefixBody(BaseModel):
+    scan_id: int
+    old: str
+    new: str
+
+
+async def _scan_job(c, scan_id: int) -> dict:
+    job = await c.db.get_job(scan_id)
+    if job is None or job["kind"] != "scan":
+        raise HTTPException(404, "扫描记录不存在")
+    return job
+
+
+@router.post("/strm/scan")
+async def strm_scan(body: ScanBody, request: Request):
+    try:
+        return {"job_id": await _ctx(request).engine.strm.create_scan(body.dir)}
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from None
+
+
+@router.get("/strm/scans")
+async def strm_scans(request: Request):
+    jobs = await _ctx(request).db.list_jobs(limit=200)
+    return [j for j in jobs if j["kind"] == "scan"]
+
+
+@router.get("/strm/scans/{scan_id}/summary")
+async def strm_scan_summary(scan_id: int, request: Request):
+    c = _ctx(request)
+    job = await _scan_job(c, scan_id)
+    summary = await c.db.strm_summary(scan_id)
+    summary["job"] = job
+    summary["public_base_url"] = c.store.public_base_url
+    return summary
+
+
+@router.get("/strm/scans/{scan_id}/files")
+async def strm_scan_files(scan_id: int, request: Request, kind: str = "", managed: str = "", prefix: str = "",
+                          q: str = "", page: int = 1, size: int = 50):
+    size = max(1, min(size, 200))
+    items, total = await _ctx(request).db.list_strm_files(scan_id, kind, managed, prefix, q,
+                                                          (max(page, 1) - 1) * size, size)
+    return {"items": items, "total": total}
+
+
+@router.get("/strm/scans/{scan_id}/missing")
+async def strm_scan_missing(scan_id: int, request: Request, page: int = 1, size: int = 50):
+    c = _ctx(request)
+    job = await _scan_job(c, scan_id)
+    size = max(1, min(size, 200))
+    items, total = await c.db.missing_outputs(job["params"]["dir"] + os.sep, (max(page, 1) - 1) * size, size)
+    return {"items": items, "total": total}
+
+
+@router.post("/strm/adopt")
+async def strm_adopt(body: AdoptBody, request: Request):
+    try:
+        job_id = await _ctx(request).engine.strm.create_adopt(
+            body.scan_id, library_id=body.library_id or None, fetch_missing=body.fetch_missing,
+            kinds=tuple(body.kinds), prefix=body.prefix)
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from None
+    return {"job_id": job_id}
+
+
+@router.post("/strm/prefix/preview")
+async def strm_prefix_preview(body: PrefixBody, request: Request):
+    try:
+        return await _ctx(request).engine.strm.preview_prefix(body.scan_id, body.old, body.new)
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from None
+
+
+@router.post("/strm/prefix/apply")
+async def strm_prefix_apply(body: PrefixBody, request: Request):
+    try:
+        return {"job_id": await _ctx(request).engine.strm.create_prefix(body.scan_id, body.old, body.new)}
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from None
+
+
+@router.get("/strm/changes")
+async def strm_changes(request: Request):
+    return await _ctx(request).db.list_change_sets()
+
+
+@router.post("/strm/changes/{change_set}/revert")
+async def strm_revert(change_set: int, request: Request):
+    try:
+        return {"job_id": await _ctx(request).engine.strm.create_revert(change_set)}
     except ValueError as err:
         raise HTTPException(400, str(err)) from None
 

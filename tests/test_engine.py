@@ -232,7 +232,7 @@ def test_migrate_v1_database(boot):
     import json
     import sqlite3
 
-    from jable_strm.db import SCHEMA_V1, Database
+    from jable_strm.db import MIGRATIONS, SCHEMA_V1, Database
 
     path = boot.data_dir / "old.db"
     conn = sqlite3.connect(path)
@@ -250,7 +250,7 @@ def test_migrate_v1_database(boot):
     async def run():
         db = Database(path)
         await db.open()
-        assert (await db._one("PRAGMA user_version"))[0] == 2
+        assert (await db._one("PRAGMA user_version"))[0] == len(MIGRATIONS)
         assert [l["name"] for l in await db.list_libraries()] == ["全部"]
         out = await db.get_output(1, 1)
         assert out["strm_path"] == "/old/ABC-1/ABC-1.strm" and out["cover_done"] == 1

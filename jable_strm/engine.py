@@ -22,6 +22,7 @@ from .db import DEFAULT_LIBRARY_ID, Database
 from .fetcher import Blocked, FetchError, Fetcher, NotFound
 from .observability import Metrics
 from .parser import ParseError, VideoGone, m3u8_duration, parse_detail, parse_list
+from .strm_manage import StrmManager
 from .writer import OutputWriter
 
 log = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ class Engine:
         self.blocked_until = 0.0
         self.running: dict[int, dict] = {}
         self.libs: dict[int, dict] = {}
+        self.strm = StrmManager(self)
         self._workers: list[asyncio.Task] = []
         self._scheduler: asyncio.Task | None = None
         self._wake = asyncio.Event()
@@ -148,7 +150,8 @@ class Engine:
                 await self.db.finish_task(tid, "pending", refund_attempt=True)
                 return
             handler = {"list": self._do_list, "detail": self._do_detail, "rewrite": self._do_rewrite,
-                       "purge": self._do_purge}[task["kind"]]
+                       "purge": self._do_purge, "scan": self.strm.do_scan, "adopt": self.strm.do_adopt,
+                       "prefix": self.strm.do_prefix, "revert": self.strm.do_revert}[task["kind"]]
             await handler(job, task)
             await self.db.finish_task(tid, "done", duration_ms=int((time.monotonic() - t0) * 1000))
             self.metrics.inc(f"task_{task['kind']}_done")

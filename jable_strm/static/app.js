@@ -2,10 +2,12 @@
 
 const KIND_NAMES = {
   list: "列表页", detail: "详情页", rewrite: "重写输出", purge: "删除库",
+  scan: "扫描", adopt: "纳管", prefix: "改前缀", revert: "回滚",
   crawl: "列表抓取", incremental: "增量", videos: "指定影片",
 };
 const JOB_STATUS = { running: "运行中", paused: "已暂停", done: "已完成", cancelled: "已取消" };
 const TASK_STATUS = { pending: "待处理", running: "运行中", done: "完成", failed: "失败", gone: "下架", cancelled: "已取消" };
+const STRM_KINDS = { ours: "本服务格式", cdn: "CDN 直链", named: "文件名识别", other: "其他来源", invalid: "无效" };
 const LEVELS = { DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50 };
 
 const SETTING_GROUPS = [
@@ -30,7 +32,8 @@ function app() {
   return {
     tabs: [
       { id: "overview", name: "概览" }, { id: "jobs", name: "任务" }, { id: "videos", name: "影片库" },
-      { id: "libraries", name: "输出库与订阅" }, { id: "settings", name: "设置" }, { id: "logs", name: "日志" },
+      { id: "libraries", name: "输出库与订阅" }, { id: "strm", name: "strm 管理" },
+      { id: "settings", name: "设置" }, { id: "logs", name: "日志" },
     ],
     tab: "overview",
     s: {},
@@ -43,6 +46,18 @@ function app() {
     subscriptions: [],
     libForm: {},
     subForm: {},
+    strmKinds: STRM_KINDS,
+    scans: [],
+    scanId: null,
+    scanDir: "",
+    scanSummary: null,
+    sf: { kind: "", managed: "", prefix: "", q: "", page: 1, size: 50 },
+    strmFiles: { items: [], total: 0 },
+    showMissing: false,
+    missing: { items: [], total: 0 },
+    adoptForm: { library_id: 0, kinds: ["ours", "cdn"], fetch_missing: true, prefix: "" },
+    prefixForm: { old: "", new: "", preview: null },
+    changeSets: [],
     jobs: [],
     openJobId: null,
     taskFilter: "failed",
@@ -90,6 +105,7 @@ function app() {
       if (this.tab === "jobs") { this.loadJobs(); this.loadLibraries(); }
       if (this.tab === "videos") { this.loadVideos(); this.loadLibraries(); }
       if (this.tab === "libraries") { this.loadLibraries(); this.loadSubs(); }
+      if (this.tab === "strm") { this.loadLibraries(); this.loadScans(); this.loadChangeSets(); }
       if (this.tab === "settings") this.loadSettings();
       if (this.tab === "logs") this.$nextTick(() => this.scrollLogs(true));
     },
@@ -98,6 +114,7 @@ function app() {
       this.refreshStatus();
       if (this.tab === "jobs") { this.loadJobs(); if (this.openJobId) this.loadTasks(); }
       if (this.tab === "libraries") { this.loadLibraries(); this.loadSubs(); }
+      if (this.tab === "strm" && this.scans.some(j => j.status === "running")) this.loadScans();
     },
 
     // ---- HTTP ----
@@ -341,6 +358,73 @@ function app() {
       if (!sub.enabled) return { text: "已停用", cls: "" };
       if (!sub.initialized) return { text: "未跑首轮全量", cls: "" };
       return { text: sub.interval ? "定时增量" : "仅手动", cls: "ok" };
+    },
+
+    // ---- strm 管理 ----
+    strmKindName(k) { return STRM_KINDS[k] || k; },
+    async loadScans() {
+      const wasRunning = this.scans.find(j => j.id === this.scanId)?.status === "running";
+      this.scans = await this.get("/api/strm/scans").catch(() => this.scans);
+      const current = this.scans.find(j => j.id === this.scanId);
+      if (!current && this.scans.length) this.selectScan(this.scans[0].id);
+      else if (current && wasRunning && current.status !== "running") this.selectScan(current.id);
+    },
+    async startScan() {
+      try {
+        const r = await this.req("POST", "/api/strm/scan", { dir: this.scanDir });
+        this.notify(`已开始扫描（任务 #${r.job_id}）`);
+        this.scanId = r.job_id;
+        this.scanSummary = null;
+        setTimeout(() => this.loadScans(), 800);
+      } catch (e) { this.notify(e.message, true); }
+    },
+    async selectScan(id) {
+      this.scanId = id;
+      this.sf = { kind: "", managed: "", prefix: "", q: "", page: 1, size: 50 };
+      this.showMissing = false;
+      this.scanSummary = await this.get(`/api/strm/scans/${id}/summary`).catch(() => null);
+      this.loadStrmFiles();
+    },
+    async loadStrmFiles() {
+      if (!this.scanId) return;
+      const p = new URLSearchParams({ ...this.sf });
+      this.strmFiles = await this.get(`/api/strm/scans/${this.scanId}/files?${p}`).catch(() => this.strmFiles);
+    },
+    async loadMissing() {
+      if (this.showMissing) this.missing = await this.get(`/api/strm/scans/${this.scanId}/missing?size=200`).catch(() => this.missing);
+    },
+    async startAdopt() {
+      const f = this.adoptForm;
+      if (f.kinds.includes("named") && !confirm("「文件名识别」的文件内容会被改成本服务地址。确认这些文件都是 Jable 的吗？")) return;
+      try {
+        const r = await this.req("POST", "/api/strm/adopt", { scan_id: this.scanId, ...f, library_id: f.library_id || null });
+        this.notify(`已创建纳管任务 #${r.job_id}，完成后重新扫描可看到结果`);
+      } catch (e) { this.notify(e.message, true); }
+    },
+    async previewPrefix() {
+      try {
+        this.prefixForm.preview = await this.req("POST", "/api/strm/prefix/preview",
+          { scan_id: this.scanId, old: this.prefixForm.old, new: this.prefixForm.new });
+      } catch (e) { this.notify(e.message, true); }
+    },
+    async applyPrefix() {
+      const f = this.prefixForm;
+      if (!confirm(`把 ${f.preview.count} 个 strm 的前缀 ${f.old} 改成 ${f.new}？改动会记录下来，可以回滚。`)) return;
+      try {
+        const r = await this.req("POST", "/api/strm/prefix/apply", { scan_id: this.scanId, old: f.old, new: f.new });
+        this.notify(`已创建改前缀任务 #${r.job_id}`);
+        f.preview = null;
+        setTimeout(() => { this.loadChangeSets(); this.selectScan(this.scanId); }, 1500);
+      } catch (e) { this.notify(e.message, true); }
+    },
+    async loadChangeSets() { this.changeSets = await this.get("/api/strm/changes").catch(() => this.changeSets); },
+    async revertChange(cs) {
+      if (!confirm(`回滚改动 #${cs.change_set}（${cs.params.old} → ${cs.params.new}）？已被别处改过的文件会跳过。`)) return;
+      try {
+        const r = await this.req("POST", `/api/strm/changes/${cs.change_set}/revert`);
+        this.notify(`已创建回滚任务 #${r.job_id}`);
+        setTimeout(() => { this.loadChangeSets(); this.selectScan(this.scanId); }, 1500);
+      } catch (e) { this.notify(e.message, true); }
     },
 
     // ---- 设置 ----

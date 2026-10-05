@@ -436,6 +436,176 @@
     </div>
   </section>
 
+  <!-- ================= strm 管理 ================= -->
+  <section x-show="tab === 'strm'">
+    <div class="card">
+      <h3>扫描</h3>
+      <div class="form-row">
+        <label class="field grow"><span>目录（留空 = 输出根目录；也可以是其他工具生成 strm 的目录）</span>
+          <input x-model="scanDir" :placeholder="s.output_dir" spellcheck="false"></label>
+        <button class="primary" @click="startScan()">开始扫描</button>
+        <label class="field"><span>扫描记录</span>
+          <select x-model.number="scanId" @change="selectScan(scanId)">
+            <template x-for="j in scans" :key="j.id">
+              <option :value="j.id" :selected="j.id === scanId" x-text="'#' + j.id + ' ' + (j.params.dir || '') + ' · ' + fmtTime(j.created_at) + (j.status === 'running' ? '（扫描中）' : '')"></option>
+            </template>
+          </select>
+        </label>
+      </div>
+      <template x-if="scanSummary">
+        <div class="section">
+          <div class="toolbar">
+            <template x-for="[k, v] in Object.entries(scanSummary.kinds)" :key="k">
+              <span class="chip" :class="k === 'ours' ? 'ok' : (k === 'invalid' ? 'err' : '')"
+                    x-text="strmKindName(k) + ' ' + fmtNum(v.total) + (v.managed ? '（已纳管 ' + fmtNum(v.managed) + '）' : '')"></span>
+            </template>
+            <span class="chip warn" x-show="scanSummary.adoptable" x-text="'可纳管 ' + fmtNum(scanSummary.adoptable) + (scanSummary.adoptable_unknown ? '（其中库里没有 ' + fmtNum(scanSummary.adoptable_unknown) + '）' : '')"></span>
+            <a href="#" class="chip err" x-show="scanSummary.job.state.missing" @click.prevent="showMissing = !showMissing; loadMissing()"
+               x-text="'库里有记录但文件缺失 ' + fmtNum(scanSummary.job.state.missing)"></a>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>前缀</th><th class="num">文件</th><th class="num">已纳管</th><th>示例</th><th></th></tr></thead>
+              <tbody>
+                <template x-for="px in scanSummary.prefixes" :key="px.prefix">
+                  <tr>
+                    <td class="mono"><span x-text="px.prefix || '（无）'"></span>
+                      <span class="chip info" x-show="px.prefix && px.prefix === scanSummary.public_base_url">对外地址</span></td>
+                    <td class="num" x-text="fmtNum(px.n)"></td>
+                    <td class="num" x-text="fmtNum(px.managed)"></td>
+                    <td class="small muted ellipsis" :title="px.sample_url" x-text="px.sample_url"></td>
+                    <td class="nowrap">
+                      <button class="sm" @click="sf.prefix = px.prefix; sf.page = 1; loadStrmFiles()">只看</button>
+                      <button class="sm" @click="prefixForm.old = px.prefix; prefixForm.preview = null">改前缀</button>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <template x-if="showMissing && scanSummary">
+      <div class="card section">
+        <h3>库里有记录但文件缺失 <span class="actions"><button class="sm" @click="showMissing = false">收起</button></span></h3>
+        <div class="small muted" style="margin-bottom:8px">对相应的库执行「重写输出」即可重新生成。</div>
+        <table>
+          <thead><tr><th>影片</th><th>输出库</th><th>应在的位置</th></tr></thead>
+          <tbody>
+            <template x-for="m in missing.items" :key="m.strm_path">
+              <tr><td class="mono" x-text="m.slug.toUpperCase()"></td><td x-text="m.library_name"></td><td class="mono small" x-text="m.strm_path"></td></tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </template>
+
+    <div class="grid two section" x-show="scanSummary">
+      <div class="card">
+        <h3>纳管</h3>
+        <div class="small muted" style="margin-bottom:10px">把识别出的影片关联到输出库：文件按库的目录结构归位，内容改成本服务地址，之后随重写、改前缀一起维护。</div>
+        <div class="form-row">
+          <label class="field"><span>目标库</span>
+            <select x-model.number="adoptForm.library_id">
+              <option value="0">按所在目录（不在库目录下的跳过）</option>
+              <template x-for="l in libraries" :key="l.id"><option :value="l.id" x-text="'全部放进「' + l.name + '」'"></option></template>
+            </select></label>
+          <label class="field"><span>只处理该前缀（可空）</span><input x-model="adoptForm.prefix" spellcheck="false"></label>
+        </div>
+        <div class="form-row section small">
+          <label><input type="checkbox" value="ours" x-model="adoptForm.kinds"> 本服务格式</label>
+          <label><input type="checkbox" value="cdn" x-model="adoptForm.kinds"> CDN 直链</label>
+          <label><input type="checkbox" value="named" x-model="adoptForm.kinds"> 文件名识别 <span class="muted">（可能是 115、alist 里同番号的其他片源，确认后再勾）</span></label>
+          <label><input type="checkbox" x-model="adoptForm.fetch_missing"> 库里没有的影片先抓详情</label>
+        </div>
+        <button class="primary section" @click="startAdopt()">开始纳管</button>
+      </div>
+
+      <div class="card">
+        <h3>批量改前缀</h3>
+        <div class="form-row">
+          <label class="field grow"><span>旧前缀</span><input x-model="prefixForm.old" @input="prefixForm.preview = null" spellcheck="false" placeholder="http://192.168.1.10:8080"></label>
+          <label class="field grow"><span>新前缀</span><input x-model="prefixForm.new" @input="prefixForm.preview = null" spellcheck="false" placeholder="https://jable.example.com"></label>
+        </div>
+        <div class="toolbar section">
+          <button @click="previewPrefix()">预览</button>
+          <button class="primary" :disabled="!prefixForm.preview || !prefixForm.preview.count" @click="applyPrefix()">执行</button>
+          <span class="small" x-show="prefixForm.preview" x-text="prefixForm.preview ? '命中 ' + fmtNum(prefixForm.preview.count) + ' 个文件，其中已纳管 ' + fmtNum(prefixForm.preview.managed) : ''"></span>
+        </div>
+        <div class="notice warn small" x-show="prefixForm.preview && prefixForm.preview.updates_setting">旧前缀就是本服务的对外地址，执行后设置里的对外地址会同步改成新前缀。</div>
+        <template x-if="prefixForm.preview && prefixForm.preview.samples.length">
+          <div class="table-wrap small">
+            <table>
+              <thead><tr><th>改前</th><th>改后</th></tr></thead>
+              <tbody>
+                <template x-for="x in prefixForm.preview.samples" :key="x.path">
+                  <tr><td class="mono ellipsis" :title="x.old" x-text="x.old"></td><td class="mono ellipsis" :title="x.new" x-text="x.new"></td></tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </template>
+        <h3 class="section">改动记录</h3>
+        <table class="small">
+          <thead><tr><th>#</th><th>旧 → 新</th><th class="num">文件</th><th class="num">已回滚</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="cs in changeSets" :key="cs.change_set">
+              <tr>
+                <td x-text="cs.change_set"></td>
+                <td class="mono"><div x-text="cs.params.old"></div><div class="muted" x-text="'→ ' + cs.params.new"></div></td>
+                <td class="num" x-text="fmtNum(cs.files)"></td>
+                <td class="num" x-text="fmtNum(cs.reverted)"></td>
+                <td><button class="sm" x-show="cs.reverted < cs.files" @click="revertChange(cs)">回滚</button></td>
+              </tr>
+            </template>
+            <tr x-show="!changeSets.length"><td colspan="5" class="muted">还没有改动</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card section" x-show="scanSummary">
+      <div class="toolbar">
+        <select x-model="sf.kind" @change="sf.page = 1; loadStrmFiles()">
+          <option value="">全部类型</option>
+          <template x-for="[k, n] in Object.entries(strmKinds)" :key="k"><option :value="k" x-text="n"></option></template>
+        </select>
+        <select x-model="sf.managed" @change="sf.page = 1; loadStrmFiles()">
+          <option value="">纳管状态</option><option value="1">已纳管</option><option value="0">未纳管</option>
+        </select>
+        <span class="chip" x-show="sf.prefix"><span x-text="sf.prefix"></span> <a href="#" @click.prevent="sf.prefix = ''; loadStrmFiles()">×</a></span>
+        <input placeholder="路径、URL、番号、备注" x-model="sf.q" @input.debounce.400ms="sf.page = 1; loadStrmFiles()" style="flex:1;min-width:160px">
+        <span class="small muted">共 <b x-text="fmtNum(strmFiles.total)"></b> 个</span>
+      </div>
+      <div class="table-wrap">
+        <table class="small">
+          <thead><tr><th>文件</th><th>类型</th><th>番号</th><th>状态</th><th>内容</th></tr></thead>
+          <tbody>
+            <template x-for="f in strmFiles.items" :key="f.path">
+              <tr>
+                <td class="mono ellipsis" :title="f.path" x-text="f.path"></td>
+                <td><span class="chip" :class="f.kind === 'ours' ? 'ok' : (f.kind === 'invalid' ? 'err' : '')" x-text="strmKindName(f.kind)"></span>
+                  <span class="chip err" x-show="f.expired">已过期</span></td>
+                <td class="mono" x-text="f.slug ? f.slug.toUpperCase() : ''"></td>
+                <td><span class="chip" :class="f.managed ? 'ok' : ''" x-text="f.managed ? '已纳管' : (f.video_id ? '库里有' : (f.slug ? '库里没有' : ''))"></span>
+                  <div class="muted" x-text="f.note"></div></td>
+                <td class="mono ellipsis" :title="f.url" x-text="f.url"></td>
+              </tr>
+            </template>
+            <tr x-show="!strmFiles.items.length"><td colspan="5" class="muted">没有文件</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button class="sm" :disabled="sf.page <= 1" @click="sf.page--; loadStrmFiles()">上一页</button>
+        <span class="small muted">第 <span x-text="sf.page"></span> / <span x-text="Math.max(1, Math.ceil(strmFiles.total / sf.size))"></span> 页</span>
+        <button class="sm" :disabled="sf.page * sf.size >= strmFiles.total" @click="sf.page++; loadStrmFiles()">下一页</button>
+      </div>
+    </div>
+  </section>
+
   <!-- ================= 设置 ================= -->
   <section x-show="tab === 'settings'">
     <template x-if="needRewrite">
