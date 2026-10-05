@@ -1,5 +1,11 @@
 # v3 迭代方案：输出库、订阅、strm 扫描与改前缀、网关集成
 
+> **实施状态（2026-10-06）**：第 1–5 步已完成，第 6 步（Emby/Jellyfin 媒体库刷新联动）暂缓。
+> 和方案相比有三处调整：
+> - license 特性名是 `backend:http_resolver`，网关的前缀是冒号，不是点。
+> - 浏览器同源的脚本请求不带 `Origin`，所以网关额外传了 `fetch_mode`（Sec-Fetch-Mode），值为 `cors` 时同样返回 409。
+> - 网关的改动在 embyGateway 仓库的 `feat/http-resolver-backend` 分支上，`main` 没有动。
+
 > 2026-10-06。已确认的决定：
 > - 分目录两种方式都做：先做"按任务 + 订阅"，再做"规则库"
 > - 扫描要识别三类 strm：本服务生成的、其他 Jable 工具生成的、其他来源的

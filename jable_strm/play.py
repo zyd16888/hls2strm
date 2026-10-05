@@ -90,16 +90,19 @@ def _check_token(request: Request, t: str) -> None:
         raise HTTPException(403, "播放令牌错误")
 
 
-def direct_blocker(proxy_user_agents: list[str], ua: str, origin: str) -> str:
+def direct_blocker(proxy_user_agents: list[str], ua: str, origin: str, fetch_mode: str = "") -> str:
     """客户端不能直连 CDN 的原因；能直连返回空串。
 
-    CDN 拒绝 UA 含 Lavf / python-requests 的请求，也不返回 CORS 头（浏览器跨域请求会失败）。
+    CDN 拒绝 UA 含 Lavf / python-requests 的请求，也不返回 CORS 头：浏览器里 hls.js 这类脚本请求
+    （Sec-Fetch-Mode: cors）被 302 到 CDN 后会跨域失败；同源请求不带 Origin，所以要看 Sec-Fetch-Mode。
     """
     for p in proxy_user_agents:
         if p and p in ua:
             return f"客户端 UA 含 {p}，CDN 会拒绝"
     if origin:
         return "浏览器跨域请求，CDN 不返回 CORS 头"
+    if fetch_mode.lower() == "cors":
+        return "浏览器脚本请求（Sec-Fetch-Mode: cors），302 到 CDN 后会跨域失败"
     return ""
 
 
@@ -128,7 +131,8 @@ async def play(name: str, request: Request, t: str = "", proxy: int = 0):
     s = ctx.store.current
     ua = request.headers.get("user-agent", "")
     origin = request.headers.get("origin", "")
-    proxied = bool(proxy) or s.play_mode == "proxy" or bool(direct_blocker(s.proxy_user_agents, ua, origin))
+    fetch_mode = request.headers.get("sec-fetch-mode", "")
+    proxied = bool(proxy) or s.play_mode == "proxy" or bool(direct_blocker(s.proxy_user_agents, ua, origin, fetch_mode))
     left = int((v.get("hls_expires") or 0) - time.time())
     log.info("播放 %s：%s（地址剩余 %d 分钟，客户端 %s，UA %s）", slug, "中转" if proxied else "302",
              left // 60, request.client.host if request.client else "?", ua[:60])
@@ -150,7 +154,7 @@ async def cors_preflight():
 
 
 @router.get("/api/resolve/{name:path}")
-async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin: str = "",
+async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin: str = "", fetch_mode: str = "",
                               min_remaining: int | None = None):
     """给 embyGateway 的 http_resolver 后端用：返回可直连的 CDN 地址；客户端不能直连时返回 409，由网关回退。
 
@@ -168,7 +172,7 @@ async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin:
     if not SLUG_RE.fullmatch(slug):
         raise HTTPException(404, f"无法识别的影片：{name}")
     ctx.metrics.inc("resolve_requests")
-    reason = direct_blocker(s.proxy_user_agents, ua, origin)
+    reason = direct_blocker(s.proxy_user_agents, ua, origin, fetch_mode)
     if reason:
         ctx.metrics.inc("resolve_fallback")
         log.info("resolve %s：%s，让网关回退（UA %s）", slug, reason, ua[:60])

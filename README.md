@@ -120,6 +120,34 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
 
 路径的最后一段就是影片，所以网关的 objectKey 可以原样传，比如 `/api/resolve/play/ipzz-983.m3u8`。
 
+## 和 embyGateway 结合
+
+网关的 `http_resolver`（外部解析）后端会调用本服务的 `/api/resolve`。好处有两个：客户端只需一次 302 就直连 CDN；本服务不需要暴露到公网。
+
+```
+客户端 ──/videos/{id}/stream──► 网关 ──查 Emby 拿到 strm 地址 /play/ipzz-983.m3u8
+                                  │ 路由命中 → http_resolver 后端 → GET 本服务 /api/resolve/play/ipzz-983.m3u8
+                                  ├─ 200：302 到 CDN（原生播放器：Infuse、ExoPlayer、AVPlayer、Safari <video> 等）
+                                  └─ 409：回退反代 Emby → Emby 用 strm 里的内网地址拉流，本服务中转
+                                       （ffmpeg 的 Lavf UA、Emby Web 的 hls.js 等脚本请求）
+```
+
+配置步骤：
+
+1. 本服务「设置 → 网关解析令牌」填一个随机字符串。对外地址填 Emby 能访问到的内网地址即可。
+2. 网关管理台 → 后端：新建「外部解析 (http_resolver)」。
+   - 接口地址：`http://<本服务>:8080/api/resolve`
+   - Token：填第 1 步的令牌
+   - 超时：默认 10 秒（缓存的地址快过期时，需要现抓一次详情页）
+3. 网关 → 资源池：新建资源池，主后端选上一步建的后端。
+4. 网关 → Emby 源 → 路由：新建路由。
+   - 匹配正则：`^/play/[^/]+\.m3u8$`
+   - 路径规则集：任选一个，不需要映射，objectKey 原样传过来就行
+   - 资源池：选第 3 步建的资源池
+5. 网关的 license 需要带 `backend:http_resolver` 特性，否则这个后端会被禁用。
+
+验证方法：播放一部影片，网关日志里会出现 `Backend=<后端 ID> ObjectKey=play/xxx.m3u8`，本服务日志里会出现「resolve xxx：直连 CDN」或「让网关回退」。
+
 ## 被拦截了怎么办
 
 - 某个域名被拦截时，它会进入冷却（默认 5 分钟，连续被拦就翻倍，最长 1 小时），限速减半，并切换到下一个域名。

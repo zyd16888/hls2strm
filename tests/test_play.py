@@ -28,6 +28,10 @@ def test_play_and_resolve(tmp_path):
             r = c.get("/play/ipzz-983.m3u8", headers={"User-Agent": "Mozilla/5.0", "Origin": "http://emby:8096"})
             assert r.status_code == 200 and r.headers["access-control-allow-origin"] == "*"
             assert c.options("/hls/ipzz-983/a.ts").status_code == 204
+            # 同源的脚本请求（不带 Origin，但 Sec-Fetch-Mode: cors）也要中转
+            r = c.get("/play/ipzz-983.m3u8", headers={"User-Agent": "Mozilla/5.0", "Sec-Fetch-Mode": "cors"},
+                      follow_redirects=False)
+            assert r.status_code == 200 and "../hls/" in r.text
 
             # resolve：没设令牌不开放；令牌错误 401
             assert c.get("/api/resolve/ipzz-983.m3u8").status_code == 403
@@ -43,6 +47,10 @@ def test_play_and_resolve(tmp_path):
             assert r.status_code == 409 and "Lavf" in r.json()["reason"]
             r = c.get("/api/resolve/ipzz-983", headers=h, params={"ua": "Mozilla/5.0", "origin": "http://emby:8096"})
             assert r.status_code == 409
+            r = c.get("/api/resolve/ipzz-983", headers=h, params={"ua": "Mozilla/5.0", "fetch_mode": "cors"})
+            assert r.status_code == 409 and "cors" in r.json()["reason"]
+            r = c.get("/api/resolve/ipzz-983", headers=h, params={"ua": "Mozilla/5.0", "fetch_mode": "no-cors"})
+            assert r.status_code == 200  # <video> 元素直接加载，不受 CORS 限制
             assert c.get("/api/resolve/not-exist-1.m3u8", headers=h).status_code == 404
             assert c.get("/api/resolve/ipzz-983?token=tk").status_code == 200
     finally:
