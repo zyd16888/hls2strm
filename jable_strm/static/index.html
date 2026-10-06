@@ -357,7 +357,8 @@
               <tr>
                 <td class="num" x-text="l.id"></td>
                 <td x-text="l.name"></td>
-                <td><div class="mono" x-text="l.dir"></div><div class="small muted mono" x-text="l.root"></div></td>
+                <td><div class="mono" x-text="l.dir"></div><div class="small muted mono" x-text="l.root"></div>
+                  <div class="small" x-show="l.external_dir"><span class="chip info">外部整理</span> <span class="mono" x-text="l.external_root"></span></div></td>
                 <td class="mono small" x-text="l.path_template || '（默认）'"></td>
                 <td class="small" x-text="l.rule_text || '-'"></td>
                 <td class="num" x-text="fmtNum(l.videos)"></td>
@@ -366,6 +367,7 @@
                   <button class="sm" @click="editLibrary(l)">编辑</button>
                   <button class="sm" @click="post('/api/jobs', {kind: 'rewrite', library_id: l.id}).then(() => notify('已排队重写'))">重写</button>
                   <button class="sm" x-show="l.rule" @click="post('/api/libraries/' + l.id + '/reclassify').then(() => notify('已排队重新归库'))">重新归库</button>
+                  <button class="sm" x-show="l.external_dir" @click="post('/api/libraries/' + l.id + '/locate').then(() => notify('已排队同步位置'))">同步位置</button>
                   <button class="sm danger" x-show="l.id !== 1" @click="deleteLibrary(l)">删除</button>
                 </td>
               </tr>
@@ -378,6 +380,10 @@
         <label class="field"><span>名称</span><input x-model="libForm.name" placeholder="中文字幕"></label>
         <label class="field grow"><span>目录（相对输出根目录，或绝对路径）</span><input x-model="libForm.dir" placeholder="中文字幕"></label>
         <label class="field grow"><span>路径模板（留空用默认）</span><input x-model="libForm.path_template" placeholder="{actor}/{slug}"></label>
+      </div>
+      <div class="form-row section">
+        <label class="field grow"><span>外部整理目录（交给 mdcng 等移动、刮削时填它的整理目标；留空 = 由本服务管理）</span>
+          <input x-model="libForm.external_dir" placeholder="/media/jable-mdc/中文字幕" spellcheck="false"></label>
       </div>
       <details class="section" :open="libForm.useRule">
         <summary class="small" @click.prevent="libForm.useRule = !libForm.useRule">
@@ -405,6 +411,10 @@
       <div class="small muted">库目录不能互相嵌套。修改目录或模板会自动排一个重写任务，把已有文件搬到新位置；
         修改规则会自动排一个重新归库任务，不再符合规则的影片会从库里移除（只移除规则加入的，任务和订阅加入的保留）。
         组内多个值满足任一即可；分类、标签按站点上的名称或 slug 匹配。</div>
+      <div class="small muted section">外部整理库：strm 只在影片第一次入库时写进库目录（不写 nfo、封面），之后由外部工具移走、改名、刮削，
+        本服务不再在库目录补写，也不搬文件。「同步位置」按 strm 内容在库目录和外部整理目录里找回每部影片的文件；
+        重写输出（比如改了对外地址或播放令牌）会先同步位置，再原地改 strm 内容；删除库时只删 strm，nfo 和图片留给外部工具。
+        外部整理目录不能和任何库目录嵌套。清空外部整理目录就改回由本服务管理，之后重写会把文件按模板搬回库目录。</div>
     </div>
 
     <div class="card section">

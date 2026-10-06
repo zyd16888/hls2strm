@@ -2,7 +2,7 @@
 
 const KIND_NAMES = {
   list: "列表页", detail: "详情页", rewrite: "重写输出", purge: "删除库", reclassify: "重新归库",
-  scan: "扫描", adopt: "纳管", prefix: "改前缀", revert: "回滚",
+  scan: "扫描", adopt: "纳管", prefix: "改前缀", revert: "回滚", locate: "同步位置",
   crawl: "列表抓取", incremental: "增量", videos: "指定影片",
 };
 const JOB_STATUS = { running: "运行中", paused: "已暂停", done: "已完成", cancelled: "已取消" };
@@ -214,6 +214,7 @@ function app() {
     jobProgressText(j) {
       let text = `${this.fmtNum(this.jobFinished(j))} / ${this.fmtNum(this.jobTotal(j))}`;
       if (j.state?.last_page) text += ` · 共 ${j.state.last_page} 页`;
+      if (j.kind === "locate" && j.state?.checked != null) text += ` · 更新 ${this.fmtNum(j.state.updated)}，找不到 ${this.fmtNum(j.state.missing)}`;
       return text;
     },
     jobCls(st) { return { running: "ok", paused: "warn", done: "info", cancelled: "" }[st] || ""; },
@@ -305,19 +306,20 @@ function app() {
     async loadLibraries() { this.libraries = await this.get("/api/libraries").catch(() => this.libraries); },
     async loadSubs() { this.subscriptions = await this.get("/api/subscriptions").catch(() => this.subscriptions); },
     emptyRule() { return { categories: "", tags: "", models: "", quality: "", keywords: "", match: "any" }; },
-    resetLibForm() { this.libForm = { id: null, name: "", dir: "", path_template: "", useRule: false, rule: this.emptyRule() }; },
+    resetLibForm() { this.libForm = { id: null, name: "", dir: "", path_template: "", external_dir: "", useRule: false, rule: this.emptyRule() }; },
     editLibrary(l) {
       const rule = this.emptyRule();
       if (l.rule) for (const k of Object.keys(rule)) rule[k] = Array.isArray(l.rule[k]) ? l.rule[k].join(", ") : (l.rule[k] || rule[k]);
-      this.libForm = { id: l.id, name: l.name, dir: l.dir, path_template: l.path_template, useRule: !!l.rule, rule };
+      this.libForm = { id: l.id, name: l.name, dir: l.dir, path_template: l.path_template, external_dir: l.external_dir, useRule: !!l.rule, rule };
     },
     async loadFacets() { this.facets = await this.get("/api/facets").catch(() => this.facets); },
     async saveLibrary() {
       const f = this.libForm;
-      const body = { name: f.name, dir: f.dir, path_template: f.path_template, rule: f.useRule ? f.rule : null };
+      const body = { name: f.name, dir: f.dir, path_template: f.path_template, external_dir: f.external_dir, rule: f.useRule ? f.rule : null };
       try {
         const r = f.id ? await this.req("PUT", `/api/libraries/${f.id}`, body) : await this.req("POST", "/api/libraries", body);
-        const jobs = [r.rewrite_job_id && `重写 #${r.rewrite_job_id}`, r.reclassify_job_id && `重新归库 #${r.reclassify_job_id}`].filter(Boolean);
+        const jobs = [r.rewrite_job_id && `重写 #${r.rewrite_job_id}`, r.reclassify_job_id && `重新归库 #${r.reclassify_job_id}`,
+                      r.locate_job_id && `同步位置 #${r.locate_job_id}`].filter(Boolean);
         this.notify((f.id ? "已保存" : "已新建输出库") + (jobs.length ? `，已排队：${jobs.join("、")}` : ""));
         this.resetLibForm();
         this.loadLibraries();
@@ -325,7 +327,8 @@ function app() {
     },
     async deleteLibrary(l) {
       if (!confirm(`删除输出库「${l.name}」？`)) return;
-      const files = confirm(`同时删除「${l.name}」目录下本程序生成的 ${l.videos} 部影片的文件吗？\n确定 = 删除文件；取消 = 只删记录，保留文件`);
+      const what = l.external_dir ? `${l.videos} 部影片的 strm（外部整理库只删 strm，nfo 和图片留给外部工具）` : `目录下本程序生成的 ${l.videos} 部影片的文件`;
+      const files = confirm(`同时删除「${l.name}」${what}吗？\n确定 = 删除文件；取消 = 只删记录，保留文件`);
       try {
         const r = await this.req("DELETE", `/api/libraries/${l.id}?delete_files=${files}`);
         this.notify(`已排队删除任务 #${r.job_id}`);

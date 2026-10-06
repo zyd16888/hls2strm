@@ -199,7 +199,12 @@ async def _migrate_v3(conn: aiosqlite.Connection) -> None:
         await conn.execute(sql)
 
 
-MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3]
+async def _migrate_v4(conn: aiosqlite.Connection) -> None:
+    """输出库的外部整理目录：strm 交给 mdcng 等外部工具移动、刮削。"""
+    await conn.execute("ALTER TABLE libraries ADD COLUMN external_dir TEXT NOT NULL DEFAULT ''")
+
+
+MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4]
 
 
 def now() -> int:
@@ -447,10 +452,11 @@ class Database:
     async def get_library(self, library_id: int) -> dict | None:
         return _library_row(await self._one("SELECT * FROM libraries WHERE id=?", (library_id,)))
 
-    async def create_library(self, name: str, dir: str, path_template: str = "", rule: dict | None = None) -> int:
+    async def create_library(self, name: str, dir: str, path_template: str = "", rule: dict | None = None,
+                             external_dir: str = "") -> int:
         cur = await self._write(
-            "INSERT INTO libraries(name, dir, path_template, rule, created_at) VALUES(?, ?, ?, ?, ?)",
-            (name, dir, path_template, json.dumps(rule, ensure_ascii=False) if rule else "", now()),
+            "INSERT INTO libraries(name, dir, path_template, rule, external_dir, created_at) VALUES(?, ?, ?, ?, ?, ?)",
+            (name, dir, path_template, json.dumps(rule, ensure_ascii=False) if rule else "", external_dir, now()),
         )
         return cur.lastrowid
 
@@ -511,6 +517,13 @@ class Database:
                 "UPDATE outputs SET strm_path=?, written_at=?, cover_done=? WHERE video_id=? AND library_id=?",
                 (strm_path, now(), int(cover_done), video_id, library_id),
             )
+
+    async def set_output_paths(self, library_id: int, paths: list[tuple[str, int]]) -> int:
+        """批量改记录的 strm 路径（外部工具移走文件后找回的新位置），paths 是 (路径, 影片 id)。"""
+        return await self._write_many(
+            "UPDATE outputs SET strm_path=? WHERE video_id=? AND library_id=?",
+            [(path, video_id, library_id) for path, video_id in paths],
+        )
 
     async def delete_output(self, video_id: int, library_id: int) -> None:
         await self._write("DELETE FROM outputs WHERE video_id=? AND library_id=?", (video_id, library_id))

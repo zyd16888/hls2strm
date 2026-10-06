@@ -1,4 +1,4 @@
-"""已有 strm 的扫描、纳管、批量改前缀与回滚。
+"""已有 strm 的扫描、纳管、批量改前缀与回滚，以及外部整理库的「同步位置」。
 
 扫描把目录下每个 .strm 分类：
   ours     本服务格式：…/play/{slug}.m3u8（域名不限）
@@ -6,6 +6,9 @@
   named    URL 不认识，但文件名或父目录里有番号（可能是别的片源，纳管需手动勾选）
   other    其他来源（115、alist 等），只参与统计和改前缀
   invalid  空文件
+
+外部整理库（设置了外部整理目录）的 strm 会被 mdcng 等工具移走、改名；「同步位置」在库目录和外部整理目录里
+按 strm 内容找回每部影片的文件，更新记录的路径，之后重写、改地址都在新位置原地进行。
 """
 
 from __future__ import annotations
@@ -86,6 +89,29 @@ def classify(path: Path, content: str, now: float) -> StrmInfo:
     return StrmInfo("named" if slug else "other", url, prefix, slug)
 
 
+def iter_strm(root: Path, now: float):
+    """遍历目录下的 .strm，产出 (路径, 修改时间, 分类结果)。"""
+    for dirpath, _, files in os.walk(root):
+        for name in files:
+            if not name.lower().endswith(".strm"):
+                continue
+            p = os.path.join(dirpath, name)
+            try:
+                mtime = int(os.stat(p).st_mtime)
+                with open(p, "rb") as f:
+                    content = f.read(8192).decode("utf-8", "replace")
+            except OSError:
+                continue
+            yield p, mtime, classify(Path(p), content, now)
+
+
+def video_of(info: StrmInfo, slug_by_id: dict[int, str], id_by_slug: dict[str, int]) -> tuple[str, int | None]:
+    """strm 对应库里的哪部影片，返回 (slug, 影片 id)；库里没有时 id 为 None。"""
+    if info.kind == "cdn" and info.video_id in slug_by_id:
+        return slug_by_id[info.video_id], info.video_id  # videoId 就是库里的主键，直接换出 slug
+    return info.slug, (id_by_slug.get(info.slug) if info.slug else None)
+
+
 def scan_directory(
     root: Path,
     library_roots: list[tuple[int, Path]],
@@ -98,29 +124,32 @@ def scan_directory(
     now = time.time()
     roots = sorted(((os.path.normcase(str(r)) + os.sep, lid) for lid, r in library_roots), key=lambda x: -len(x[0]))
     rows = []
-    for dirpath, _, files in os.walk(root):
-        for name in files:
-            if not name.lower().endswith(".strm"):
-                continue
-            p = os.path.join(dirpath, name)
-            try:
-                mtime = int(os.stat(p).st_mtime)
-                with open(p, "rb") as f:
-                    content = f.read(8192).decode("utf-8", "replace")
-            except OSError:
-                continue
-            info = classify(Path(p), content, now)
-            slug, vid = info.slug, None
-            if info.kind == "cdn" and info.video_id in slug_by_id:
-                vid = info.video_id
-                slug = slug_by_id[vid]  # videoId 就是库里的主键，直接换出 slug
-            elif slug:
-                vid = id_by_slug.get(slug)
-            key = os.path.normcase(p)
-            lib_id = next((lid for r, lid in roots if key.startswith(r)), None)
-            rows.append((p, scan_id, info.url, info.prefix, info.kind, slug, vid, int(info.expired),
-                         int(key in managed), lib_id, mtime, "", int(now)))
+    for p, mtime, info in iter_strm(root, now):
+        slug, vid = video_of(info, slug_by_id, id_by_slug)
+        key = os.path.normcase(p)
+        lib_id = next((lid for r, lid in roots if key.startswith(r)), None)
+        rows.append((p, scan_id, info.url, info.prefix, info.kind, slug, vid, int(info.expired),
+                     int(key in managed), lib_id, mtime, "", int(now)))
     return rows
+
+
+def find_by_video(roots: list[Path], slug_by_id: dict[int, str], id_by_slug: dict[str, int]) -> dict[int, list[str]]:
+    """按 strm 内容（本服务地址或 CDN 直链）找出每部影片的文件，不看文件名，所以外部工具改名也认得出。
+
+    跳过软链接：外部工具用软链接模式时，真正的文件还在库目录里，记录它就行。同步函数，放到线程里跑。
+    """
+    now = time.time()
+    found: dict[int, list[str]] = {}
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for p, _, info in iter_strm(root, now):
+            if info.kind not in ("ours", "cdn") or os.path.islink(p):
+                continue
+            _, vid = video_of(info, slug_by_id, id_by_slug)
+            if vid is not None:
+                found.setdefault(vid, []).append(p)
+    return {vid: sorted(paths) for vid, paths in found.items()}
 
 
 def replace_prefix_in_file(path: Path, old: str, new: str) -> tuple[str, str] | None:
@@ -187,6 +216,7 @@ class StrmManager:
         if not root.is_dir():
             raise ValueError(f"目录不存在：{root}")
         lib_roots = [(lid, self.e.writer.library_root(lib)) for lid, lib in self.e.libs.items()]
+        lib_roots += [(lid, r) for lid, lib in self.e.libs.items() if (r := self.e.writer.external_root(lib))]
         managed = {os.path.normcase(p) for p in await self.db.all_output_paths()}
         keys = await self.db.video_keys()
         rows = await asyncio.to_thread(
@@ -229,6 +259,9 @@ class StrmManager:
         row = await self.db.get_strm_file(path)
         if row is None or row["managed"]:
             return
+        if not Path(path).is_file():
+            await self.db.update_strm_file(path, note="文件已不存在")
+            return
         lib_id = p.get("library_id") or row["library_id"]
         if not lib_id or lib_id not in self.e.libs:
             await self.db.update_strm_file(path, note="不在任何输出库目录下，需要指定目标库")
@@ -258,6 +291,65 @@ class StrmManager:
             path, managed=1, kind="ours", url=url, prefix=url_prefix(url), slug=v["slug"], video_id=v["id"],
             library_id=lib_id, note=f"已纳管，移到 {out['strm_path']}" if moved else "已纳管",
         )
+
+    # ---- 外部整理库：同步位置 ----
+
+    async def create_locate(self, library_id: int | None = None) -> int:
+        """library_id 为空时同步所有外部整理库。"""
+        libs = [self.e._library(library_id)] if library_id else list(self.e.libs.values())
+        libs = [lib for lib in libs if lib["external_dir"]]
+        if not libs:
+            raise ValueError("没有设置外部整理目录的输出库")
+        job_id = await self.db.create_job("locate", "同步位置：" + "、".join(lib["name"] for lib in libs),
+                                          {"library_id": library_id})
+        await self.db.add_tasks(job_id, "locate", [lib["id"] for lib in libs], 20)
+        self.e.notify()
+        return job_id
+
+    async def do_locate(self, job: dict, task: dict) -> None:
+        lib = self.e.libs.get(int(task["target"]))
+        if lib is None or not lib["external_dir"]:
+            return
+        result = await self.locate(lib)
+        state = (await self.db.get_job(job["id"]))["state"]
+        for k, n in result.items():
+            state[k] = state.get(k, 0) + n
+        await self.db.update_job(job["id"], state=state)
+
+    async def locate(self, lib: dict) -> dict:
+        """在库目录和外部整理目录里找回这个库每部影片的 strm，更新记录的路径；不移动、不改任何文件。
+
+        同一部影片找到多个文件时优先外部整理目录里的（整理好的那份才是媒体库在用的）。
+        """
+        ext = self.e.writer.external_root(lib)
+        keys = await self.db.video_keys()
+        found = await asyncio.to_thread(
+            find_by_video, [self.e.writer.library_root(lib), ext], dict(keys), {s: i for i, s in keys}
+        )
+        ext_prefix = os.path.normcase(str(ext)) + os.sep
+        in_ext = {vid: [p for p in paths if os.path.normcase(p).startswith(ext_prefix)] for vid, paths in found.items()}
+        updates: list[tuple[str, int]] = []
+        seen: set[int] = set()
+        result = {"checked": 0, "updated": 0, "missing": 0, "duplicates": 0, "extra": 0}
+        async for v, out in self.db.iter_outputs(lib["id"]):
+            seen.add(v["id"])
+            result["checked"] += 1
+            cur, ext_paths, paths = out["strm_path"], in_ext.get(v["id"], []), found.get(v["id"], [])
+            result["duplicates"] += len(ext_paths) > 1
+            if cur and (os.path.normcase(cur) in {os.path.normcase(p) for p in ext_paths}
+                        or (not ext_paths and os.path.isfile(cur))):
+                continue
+            if ext_paths or paths:
+                updates.append(((ext_paths or paths)[0], v["id"]))
+            elif cur:
+                result["missing"] += 1
+        await self.db.set_output_paths(lib["id"], updates)
+        result["updated"] = len(updates)
+        result["extra"] = sum(1 for vid, paths in in_ext.items() if paths and vid not in seen)
+        log.info("同步位置「%s」：检查 %d 部，更新路径 %d，找不到 %d，外部整理目录里重复 %d，不在本库 %d",
+                 lib["name"], result["checked"], result["updated"], result["missing"], result["duplicates"],
+                 result["extra"])
+        return result
 
     # ---- 改前缀 / 回滚 ----
 

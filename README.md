@@ -87,6 +87,24 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
   - 不再符合规则的影片会从库里移除，但只移除规则加入的，任务和订阅加入的保留。
   - 例子：建库「中文字幕」，规则写分类 `中文字幕`（或 slug `chinese-subtitle`）。这样全站订阅抓到的中文字幕片会自动归进去，不用再单独订阅这个分类。
 
+### 交给 mdcng 等外部工具整理刮削
+
+只想要 strm、刮削和归类交给 mdcng 时，给库填上**外部整理目录**，也就是 mdcng 为这个库整理输出的目标目录。这样的库叫外部整理库：
+
+- 库目录变成"收件目录"：影片第一次入库时按模板写一个 strm，不写 nfo，也不下载封面。mdcng 监控这个目录，把 strm 移走、改名，并生成 nfo 和图片。
+- 之后本服务不会在收件目录补写 strm：订阅增量、重抓详情、重写都不会，所以 mdcng 不会重复刮削。本服务也不搬文件。
+- **同步位置**：在收件目录和外部整理目录里按 strm 内容（`/play/{slug}.m3u8`）找回每部影片的文件，并更新记录的路径，不看文件名，所以 mdcng 改了名也认得出。
+- **重写输出**：改对外地址或播放令牌后执行。外部整理库会先自动同步位置，再原地改 strm 内容。
+- **删除库**：选了"连同文件"时，只删 strm，nfo 和图片留给 mdcng 处理。
+- 外部整理目录不能和任何库目录互相嵌套，否则整理好的文件会被 mdcng 当成新文件，再处理一遍。
+
+建议的配置：
+
+1. 本服务：设置里关掉「抓详情」。各库填好外部整理目录，比如 `全部` → `/media/jable/全部`，`中文字幕` → `/media/jable/中文字幕`。
+2. mdcng：给每个收件目录加一个目录监控，整理模式选「移动」，目标目录选上面填的外部整理目录。两边容器里的路径可以不一样，但必须是同一个目录；本服务这边填的是本服务容器里看到的路径。不同的收件目录要整理到不同的目标目录。
+3. Emby/Jellyfin：媒体库指向外部整理目录，不要指向收件目录。
+4. 分类用「分类订阅 + 输出库」实现，只翻列表页，不需要详情。例如订阅 `/categories/chinese-subtitle/` → 库「中文字幕」。同一部影片在多个库里各有一份独立的 strm，mdcng 会分别刮削。
+
 ### 其他任务类型（「任务」页）
 
 - **列表地址**：一次性抓取分类 `/categories/x/`、标签 `/tags/x/`、女优 `/models/x/`、搜索 `/search/关键词/`、热门 `/hot/`，可以指定排序、页码范围和输出库
@@ -179,6 +197,7 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
 | POST | `/api/jobs/{id}/pause\|resume\|cancel\|retry` | 控制任务 |
 | GET | `/api/videos?q=&filter=no_detail&library_id=&page=` | 影片库（每部影片带所在的库和 strm 路径） |
 | GET / POST / PUT / DELETE | `/api/libraries`、`/api/libraries/{id}` | 输出库；DELETE 可带 `?delete_files=true` |
+| POST | `/api/libraries/{id}/locate` | 外部整理库：同步位置 |
 | GET / POST / PUT / DELETE | `/api/subscriptions`、`/api/subscriptions/{id}` | 订阅 |
 | POST | `/api/subscriptions/{id}/run?mode=auto\|full\|incremental` | 立即运行订阅 |
 | POST | `/api/videos/{slug}/refresh` | 立即重抓详情 |

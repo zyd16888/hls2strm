@@ -253,6 +253,7 @@ class LibraryBody(BaseModel):
     dir: str
     path_template: str = ""
     rule: dict | None = None
+    external_dir: str = ""
 
 
 @router.get("/libraries")
@@ -261,6 +262,7 @@ async def list_libraries(request: Request):
     libs = await c.db.list_libraries()
     for lib in libs:
         lib["root"] = str(c.writer.library_root(lib))
+        lib["external_root"] = str(c.writer.external_root(lib) or "")
         lib["rule_text"] = describe_rule(lib["rule"])
     return libs
 
@@ -268,7 +270,8 @@ async def list_libraries(request: Request):
 @router.post("/libraries")
 async def create_library(body: LibraryBody, request: Request):
     try:
-        return await _ctx(request).engine.create_library(body.name, body.dir, body.path_template, body.rule)
+        return await _ctx(request).engine.create_library(body.name, body.dir, body.path_template, body.rule,
+                                                         body.external_dir)
     except ValueError as err:
         raise HTTPException(400, str(err)) from None
     except sqlite3.IntegrityError:
@@ -278,7 +281,8 @@ async def create_library(body: LibraryBody, request: Request):
 @router.put("/libraries/{lib_id}")
 async def update_library(lib_id: int, body: LibraryBody, request: Request):
     try:
-        return await _ctx(request).engine.update_library(lib_id, body.name, body.dir, body.path_template, body.rule)
+        return await _ctx(request).engine.update_library(lib_id, body.name, body.dir, body.path_template, body.rule,
+                                                         body.external_dir)
     except ValueError as err:
         raise HTTPException(400, str(err)) from None
     except sqlite3.IntegrityError:
@@ -289,6 +293,14 @@ async def update_library(lib_id: int, body: LibraryBody, request: Request):
 async def reclassify_library(lib_id: int, request: Request):
     try:
         return {"job_id": await _ctx(request).engine.create_reclassify(lib_id)}
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from None
+
+
+@router.post("/libraries/{lib_id}/locate")
+async def locate_library(lib_id: int, request: Request):
+    try:
+        return {"job_id": await _ctx(request).engine.strm.create_locate(lib_id)}
     except ValueError as err:
         raise HTTPException(400, str(err)) from None
 

@@ -107,6 +107,10 @@ class OutputWriter:
         d = Path(lib["dir"])
         return d if d.is_absolute() else self.store.output_dir / d
 
+    def external_root(self, lib: dict) -> Path | None:
+        """外部整理目录（mdcng 等把这个库的 strm 整理到哪里），没设置返回 None；路径规则同库目录。"""
+        return self.library_root({"dir": lib["external_dir"]}) if lib.get("external_dir") else None
+
     def base_path(self, v: dict, lib: dict) -> Path:
         """不含扩展名的输出路径。"""
         models = v.get("models") or []
@@ -125,19 +129,28 @@ class OutputWriter:
             raise ValueError(f"输出路径越界：{path}")
         return path
 
-    def write(self, v: dict, lib: dict, old_strm: str = "", keep_dirs: frozenset[Path] = frozenset()) -> Path:
+    def write(self, v: dict, lib: dict, old_strm: str = "", keep_dirs: frozenset[Path] = frozenset()) -> Path | None:
         """写 strm（有详情时一并写 nfo），返回 strm 路径。同步函数，调用方放到线程里跑。
 
         old_strm 和新位置不同（模板或库目录改了）时，把 nfo、封面搬到新位置，再清掉旧文件和空目录；
         keep_dirs 里的目录（各输出库根目录）不会被删。
+
+        外部整理库只在第一次按模板写进库目录，之后文件归外部工具移动、改名、刮削：这里只原地更新 strm 内容，
+        不搬文件、不写 nfo；记录的文件已经不在时返回 None，等「同步位置」找回新位置。
         """
+        url = (self.play_url(v) + "\n").encode()
+        if lib.get("external_dir") and old_strm:
+            if not Path(old_strm).is_file():
+                return None
+            write_atomic(Path(old_strm), url)
+            return Path(old_strm)
         base = self.base_path(v, lib)
         base.parent.mkdir(parents=True, exist_ok=True)
         strm = base.with_name(base.name + ".strm")
         if old_strm and Path(old_strm) != strm:
             self._relocate(Path(old_strm), base, keep_dirs)
-        write_atomic(strm, (self.play_url(v) + "\n").encode())
-        if self.store.current.write_nfo and v.get("detail_at"):
+        write_atomic(strm, url)
+        if self.store.current.write_nfo and v.get("detail_at") and not lib.get("external_dir"):
             write_atomic(base.with_name(base.name + ".nfo"), build_nfo(v).encode())
         return strm
 
@@ -154,10 +167,13 @@ class OutputWriter:
                 shutil.move(src, dst)
         self.remove_empty_dirs(old_strm.parent, keep_dirs)
 
-    def remove(self, strm: Path, keep_dirs: frozenset[Path] = frozenset()) -> None:
-        """删除一部影片在某个库里的全部输出文件（只删本程序生成的文件）。"""
+    def remove(self, strm: Path, keep_dirs: frozenset[Path] = frozenset(), strm_only: bool = False) -> None:
+        """删除一部影片在某个库里的全部输出文件（只删本程序生成的文件）。
+
+        strm_only：外部整理库只删 strm，旁边的 nfo、图片是外部工具生成的，不动。
+        """
         base = strm.with_name(strm.name.removesuffix(".strm"))
-        for suffix in OUTPUT_SUFFIXES:
+        for suffix in (".strm",) if strm_only else OUTPUT_SUFFIXES:
             base.with_name(base.name + suffix).unlink(missing_ok=True)
         self.remove_empty_dirs(strm.parent, keep_dirs)
 

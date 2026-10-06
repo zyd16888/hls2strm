@@ -6,7 +6,8 @@ job 种类：
   videos       抓指定影片的详情（手动添加、补全缺失详情）
   rewrite      按当前设置重写输出（可限定某个库），路径变化时搬动文件
   purge        删除输出库及其文件
-子任务种类：list（目标=页码）、detail（目标=slug）、rewrite（目标=all）、purge（目标=库 id）
+  locate       外部整理库：找回被外部工具（mdcng 等）移走、改名的 strm，更新记录的路径
+子任务种类：list（目标=页码）、detail（目标=slug）、rewrite（目标=all）、purge / locate（目标=库 id）
 """
 
 from __future__ import annotations
@@ -153,7 +154,8 @@ class Engine:
             handler = {"list": self._do_list, "detail": self._do_detail, "rewrite": self._do_rewrite,
                        "purge": self._do_purge, "reclassify": self._do_reclassify,
                        "scan": self.strm.do_scan, "adopt": self.strm.do_adopt,
-                       "prefix": self.strm.do_prefix, "revert": self.strm.do_revert}[task["kind"]]
+                       "prefix": self.strm.do_prefix, "revert": self.strm.do_revert,
+                       "locate": self.strm.do_locate}[task["kind"]]
             await handler(job, task)
             await self.db.finish_task(tid, "done", duration_ms=int((time.monotonic() - t0) * 1000))
             self.metrics.inc(f"task_{task['kind']}_done")
@@ -235,7 +237,8 @@ class Engine:
         self.libs = {lib["id"]: lib for lib in await self.db.list_libraries()}
 
     def keep_dirs(self) -> frozenset[Path]:
-        return frozenset(self.writer.library_root(lib) for lib in self.libs.values())
+        roots = [self.writer.library_root(lib) for lib in self.libs.values()]
+        return frozenset(roots + [r for lib in self.libs.values() if (r := self.writer.external_root(lib))])
 
     def _library(self, library_id: int) -> dict:
         lib = self.libs.get(library_id)
@@ -249,8 +252,10 @@ class Engine:
             out = await self.db.get_output(v["id"], library_id)
             old_strm = out["strm_path"] if out else ""
         strm = await asyncio.to_thread(self.writer.write, v, lib, old_strm, self.keep_dirs())
+        if strm is None:
+            return  # 外部整理库：文件已被外部工具移走，等「同步位置」找回
         cover_done = None
-        if cover:
+        if cover and not lib["external_dir"]:
             siblings = [Path(o["strm_path"]) for o in await self.db.get_outputs(v["id"])
                         if o["library_id"] != library_id and o["strm_path"]]
             cover_done = await self.writer.write_cover(self.fetcher, v, strm, siblings)
@@ -350,6 +355,9 @@ class Engine:
 
     async def _do_rewrite(self, job: dict, task: dict) -> None:
         lib_id = job["params"].get("library_id")
+        for lib in list(self.libs.values()):
+            if lib["external_dir"] and lib_id in (None, lib["id"]):
+                await self.strm.locate(lib)  # 外部整理库先找回文件的新位置，再原地改内容
         n = 0
         async for v, out in self.db.iter_outputs(lib_id):
             if v["status"] != "active" or out["library_id"] not in self.libs:
@@ -374,7 +382,8 @@ class Engine:
                 added += 1
             elif not should and out is not None and out["via"] == "rule":
                 if out["strm_path"]:
-                    await asyncio.to_thread(self.writer.remove, Path(out["strm_path"]), self.keep_dirs())
+                    await asyncio.to_thread(self.writer.remove, Path(out["strm_path"]), self.keep_dirs(),
+                                            bool(lib["external_dir"]))
                 await self.db.delete_output(v["id"], lib["id"])
                 removed += 1
         return added, removed
@@ -404,11 +413,14 @@ class Engine:
         if lib is None:
             return
         if job["params"].get("delete_files"):
+            external = bool(lib["external_dir"])
+            if external:
+                await self.strm.locate(lib)
             keep = self.keep_dirs() - {self.writer.library_root(lib)}
             n = 0
             async for _, out in self.db.iter_outputs(lib_id):
                 if out["strm_path"]:
-                    await asyncio.to_thread(self.writer.remove, Path(out["strm_path"]), keep)
+                    await asyncio.to_thread(self.writer.remove, Path(out["strm_path"]), keep, external)
                     n += 1
             log.info("输出库「%s」：已删除 %d 部影片的文件", lib["name"], n)
         await self.db.delete_library(lib_id)
@@ -514,47 +526,65 @@ class Engine:
 
     # ---- 输出库管理 ----
 
-    def _check_library(self, name: str, dir: str, path_template: str, exclude_id: int | None = None) -> tuple:
-        name, dir = name.strip(), dir.strip().rstrip("/\\")
+    def _check_library(self, name: str, dir: str, path_template: str, external_dir: str = "",
+                       exclude_id: int | None = None) -> tuple:
+        name, dir, external_dir = name.strip(), dir.strip().rstrip("/\\"), external_dir.strip().rstrip("/\\")
         if not name:
             raise ValueError("库名不能为空")
         if not dir:
             raise ValueError("目录不能为空：输出根目录本身不能作为库目录，否则别的库会嵌套在里面")
-        if not Path(dir).is_absolute() and ".." in Path(dir).parts:
-            raise ValueError("相对目录不能包含 ..")
+        for d in (dir, external_dir):
+            if d and not Path(d).is_absolute() and ".." in Path(d).parts:
+                raise ValueError("相对目录不能包含 ..")
         template = check_path_template(path_template) if path_template.strip() else ""
         root = self.writer.library_root({"dir": dir}).resolve()
         if root == self.store.output_dir.resolve():
             raise ValueError("库目录不能是输出根目录")
+        mine = [root]
+        if external_dir:
+            ext = self.writer.library_root({"dir": external_dir}).resolve()
+            if _overlap(root, ext):
+                raise ValueError("外部整理目录和库目录不能互相嵌套，否则整理好的文件会被外部工具当成新文件再处理一遍")
+            mine.append(ext)
         for other in self.libs.values():
             if other["id"] == exclude_id:
                 continue
-            o = self.writer.library_root(other).resolve()
-            if root == o or o in root.parents or root in o.parents:
-                raise ValueError(f"目录和输出库「{other['name']}」（{o}）重叠，库目录不能互相嵌套")
-        return name, dir, template
+            for o in filter(None, (self.writer.library_root(other), self.writer.external_root(other))):
+                o = o.resolve()
+                if any(_overlap(m, o) for m in mine):
+                    raise ValueError(f"目录和输出库「{other['name']}」（{o}）重叠，各库的目录、外部整理目录不能互相嵌套")
+        return name, dir, template, external_dir
 
-    async def create_library(self, name: str, dir: str, path_template: str = "", rule: dict | None = None) -> dict:
+    async def create_library(self, name: str, dir: str, path_template: str = "", rule: dict | None = None,
+                             external_dir: str = "") -> dict:
         """新建输出库；带规则时自动排一个重新归库任务。"""
-        name, dir, template = self._check_library(name, dir, path_template)
+        name, dir, template, external_dir = self._check_library(name, dir, path_template, external_dir)
         rule = normalize_rule(rule)
-        lib_id = await self.db.create_library(name, dir, template, rule)
+        lib_id = await self.db.create_library(name, dir, template, rule, external_dir)
         await self.reload_libraries()
-        log.info("新建输出库「%s」：%s%s", name, self.writer.library_root(self.libs[lib_id]),
+        lib = self.libs[lib_id]
+        log.info("新建输出库「%s」：%s%s%s", name, self.writer.library_root(lib),
+                 f"，外部整理到 {self.writer.external_root(lib)}" if external_dir else "",
                  f"，规则 {describe_rule(rule)}" if rule else "")
         return {"id": lib_id, "reclassify_job_id": await self.create_reclassify(lib_id) if rule else None}
 
     async def update_library(self, lib_id: int, name: str, dir: str, path_template: str = "",
-                             rule: dict | None = None) -> dict:
-        """修改输出库：目录或模板变了排重写任务搬文件，规则变了排重新归库任务。"""
+                             rule: dict | None = None, external_dir: str = "") -> dict:
+        """修改输出库：目录或模板变了排重写任务搬文件，规则变了排重新归库任务。
+
+        外部整理库的文件归外部工具管，目录或模板变了也不搬，只影响以后新写的 strm；外部整理目录变了排同步位置。
+        """
         old = self._library(lib_id)
-        name, dir, template = self._check_library(name, dir, path_template, exclude_id=lib_id)
+        name, dir, template, external_dir = self._check_library(name, dir, path_template, external_dir, lib_id)
         rule = normalize_rule(rule)
-        await self.db.update_library(lib_id, name=name, dir=dir, path_template=template, rule=rule)
+        await self.db.update_library(lib_id, name=name, dir=dir, path_template=template, rule=rule,
+                                     external_dir=external_dir)
         await self.reload_libraries()
-        jobs = {"rewrite_job_id": None, "reclassify_job_id": None}
-        if (dir, template) != (old["dir"], old["path_template"]):
+        jobs = {"rewrite_job_id": None, "reclassify_job_id": None, "locate_job_id": None}
+        if (dir, template) != (old["dir"], old["path_template"]) and not external_dir:
             jobs["rewrite_job_id"] = await self.create_rewrite(lib_id)
+        if external_dir and external_dir != old["external_dir"]:
+            jobs["locate_job_id"] = await self.strm.create_locate(lib_id)
         if rule != old["rule"]:
             jobs["reclassify_job_id"] = await self.create_reclassify(lib_id)
         return jobs
@@ -611,6 +641,10 @@ class Engine:
             if sub["last_run_at"] and t - sub["last_run_at"] < sub["interval"] * 60:
                 continue
             await self.run_subscription(sub["id"], "incremental")
+
+
+def _overlap(a: Path, b: Path) -> bool:
+    return a == b or a in b.parents or b in a.parents
 
 
 def snapshot_path(boot: BootConfig, name: str) -> Path | None:
