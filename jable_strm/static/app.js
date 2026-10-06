@@ -306,16 +306,21 @@ function app() {
     async loadLibraries() { this.libraries = await this.get("/api/libraries").catch(() => this.libraries); },
     async loadSubs() { this.subscriptions = await this.get("/api/subscriptions").catch(() => this.subscriptions); },
     emptyRule() { return { categories: "", tags: "", models: "", quality: "", keywords: "", match: "any" }; },
-    resetLibForm() { this.libForm = { id: null, name: "", dir: "", path_template: "", external_dir: "", useRule: false, rule: this.emptyRule() }; },
+    resetLibForm() {
+      this.libForm = { id: null, name: "", dir: "", path_template: "", external_dir: "", sources: [], excludes: [], useRule: false, rule: this.emptyRule() };
+    },
     editLibrary(l) {
       const rule = this.emptyRule();
       if (l.rule) for (const k of Object.keys(rule)) rule[k] = Array.isArray(l.rule[k]) ? l.rule[k].join(", ") : (l.rule[k] || rule[k]);
-      this.libForm = { id: l.id, name: l.name, dir: l.dir, path_template: l.path_template, external_dir: l.external_dir, useRule: !!l.rule, rule };
+      this.libForm = { id: l.id, name: l.name, dir: l.dir, path_template: l.path_template, external_dir: l.external_dir,
+                       sources: [...l.sources], excludes: [...l.excludes], useRule: !!l.rule, rule };
     },
+    libNames(ids) { return ids.map(id => this.libraries.find(l => l.id === id)?.name || `#${id}`).join("、"); },
     async loadFacets() { this.facets = await this.get("/api/facets").catch(() => this.facets); },
     async saveLibrary() {
       const f = this.libForm;
-      const body = { name: f.name, dir: f.dir, path_template: f.path_template, external_dir: f.external_dir, rule: f.useRule ? f.rule : null };
+      const body = { name: f.name, dir: f.dir, path_template: f.path_template, external_dir: f.external_dir,
+                     sources: f.sources.map(Number), excludes: f.excludes.map(Number), rule: f.useRule ? f.rule : null };
       try {
         const r = f.id ? await this.req("PUT", `/api/libraries/${f.id}`, body) : await this.req("POST", "/api/libraries", body);
         const jobs = [r.rewrite_job_id && `重写 #${r.rewrite_job_id}`, r.reclassify_job_id && `重新归库 #${r.reclassify_job_id}`,
@@ -366,6 +371,11 @@ function app() {
       this.notify(`已创建任务 #${r.job_id}`);
       this.loadSubs();
       this.refreshStatus();
+    },
+    async markInitialized(sub) {
+      if (!confirm(`订阅「${sub.name}」不跑首轮全量，直接改为定时增量？（库里已经用别的任务抓全时使用）`)) return;
+      await this.post(`/api/subscriptions/${sub.id}/initialized`);
+      this.loadSubs();
     },
     subState(sub) {
       if (sub.active_job_id) return { text: "执行中", cls: "warn" };

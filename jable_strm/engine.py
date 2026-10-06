@@ -7,6 +7,7 @@ job 种类：
   rewrite      按当前设置重写输出（可限定某个库），路径变化时搬动文件
   purge        删除输出库及其文件
   locate       外部整理库：找回被外部工具（mdcng 等）移走、改名的 strm，更新记录的路径
+  reclassify   重新归库：规则库重新求值，并按来源库、排除库归并（只在本地，不联网）
 子任务种类：list（目标=页码）、detail（目标=slug）、rewrite（目标=all）、purge / locate（目标=库 id）
 """
 
@@ -36,6 +37,7 @@ MAX_RETRY_DELAY = 7200
 MAX_SNAPSHOTS = 200
 DEFAULT_STOP_AFTER_KNOWN = 48
 DEFAULT_MAX_PAGES = 20
+SETTLE_INTERVAL = 600
 
 
 class Engine:
@@ -63,6 +65,9 @@ class Engine:
         self._scheduler: asyncio.Task | None = None
         self._wake = asyncio.Event()
         self._stopping = False
+        self._settle_lock = asyncio.Lock()
+        self._settle_wanted = True
+        self._settled_at = 0.0
 
     # ---- 生命周期 ----
 
@@ -224,6 +229,7 @@ class Engine:
             return
         counts = await self.db.task_counts(job_id)
         await self.db.update_job(job_id, status="done", finished_at=int(time.time()))
+        self._settle_wanted = True
         p = job["params"]
         if p.get("subscription_id") and not p.get("incremental"):
             await self.db.update_subscription(p["subscription_id"], initialized=1)
@@ -246,11 +252,14 @@ class Engine:
             raise ValueError(f"输出库 #{library_id} 不存在")
         return lib
 
-    async def _output_one(self, v: dict, library_id: int, *, cover: bool, old_strm: str | None = None) -> None:
+    async def _output_one(self, v: dict, library_id: int, *, cover: bool, old_strm: str | None = None,
+                          settle: bool = False) -> None:
         lib = self._library(library_id)
         if old_strm is None:
             out = await self.db.get_output(v["id"], library_id)
             old_strm = out["strm_path"] if out else ""
+        if not old_strm and lib["excludes"] and not settle:
+            return  # 有排除库的库：新片等归并确认它不属于排除库后再写
         strm = await asyncio.to_thread(self.writer.write, v, lib, old_strm, self.keep_dirs())
         if strm is None:
             return  # 外部整理库：文件已被外部工具移走，等「同步位置」找回
@@ -270,7 +279,7 @@ class Engine:
     async def _do_list(self, job: dict, task: dict) -> None:
         p = job["params"]
         lib_id = p.get("library_id") or DEFAULT_LIBRARY_ID
-        self._library(lib_id)
+        lib = self._library(lib_id)
         page = int(task["target"])
         url = sources.page_url(p["source"], page, p.get("sort", ""), p.get("block_id"))
         pg = await self.fetcher.get_page(url)
@@ -286,6 +295,10 @@ class Engine:
         for it in lp.items:
             await self.db.upsert_list_item(it)
             v = await self.db.get_video(it.slug)
+            if await self.db.in_libraries(v["id"], lib["excludes"]):
+                # 已分到排除库：本库不收，但算作已知，增量照常停
+                state["known_streak"] = state.get("known_streak", 0) + 1
+                continue
             added = await self.db.ensure_output(v["id"], lib_id)
             if added or not (await self.db.get_output(v["id"], lib_id))["strm_path"]:
                 # 已有详情的影片（别的库抓过）直接带上 nfo 和封面
@@ -374,7 +387,8 @@ class Engine:
         for lib in list(self.libs.values()):
             if not lib["rule"] or (only_library and lib["id"] != only_library):
                 continue
-            should = v["status"] == "active" and match_rule(lib["rule"], v)
+            should = (v["status"] == "active" and match_rule(lib["rule"], v)
+                      and not await self.db.in_libraries(v["id"], lib["excludes"]))
             out = await self.db.get_output(v["id"], lib["id"])
             if should and out is None:
                 await self.db.ensure_output(v["id"], lib["id"], via="rule")
@@ -391,13 +405,122 @@ class Engine:
     async def _do_reclassify(self, job: dict, task: dict) -> None:
         lib_id = job["params"].get("library_id")
         n = added = removed = 0
-        async for v in self.db.iter_videos():
-            a, r = await self.apply_rules(v, only_library=lib_id)
-            added, removed, n = added + a, removed + r, n + 1
-            if n % 2000 == 0:
-                log.info("重新归库：已检查 %d 部，加入 %d，移除 %d", n, added, removed)
-        await self.db.update_job(job["id"], state={"checked": n, "added": added, "removed": removed})
-        log.info("重新归库完成：检查 %d 部，加入 %d，移除 %d", n, added, removed)
+        if any(lib["rule"] for lib in self.libs.values() if lib_id in (None, lib["id"])):
+            async for v in self.db.iter_videos():
+                a, r = await self.apply_rules(v, only_library=lib_id)
+                added, removed, n = added + a, removed + r, n + 1
+                if n % 2000 == 0:
+                    log.info("重新归库：已检查 %d 部，加入 %d，移除 %d", n, added, removed)
+            log.info("重新归库完成：检查 %d 部，加入 %d，移除 %d", n, added, removed)
+        state: dict = {"checked": n, "added": added, "removed": removed}
+        if settled := await self.settle():
+            state["settle"] = settled
+        await self.db.update_job(job["id"], state=state)
+
+    # ---- 来源库 / 排除库 ----
+
+    async def settle(self) -> dict:
+        """归并：按来源库、排除库调整各库的影片，只在本地，不联网。返回 {移除, 归入, 写入}，没有相关库时为空。
+
+        有排除库的库，新片先只记一条没有文件的输出；等排除库（及其依赖的库）的定时订阅都跑完一轮
+        「在影片首次出现之后才开始」的任务，确认它没被分到排除库，才写 strm。这样外部工具（mdcng 等）
+        不会先在这里刮一遍、等影片被分走后再刮一遍。
+        """
+        async with self._settle_lock:
+            self._settle_wanted = False
+            self._settled_at = time.time()
+            linked = await self.db.libraries_with_source_outputs()
+            libs = [lib for lib in self._dependency_order() if lib["sources"] or lib["excludes"] or lib["id"] in linked]
+            if not libs:
+                return {}
+            sub_cutoffs = await self._subscription_cutoffs()
+            total = {"removed": 0, "pulled": 0, "written": 0}
+            for lib in libs:
+                r = await self._settle_library(lib, sub_cutoffs)
+                total = {k: total[k] + r[k] for k in total}
+                if any(r.values()):
+                    log.info("归并「%s」：移除 %d，从来源库归入 %d，写入 %d", lib["name"], r["removed"], r["pulled"],
+                             r["written"])
+            return total
+
+    async def _settle_library(self, lib: dict, sub_cutoffs: dict[int, int]) -> dict:
+        keep, external = self.keep_dirs(), bool(lib["external_dir"])
+        drop = await self.db.outputs_to_drop(lib["id"], lib["sources"], lib["excludes"])
+        for out in drop:
+            if out["strm_path"]:
+                await asyncio.to_thread(self.writer.remove, Path(out["strm_path"]), keep, external)
+            await self.db.delete_output(out["video_id"], lib["id"])
+        pulled = await self.db.pull_from_sources(lib["id"], lib["sources"], lib["excludes"])
+        written = 0
+        for v in await self.db.pending_outputs(lib["id"], self._seen_before(lib, sub_cutoffs)):
+            # 归并只在本地跑，不下载封面；封面等下次抓详情时补
+            await self._output_one(v, lib["id"], cover=False, old_strm="", settle=True)
+            written += 1
+            if written % 2000 == 0:
+                log.info("归并「%s」：已写入 %d 部", lib["name"], written)
+        return {"removed": len(drop), "pulled": pulled, "written": written}
+
+    async def _subscription_cutoffs(self) -> dict[int, int]:
+        """库 id → 该库每个定时订阅都已跑完一轮的时间点（最近一次跑完的任务的开始时间，取最早的那个订阅）。
+
+        还没跑首轮全量的订阅记 0（库还不完整，什么都确认不了）；没跑过但不需要首轮的，从订阅创建时算起。
+        """
+        last_done = await self.db.subscription_last_done()
+        cutoffs: dict[int, int] = {}
+        for sub in await self.db.list_subscriptions():
+            if not sub["enabled"] or sub["interval"] <= 0:
+                continue
+            t = (last_done.get(sub["id"]) or sub["created_at"]) if sub["initialized"] else 0
+            cutoffs[sub["library_id"]] = min(cutoffs.get(sub["library_id"], t), t)
+        return cutoffs
+
+    def _seen_before(self, lib: dict, sub_cutoffs: dict[int, int]) -> int:
+        """首次出现早于这个时间点的影片，才能确认没被分到排除库；没有排除库就不用等。"""
+        t = int(time.time()) + 1
+        todo, seen = list(lib["excludes"]), set()
+        while todo:
+            lid = todo.pop()
+            if lid in seen or lid not in self.libs:
+                continue
+            seen.add(lid)
+            t = min(t, sub_cutoffs.get(lid, t))
+            todo += self.libs[lid]["sources"] + self.libs[lid]["excludes"]
+        return t
+
+    def _dependency_order(self) -> list[dict]:
+        """来源库、排除库排在依赖它们的库前面（保存时已校验不成环）。"""
+        order: list[dict] = []
+        seen: set[int] = set()
+
+        def visit(lid: int) -> None:
+            if lid in seen or lid not in self.libs:
+                return
+            seen.add(lid)
+            for dep in self.libs[lid]["sources"] + self.libs[lid]["excludes"]:
+                visit(dep)
+            order.append(self.libs[lid])
+
+        for lid in sorted(self.libs):
+            visit(lid)
+        return order
+
+    def _check_links(self, lib_id: int | None, sources: list[int], excludes: list[int]) -> tuple[list[int], list[int]]:
+        sources, excludes = sorted(set(sources)), sorted(set(excludes))
+        for lid in sources + excludes:
+            if lid == lib_id:
+                raise ValueError("来源库、排除库不能选自己")
+            self._library(lid)
+        if set(sources) & set(excludes):
+            raise ValueError("同一个库不能既是来源库又是排除库")
+        todo, seen = sources + excludes, set()
+        while lib_id is not None and todo:
+            lid = todo.pop()
+            if lid == lib_id:
+                raise ValueError("来源库、排除库不能循环引用（比如 A 排除 B，B 又排除 A）")
+            if lid not in seen:
+                seen.add(lid)
+                todo += self.libs[lid]["sources"] + self.libs[lid]["excludes"]
+        return sources, excludes
 
     async def create_reclassify(self, library_id: int | None = None) -> int:
         name = f"重新归库：{self._library(library_id)['name']}" if library_id else "重新归库：全部规则库"
@@ -556,36 +679,45 @@ class Engine:
         return name, dir, template, external_dir
 
     async def create_library(self, name: str, dir: str, path_template: str = "", rule: dict | None = None,
-                             external_dir: str = "") -> dict:
-        """新建输出库；带规则时自动排一个重新归库任务。"""
+                             external_dir: str = "", sources: list[int] = (), excludes: list[int] = ()) -> dict:
+        """新建输出库；带规则、来源库或排除库时自动排一个重新归库任务。"""
         name, dir, template, external_dir = self._check_library(name, dir, path_template, external_dir)
+        sources, excludes = self._check_links(None, list(sources), list(excludes))
         rule = normalize_rule(rule)
-        lib_id = await self.db.create_library(name, dir, template, rule, external_dir)
+        lib_id = await self.db.create_library(name, dir, template, rule, external_dir, sources, excludes)
         await self.reload_libraries()
         lib = self.libs[lib_id]
-        log.info("新建输出库「%s」：%s%s%s", name, self.writer.library_root(lib),
+        log.info("新建输出库「%s」：%s%s%s%s", name, self.writer.library_root(lib),
                  f"，外部整理到 {self.writer.external_root(lib)}" if external_dir else "",
-                 f"，规则 {describe_rule(rule)}" if rule else "")
-        return {"id": lib_id, "reclassify_job_id": await self.create_reclassify(lib_id) if rule else None}
+                 f"，规则 {describe_rule(rule)}" if rule else "", self.describe_links(lib))
+        reclassify = rule or sources or excludes
+        return {"id": lib_id, "reclassify_job_id": await self.create_reclassify(lib_id) if reclassify else None}
+
+    def describe_links(self, lib: dict) -> str:
+        names = {k: "、".join(self.libs[i]["name"] for i in lib[k] if i in self.libs) for k in ("sources", "excludes")}
+        return (f"，来源 {names['sources']}" if names["sources"] else "") + (
+            f"，排除 {names['excludes']}" if names["excludes"] else "")
 
     async def update_library(self, lib_id: int, name: str, dir: str, path_template: str = "",
-                             rule: dict | None = None, external_dir: str = "") -> dict:
+                             rule: dict | None = None, external_dir: str = "", sources: list[int] = (),
+                             excludes: list[int] = ()) -> dict:
         """修改输出库：目录或模板变了排重写任务搬文件，规则变了排重新归库任务。
 
         外部整理库的文件归外部工具管，目录或模板变了也不搬，只影响以后新写的 strm；外部整理目录变了排同步位置。
         """
         old = self._library(lib_id)
         name, dir, template, external_dir = self._check_library(name, dir, path_template, external_dir, lib_id)
+        sources, excludes = self._check_links(lib_id, list(sources), list(excludes))
         rule = normalize_rule(rule)
         await self.db.update_library(lib_id, name=name, dir=dir, path_template=template, rule=rule,
-                                     external_dir=external_dir)
+                                     external_dir=external_dir, sources=sources, excludes=excludes)
         await self.reload_libraries()
         jobs = {"rewrite_job_id": None, "reclassify_job_id": None, "locate_job_id": None}
         if (dir, template) != (old["dir"], old["path_template"]) and not external_dir:
             jobs["rewrite_job_id"] = await self.create_rewrite(lib_id)
         if external_dir and external_dir != old["external_dir"]:
             jobs["locate_job_id"] = await self.strm.create_locate(lib_id)
-        if rule != old["rule"]:
+        if rule != old["rule"] or (sources, excludes) != (old["sources"], old["excludes"]):
             jobs["reclassify_job_id"] = await self.create_reclassify(lib_id)
         return jobs
 
@@ -595,6 +727,9 @@ class Engine:
             raise ValueError("默认库不能删除，可以改名或改目录")
         if lib["subscriptions"]:
             raise ValueError("还有订阅在使用这个库，先删除或改掉这些订阅")
+        users = [o["name"] for o in self.libs.values() if lib_id in o["sources"] + o["excludes"]]
+        if users:
+            raise ValueError(f"输出库「{'」「'.join(users)}」把它作为来源库或排除库，先改掉这些库")
         for job in await self.db.list_jobs(limit=1000):
             if job["status"] in ("running", "paused") and job["params"].get("library_id") == lib_id:
                 await self.set_job_status(job["id"], "cancel")
@@ -630,6 +765,12 @@ class Engine:
                 await self._run_due_subscriptions()
             except Exception:
                 log.exception("订阅调度出错")
+            if self.paused or not (self._settle_wanted or time.time() - self._settled_at > SETTLE_INTERVAL):
+                continue
+            try:
+                await self.settle()
+            except Exception:
+                log.exception("归并出错")
 
     async def _run_due_subscriptions(self) -> None:
         if self.paused:

@@ -254,6 +254,8 @@ class LibraryBody(BaseModel):
     path_template: str = ""
     rule: dict | None = None
     external_dir: str = ""
+    sources: list[int] = []
+    excludes: list[int] = []
 
 
 @router.get("/libraries")
@@ -271,7 +273,7 @@ async def list_libraries(request: Request):
 async def create_library(body: LibraryBody, request: Request):
     try:
         return await _ctx(request).engine.create_library(body.name, body.dir, body.path_template, body.rule,
-                                                         body.external_dir)
+                                                         body.external_dir, body.sources, body.excludes)
     except ValueError as err:
         raise HTTPException(400, str(err)) from None
     except sqlite3.IntegrityError:
@@ -282,7 +284,7 @@ async def create_library(body: LibraryBody, request: Request):
 async def update_library(lib_id: int, body: LibraryBody, request: Request):
     try:
         return await _ctx(request).engine.update_library(lib_id, body.name, body.dir, body.path_template, body.rule,
-                                                         body.external_dir)
+                                                         body.external_dir, body.sources, body.excludes)
     except ValueError as err:
         raise HTTPException(400, str(err)) from None
     except sqlite3.IntegrityError:
@@ -377,6 +379,16 @@ async def update_subscription(sub_id: int, body: SubscriptionBody, request: Requ
         await c.db.update_subscription(sub_id, **_subscription_fields(c, body))
     except ValueError as err:
         raise HTTPException(400, str(err)) from None
+    return {"ok": True}
+
+
+@router.post("/subscriptions/{sub_id}/initialized")
+async def mark_subscription_initialized(sub_id: int, request: Request):
+    """不跑首轮全量，直接改为定时增量（库里已经用别的任务抓全了）。"""
+    c = _ctx(request)
+    if await c.db.get_subscription(sub_id) is None:
+        raise HTTPException(404, "订阅不存在")
+    await c.db.update_subscription(sub_id, initialized=1)
     return {"ok": True}
 
 

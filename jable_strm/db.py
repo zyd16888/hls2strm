@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_LIBRARY_ID = 1
 JSON_FIELDS = ("models", "categories", "tags")
+LIBRARY_LINKS = ("sources", "excludes")  # 输出库的来源库、排除库（库 id 列表）
 
 SCHEMA_V1 = [
     """CREATE TABLE IF NOT EXISTS settings (
@@ -204,7 +205,13 @@ async def _migrate_v4(conn: aiosqlite.Connection) -> None:
     await conn.execute("ALTER TABLE libraries ADD COLUMN external_dir TEXT NOT NULL DEFAULT ''")
 
 
-MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4]
+async def _migrate_v5(conn: aiosqlite.Connection) -> None:
+    """输出库的来源库、排除库（按库归属自动归入，分库互斥）。"""
+    await conn.execute("ALTER TABLE libraries ADD COLUMN sources TEXT NOT NULL DEFAULT '[]'")
+    await conn.execute("ALTER TABLE libraries ADD COLUMN excludes TEXT NOT NULL DEFAULT '[]'")
+
+
+MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5]
 
 
 def now() -> int:
@@ -235,6 +242,8 @@ def _library_row(row: aiosqlite.Row | None) -> dict | None:
         return None
     d = dict(row)
     d["rule"] = json.loads(d["rule"]) if d.get("rule") else None
+    for k in LIBRARY_LINKS:
+        d[k] = json.loads(d[k])
     return d
 
 
@@ -444,6 +453,7 @@ class Database:
     async def list_libraries(self) -> list[dict]:
         rows = await self._all(
             """SELECT l.*, (SELECT COUNT(*) FROM outputs o WHERE o.library_id=l.id) AS videos,
+                      (SELECT COUNT(*) FROM outputs o WHERE o.library_id=l.id AND o.strm_path='') AS pending,
                       (SELECT COUNT(*) FROM subscriptions s WHERE s.library_id=l.id) AS subscriptions
                FROM libraries l ORDER BY l.id"""
         )
@@ -453,16 +463,21 @@ class Database:
         return _library_row(await self._one("SELECT * FROM libraries WHERE id=?", (library_id,)))
 
     async def create_library(self, name: str, dir: str, path_template: str = "", rule: dict | None = None,
-                             external_dir: str = "") -> int:
+                             external_dir: str = "", sources: list[int] = (), excludes: list[int] = ()) -> int:
         cur = await self._write(
-            "INSERT INTO libraries(name, dir, path_template, rule, external_dir, created_at) VALUES(?, ?, ?, ?, ?, ?)",
-            (name, dir, path_template, json.dumps(rule, ensure_ascii=False) if rule else "", external_dir, now()),
+            "INSERT INTO libraries(name, dir, path_template, rule, external_dir, sources, excludes, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, dir, path_template, json.dumps(rule, ensure_ascii=False) if rule else "", external_dir,
+             json.dumps(list(sources)), json.dumps(list(excludes)), now()),
         )
         return cur.lastrowid
 
     async def update_library(self, library_id: int, **fields) -> None:
         if "rule" in fields:
             fields["rule"] = json.dumps(fields["rule"], ensure_ascii=False) if fields["rule"] else ""
+        for k in LIBRARY_LINKS:
+            if k in fields:
+                fields[k] = json.dumps(list(fields[k]))
         await self._update("libraries", library_id, fields)
 
     async def delete_library(self, library_id: int) -> None:
@@ -550,6 +565,67 @@ class Database:
                 v.pop("output_rowid")
                 yield v, out
             last = rows[-1]["output_rowid"]
+
+    # ---- 来源库 / 排除库 ----
+
+    async def in_libraries(self, video_id: int, library_ids: list[int]) -> bool:
+        if not library_ids:
+            return False
+        marks = ",".join("?" * len(library_ids))
+        row = await self._one(f"SELECT 1 FROM outputs WHERE video_id=? AND library_id IN ({marks}) LIMIT 1",
+                              (video_id, *library_ids))
+        return row is not None
+
+    async def outputs_to_drop(self, library_id: int, sources: list[int], excludes: list[int]) -> list[dict]:
+        """该库里要移除的输出：影片已在排除库里；或者是从来源库归入的，但影片已不在任何来源库。"""
+        conds, params = [], [library_id]
+        if excludes:
+            conds.append(f"""EXISTS (SELECT 1 FROM outputs x WHERE x.video_id=o.video_id
+                                       AND x.library_id IN ({",".join("?" * len(excludes))}))""")
+            params += excludes
+        source_cond = (f"""NOT EXISTS (SELECT 1 FROM outputs s WHERE s.video_id=o.video_id AND s.strm_path!=''
+                                         AND s.library_id IN ({",".join("?" * len(sources))}))""" if sources else "1")
+        conds.append(f"(o.via='source' AND {source_cond})")
+        params += sources
+        rows = await self._all(
+            f"SELECT o.video_id, o.strm_path FROM outputs o WHERE o.library_id=? AND ({' OR '.join(conds)})", params
+        )
+        return [dict(r) for r in rows]
+
+    async def pull_from_sources(self, library_id: int, sources: list[int], excludes: list[int]) -> int:
+        """来源库里已写出、且不在排除库里的影片加入该库（via=source，先不写文件），返回新加入数。"""
+        if not sources:
+            return 0
+        sql = f"""INSERT OR IGNORE INTO outputs(video_id, library_id, via)
+                  SELECT DISTINCT s.video_id, ?, 'source' FROM outputs s JOIN videos v ON v.id=s.video_id
+                  WHERE s.library_id IN ({",".join("?" * len(sources))}) AND s.strm_path!='' AND v.status='active'"""
+        params = [library_id, *sources]
+        if excludes:
+            sql += f""" AND NOT EXISTS (SELECT 1 FROM outputs x WHERE x.video_id=s.video_id
+                                          AND x.library_id IN ({",".join("?" * len(excludes))}))"""
+            params += excludes
+        return (await self._write(sql, params)).rowcount
+
+    async def pending_outputs(self, library_id: int, seen_before: int) -> list[dict]:
+        """该库里还没写文件、且首次出现早于 seen_before 的影片。"""
+        rows = await self._all(
+            """SELECT v.* FROM outputs o JOIN videos v ON v.id=o.video_id
+               WHERE o.library_id=? AND o.strm_path='' AND v.status='active' AND v.created_at<? ORDER BY v.id""",
+            (library_id, seen_before),
+        )
+        return [_video_row(r) for r in rows]
+
+    async def libraries_with_source_outputs(self) -> set[int]:
+        rows = await self._all("SELECT DISTINCT library_id FROM outputs WHERE via='source'")
+        return {r["library_id"] for r in rows}
+
+    async def subscription_last_done(self) -> dict[int, int]:
+        """每个订阅最近一次跑完的任务的开始时间。"""
+        rows = await self._all(
+            """SELECT json_extract(params, '$.subscription_id') AS sub_id, MAX(created_at) AS t FROM jobs
+               WHERE status='done' AND json_extract(params, '$.subscription_id') IS NOT NULL GROUP BY sub_id"""
+        )
+        return {r["sub_id"]: r["t"] for r in rows}
 
     async def all_output_paths(self) -> list[str]:
         rows = await self._all("SELECT strm_path FROM outputs WHERE strm_path != ''")

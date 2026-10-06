@@ -360,13 +360,16 @@
                 <td><div class="mono" x-text="l.dir"></div><div class="small muted mono" x-text="l.root"></div>
                   <div class="small" x-show="l.external_dir"><span class="chip info">外部整理</span> <span class="mono" x-text="l.external_root"></span></div></td>
                 <td class="mono small" x-text="l.path_template || '（默认）'"></td>
-                <td class="small" x-text="l.rule_text || '-'"></td>
+                <td class="small"><div x-text="l.rule_text || (l.sources.length || l.excludes.length ? '' : '-')"></div>
+                  <div x-show="l.sources.length" x-text="'来源：' + libNames(l.sources)"></div>
+                  <div x-show="l.excludes.length" x-text="'排除：' + libNames(l.excludes)"></div>
+                  <span class="chip warn" x-show="l.pending && l.excludes.length" x-text="'等待归入 ' + fmtNum(l.pending)"></span></td>
                 <td class="num" x-text="fmtNum(l.videos)"></td>
                 <td class="num" x-text="l.subscriptions"></td>
                 <td class="nowrap">
                   <button class="sm" @click="editLibrary(l)">编辑</button>
                   <button class="sm" @click="post('/api/jobs', {kind: 'rewrite', library_id: l.id}).then(() => notify('已排队重写'))">重写</button>
-                  <button class="sm" x-show="l.rule" @click="post('/api/libraries/' + l.id + '/reclassify').then(() => notify('已排队重新归库'))">重新归库</button>
+                  <button class="sm" x-show="l.rule || l.sources.length || l.excludes.length" @click="post('/api/libraries/' + l.id + '/reclassify').then(() => notify('已排队重新归库'))">重新归库</button>
                   <button class="sm" x-show="l.external_dir" @click="post('/api/libraries/' + l.id + '/locate').then(() => notify('已排队同步位置'))">同步位置</button>
                   <button class="sm danger" x-show="l.id !== 1" @click="deleteLibrary(l)">删除</button>
                 </td>
@@ -384,6 +387,16 @@
       <div class="form-row section">
         <label class="field grow"><span>外部整理目录（交给 mdcng 等移动、刮削时填它的整理目标；留空 = 由本服务管理）</span>
           <input x-model="libForm.external_dir" placeholder="/media/jable-mdc/中文字幕" spellcheck="false"></label>
+      </div>
+      <div class="form-row section" x-show="libraries.some(x => x.id !== libForm.id)">
+        <div class="field grow"><span>来源库：这些库里的影片自动归入本库</span>
+          <div><template x-for="o in libraries.filter(x => x.id !== libForm.id)" :key="o.id">
+            <label class="small" style="margin-right:12px"><input type="checkbox" :value="o.id" x-model="libForm.sources"> <span x-text="o.name"></span></label>
+          </template></div></div>
+        <div class="field grow"><span>排除库：已在这些库里的影片本库不收</span>
+          <div><template x-for="o in libraries.filter(x => x.id !== libForm.id)" :key="o.id">
+            <label class="small" style="margin-right:12px"><input type="checkbox" :value="o.id" x-model="libForm.excludes"> <span x-text="o.name"></span></label>
+          </template></div></div>
       </div>
       <details class="section" :open="libForm.useRule">
         <summary class="small" @click.prevent="libForm.useRule = !libForm.useRule">
@@ -415,6 +428,10 @@
         本服务不再在库目录补写，也不搬文件。「同步位置」按 strm 内容在库目录和外部整理目录里找回每部影片的文件；
         重写输出（比如改了对外地址或播放令牌）会先同步位置，再原地改 strm 内容；删除库时只删 strm，nfo 和图片留给外部工具。
         外部整理目录不能和任何库目录嵌套。清空外部整理目录就改回由本服务管理，之后重写会把文件按模板搬回库目录。</div>
+      <div class="small muted section">来源库 / 排除库：比如「其他」来源选「全部」、排除「中文字幕」「无码」，就得到剩下的影片，每部影片只在一个库里，外部工具不会重复刮削。
+        任务和订阅也可以直接输出到有排除库的库。为了不让新片先进来、再被分走，有排除库的库收到新片后先不写文件，
+        等排除库的定时订阅都跑完一轮在这部片出现之后才开始的任务，确认它不属于排除库才写（最多晚一个订阅周期）；
+        排除库的订阅被拦截或还没跑完首轮全量时会一直等。影片后来进了排除库，会从本库移除。排除库的订阅请按「最近更新」排序。</div>
     </div>
 
     <div class="card section">
@@ -435,6 +452,7 @@
                 <td class="small nowrap" x-text="sub.last_run_at ? fmtTime(sub.last_run_at) : '-'"></td>
                 <td class="nowrap">
                   <button class="sm primary" x-show="!sub.initialized && !sub.active_job_id" @click="runSub(sub, 'full')">首轮全量</button>
+                  <button class="sm" x-show="!sub.initialized && !sub.active_job_id" @click="markInitialized(sub)">标记首轮已完成</button>
                   <button class="sm" x-show="sub.initialized && !sub.active_job_id" @click="runSub(sub, 'incremental')">立即增量</button>
                   <button class="sm" x-show="sub.initialized && !sub.active_job_id" @click="runSub(sub, 'full')">重跑全量</button>
                   <button class="sm" @click="editSub(sub)">编辑</button>

@@ -277,6 +277,9 @@ class StrmManager:
             except (NotFound, VideoGone):
                 await self.db.update_strm_file(path, note=f"站点上不存在 {slug}")
                 raise
+        if await self.db.in_libraries(v["id"], self.e.libs[lib_id]["excludes"]):
+            await self.db.update_strm_file(path, note="影片已在这个库的排除库里，本库不收")
+            return
         existing = await self.db.get_output(v["id"], lib_id)
         if (existing and existing["strm_path"] and Path(existing["strm_path"]).exists()
                 and os.path.normcase(existing["strm_path"]) != os.path.normcase(path)):
