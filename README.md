@@ -139,10 +139,10 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
 
 ### 给网关用的 resolve 接口
 
-`GET /api/resolve/{slug}.m3u8?ua=<客户端 UA>&origin=<客户端 Origin>`，用 `Authorization: Bearer <resolve_token>` 认证（也可以用 `?token=`）。在设置里填了「网关解析令牌」之后才开放。
+`GET /api/resolve/{slug}.m3u8`，用 `Authorization: Bearer <resolve_token>` 认证（也可以用 `?token=`）。在设置里填了「网关解析令牌」之后才开放。
 
-- 客户端能直连 CDN：返回 200 和 `{"slug", "url", "expires_at", "ttl", "duration"}`。
-- 客户端不能直连（UA 命中中转片段，或者带了 `origin`）：返回 409 和 `{"reason"}`，由网关回退为反代 Emby。
+- 正常情况：返回 200 和 `{"slug", "url", "expires_at", "ttl", "duration"}`。
+- 不按客户端区分，一律返回 CDN 地址。网关传过来的 `ua`、`origin`、`fetch_mode` 只写进日志，方便排查。这样做的原因是：网关回退时会反代 Emby，Emby 再 302 到 strm 里的内网地址，外部客户端访问不到。
 - 影片不存在：404；站点拦截中：503。
 
 路径的最后一段就是影片，所以网关的 objectKey 可以原样传，比如 `/api/resolve/play/ipzz-983.m3u8`。
@@ -154,10 +154,13 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
 ```
 客户端 ──/videos/{id}/stream──► 网关 ──查 Emby 拿到 strm 地址 /play/ipzz-983.m3u8
                                   │ 路由命中 → http_resolver 后端 → GET 本服务 /api/resolve/play/ipzz-983.m3u8
-                                  ├─ 200：302 到 CDN（原生播放器：Infuse、ExoPlayer、AVPlayer、Safari <video> 等）
-                                  └─ 409：回退反代 Emby → Emby 用 strm 里的内网地址拉流，本服务中转
-                                       （ffmpeg 的 Lavf UA、Emby Web 的 hls.js 等脚本请求）
+                                  └─ 302 到 CDN，客户端直连（浏览器、Infuse、ExoPlayer、AVPlayer 等都一样）
 ```
+
+需要知道的两点 CDN 限制：
+
+- 它只对 `https://jable.tv` 返回 CORS 头。浏览器用原生 `<video>` 播放（新版 Chrome、Safari）不受影响；如果哪个网页播放器改用 hls.js 发请求，就会跨域失败。
+- 它会拒绝 UA 含 `Lavf`（ffmpeg 默认 UA）的请求。用 ffmpeg 默认 UA 拉流的客户端会拿到 403。
 
 配置步骤：
 
@@ -173,7 +176,7 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
    - 资源池：选第 3 步建的资源池
 5. 网关的 license 需要带 `backend:http_resolver` 特性，否则这个后端会被禁用。
 
-验证方法：播放一部影片，网关日志里会出现 `Backend=<后端 ID> ObjectKey=play/xxx.m3u8`，本服务日志里会出现「resolve xxx：直连 CDN」或「让网关回退」。
+验证方法：播放一部影片，网关请求详情里的 Redirect Backend 是这个后端、Location 是 mushroomtrack 的地址；本服务日志里会出现「resolve xxx：返回 CDN 地址」。
 
 ## 被拦截了怎么办
 

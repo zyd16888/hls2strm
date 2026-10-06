@@ -43,14 +43,11 @@ def test_play_and_resolve(tmp_path):
             data = r.json()
             assert r.status_code == 200 and data["slug"] == "ipzz-983" and data["url"].endswith("/62384.m3u8")
             assert 3600 < data["ttl"] <= 10800
-            r = c.get("/api/resolve/ipzz-983", headers=h, params={"ua": "Lavf/61"})
-            assert r.status_code == 409 and "Lavf" in r.json()["reason"]
-            r = c.get("/api/resolve/ipzz-983", headers=h, params={"ua": "Mozilla/5.0", "origin": "http://emby:8096"})
-            assert r.status_code == 409
-            r = c.get("/api/resolve/ipzz-983", headers=h, params={"ua": "Mozilla/5.0", "fetch_mode": "cors"})
-            assert r.status_code == 409 and "cors" in r.json()["reason"]
-            r = c.get("/api/resolve/ipzz-983", headers=h, params={"ua": "Mozilla/5.0", "fetch_mode": "no-cors"})
-            assert r.status_code == 200  # <video> 元素直接加载，不受 CORS 限制
+            # 不按客户端判断回退：浏览器、ffmpeg 一律拿 CDN 地址
+            for q in ({"ua": "Lavf/61"}, {"ua": "Mozilla/5.0", "origin": "http://emby:8096"},
+                      {"ua": "Mozilla/5.0", "fetch_mode": "cors"}):
+                r = c.get("/api/resolve/ipzz-983", headers=h, params=q)
+                assert r.status_code == 200 and r.json()["url"].endswith("/62384.m3u8")
             assert c.get("/api/resolve/not-exist-1.m3u8", headers=h).status_code == 404
             assert c.get("/api/resolve/ipzz-983?token=tk").status_code == 200
 

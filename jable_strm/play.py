@@ -10,7 +10,7 @@ import time
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import RedirectResponse, Response, StreamingResponse
 
 from .config import SettingsStore
 from .db import Database
@@ -156,8 +156,10 @@ async def cors_preflight():
 @router.get("/api/resolve/{name:path}")
 async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin: str = "", fetch_mode: str = "",
                               min_remaining: int | None = None):
-    """给 embyGateway 的 http_resolver 后端用：返回可直连的 CDN 地址；客户端不能直连时返回 409，由网关回退。
+    """给 embyGateway 的 http_resolver 后端用：一律返回 CDN 地址，由网关 302 让客户端直连。
 
+    不按客户端判断回退：网关回退会反代 Emby，Emby 再 302 到 strm 里的内网地址，外部客户端访问不到。
+    ua / origin / fetch_mode 只记日志，方便排查。
     name 可以是 slug、slug.m3u8，也可以是网关 objectKey 原样（如 play/ipzz-983.m3u8），取最后一段。
     """
     ctx = _ctx(request)
@@ -172,15 +174,10 @@ async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin:
     if not SLUG_RE.fullmatch(slug):
         raise HTTPException(404, f"无法识别的影片：{name}")
     ctx.metrics.inc("resolve_requests")
-    reason = direct_blocker(s.proxy_user_agents, ua, origin, fetch_mode)
-    if reason:
-        ctx.metrics.inc("resolve_fallback")
-        log.info("resolve %s：%s，让网关回退（UA %s）", slug, reason, ua[:60])
-        return JSONResponse({"slug": slug, "reason": reason}, status_code=409)
     v = await _resolve_or_http(request, slug, min_remaining=min_remaining)
-    ctx.metrics.inc("resolve_direct")
     expires = v.get("hls_expires") or 0
-    log.info("resolve %s：直连 CDN（地址剩余 %d 分钟，UA %s）", slug, (expires - time.time()) // 60, ua[:60])
+    log.info("resolve %s：返回 CDN 地址（剩余 %d 分钟，UA %s%s）", slug, (expires - time.time()) // 60, ua[:60],
+             f"，fetch_mode {fetch_mode}" if fetch_mode else "")
     return {"slug": slug, "url": v["hls_url"], "expires_at": expires,
             "ttl": max(0, int(expires - time.time())), "duration": v.get("duration")}
 
