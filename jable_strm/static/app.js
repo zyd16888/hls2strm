@@ -249,7 +249,8 @@ function app() {
     openDetail(v) { this.detail = v; },
     hlsState(v) {
       if (!v.hls_url) return { text: "未缓存", cls: "" };
-      const left = (v.hls_expires || 0) - Date.now() / 1000;
+      if (!v.hls_expires) return { text: "有效期未知", cls: "warn" };
+      const left = v.hls_expires - Date.now() / 1000;
       if (left <= 0) return { text: "已过期", cls: "err" };
       return { text: "剩 " + this.fmtDur(left), cls: left > 3600 ? "ok" : "warn" };
     },

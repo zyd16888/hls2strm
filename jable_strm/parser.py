@@ -58,7 +58,10 @@ class VideoDetail:
 _CODE_RE = re.compile(r"^([A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+)(?=\s|$)")
 _SLUG_RE = re.compile(r"/videos/([^/?#]+)/?")
 _HLS_RE = re.compile(r"""var\s+hlsUrl\s*=\s*['"]([^'"]+)['"]""")
-_HLS_EXPIRES_RE = re.compile(r"/hls/[^/]+/(\d{9,11})/")
+# 播放地址里的过期时间戳，CDN 有两种格式：
+#   /hls/{token}/{expires}/{n}/{videoId}/{videoId}.m3u8
+#   /bcdn_token={token}&expires={expires}&token_path=%2Fvod%2F/vod/{n}/{videoId}/{videoId}.m3u8
+_HLS_EXPIRES_RE = re.compile(r"(?:/hls/[^/]+/|[?&]expires=)(\d{9,11})(?!\d)")
 _VIDEO_ID_RE = re.compile(r"""videoId:\s*['"]?(\d+)""")
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _BLOCK_RE = re.compile(r'id="(list_videos_[a-z0-9_]+?)(?:_pagination|_sort_list)?"')

@@ -19,6 +19,9 @@ def test_classify_and_guess():
     assert classify(p, "http://h:8080/play/ipzz-983.m3u8\n", NOW).kind == "ours"
     info = classify(p, CDN.format(vid=62384), NOW)
     assert (info.kind, info.video_id, info.expired, info.slug) == ("cdn", 62384, True, "ipzz-983")
+    new_cdn = "https://x.mushroomtrack.com/bcdn_token=t&expires=9791270819&token_path=%2Fvod%2F/vod/9000/9922/9922.m3u8"
+    info = classify(p, new_cdn, NOW)
+    assert (info.kind, info.video_id, info.expired) == ("cdn", 9922, False)
     info = classify(Path("/x/SONE-001-C 中字.strm"), "http://alist:5244/d/115/a.mp4", NOW)
     assert (info.kind, info.slug, info.prefix) == ("named", "sone-001-c", "http://alist:5244")
     assert classify(Path("/x/movie.strm"), "﻿# c\nhttp://alist/d/m.mkv", NOW).kind == "other"

@@ -60,6 +60,15 @@ def test_parse_detail():
     assert d.views == 285871 and d.favs == 1974
 
 
+def test_hls_expires_formats():
+    old = "https://a.mushroomtrack.com/hls/tok/1791180954/62000/62384/62384.m3u8"
+    new = ("https://ao-block-ater.mushroomtrack.com/bcdn_token=ujSbmq&expires=1791270819"
+           "&token_path=%2Fvod%2F/vod/9000/9922/9922.m3u8")
+    assert hls_expires(old) == 1791180954
+    assert hls_expires(new) == 1791270819
+    assert hls_expires("https://a.mushroomtrack.com/vod/9000/9922/9922.m3u8") is None
+
+
 def test_parse_detail_gone_and_broken():
     with pytest.raises(VideoGone):
         parse_detail("<html><head><title>%title% - Jable.TV</title></head><body></body></html>", "x-1")

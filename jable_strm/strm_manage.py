@@ -2,7 +2,8 @@
 
 扫描把目录下每个 .strm 分类：
   ours     本服务格式：…/play/{slug}.m3u8（域名不限）
-  cdn      CDN 直链：/hls/{token}/{expires}/{n}/{videoId}/{videoId}.m3u8（大概率已过期）
+  cdn      CDN 直链：…/hls/{token}/{expires}/{n}/{videoId}/{videoId}.m3u8
+           或 …&expires={expires}&…/vod/{n}/{videoId}/{videoId}.m3u8（大概率已过期）
   named    URL 不认识，但文件名或父目录里有番号（可能是别的片源，纳管需手动勾选）
   other    其他来源（115、alist 等），只参与统计和改前缀
   invalid  空文件
@@ -24,7 +25,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from .fetcher import NotFound
-from .parser import VideoGone
+from .parser import VideoGone, hls_expires
 from .writer import write_atomic
 
 if TYPE_CHECKING:
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 OURS_RE = re.compile(r"/play/([a-z0-9][a-z0-9._-]{0,80})\.m3u8$", re.I)
-CDN_RE = re.compile(r"/hls/[^/]+/(\d{9,11})/\d+/(\d+)/\2\.m3u8$")
+CDN_RE = re.compile(r"/(?:hls/[^/]+/\d{9,11}/\d+|vod/\d+)/(\d+)/\1\.m3u8$")
 NAME_CODE_RE = re.compile(
     r"(?<![A-Za-z0-9])([0-9]{0,4}[A-Za-z][A-Za-z0-9]{1,9}(?:-[A-Za-z]{2,5})?-\d{2,8}(?:-[A-Za-z][A-Za-z0-9]{0,2})?)"
     r"(?![A-Za-z0-9])"
@@ -84,7 +85,7 @@ def classify(path: Path, content: str, now: float) -> StrmInfo:
         if m := OURS_RE.search(parts.path):
             return StrmInfo("ours", url, prefix, m.group(1).lower())
         if m := CDN_RE.search(parts.path):
-            return StrmInfo("cdn", url, prefix, guess_slug(path), int(m.group(2)), int(m.group(1)) < now)
+            return StrmInfo("cdn", url, prefix, guess_slug(path), int(m.group(1)), (hls_expires(url) or 0) < now)
     slug = guess_slug(path)
     return StrmInfo("named" if slug else "other", url, prefix, slug)
 

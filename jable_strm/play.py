@@ -106,6 +106,12 @@ def direct_blocker(proxy_user_agents: list[str], ua: str, origin: str, fetch_mod
     return ""
 
 
+def _hls_left(v: dict) -> str:
+    if not v.get("hls_expires"):
+        return "地址有效期未知"  # 地址格式不认识，取不到过期时间
+    return f"地址剩余 {int(v['hls_expires'] - time.time()) // 60} 分钟"
+
+
 async def _resolve_or_http(request: Request, slug: str, **kw) -> dict:
     try:
         return await _ctx(request).resolver.resolve(slug, **kw)
@@ -133,9 +139,8 @@ async def play(name: str, request: Request, t: str = "", proxy: int = 0):
     origin = request.headers.get("origin", "")
     fetch_mode = request.headers.get("sec-fetch-mode", "")
     proxied = bool(proxy) or s.play_mode == "proxy" or bool(direct_blocker(s.proxy_user_agents, ua, origin, fetch_mode))
-    left = int((v.get("hls_expires") or 0) - time.time())
-    log.info("播放 %s：%s（地址剩余 %d 分钟，客户端 %s，UA %s）", slug, "中转" if proxied else "302",
-             left // 60, request.client.host if request.client else "?", ua[:60])
+    log.info("播放 %s：%s（%s，客户端 %s，UA %s）", slug, "中转" if proxied else "302", _hls_left(v),
+             request.client.host if request.client else "?", ua[:60])
     if proxied:
         ctx.metrics.inc("play_proxy")
         resp = await _proxy_playlist(request, v, t)
@@ -176,7 +181,7 @@ async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin:
     ctx.metrics.inc("resolve_requests")
     v = await _resolve_or_http(request, slug, min_remaining=min_remaining)
     expires = v.get("hls_expires") or 0
-    log.info("resolve %s：返回 CDN 地址（剩余 %d 分钟，UA %s%s）", slug, (expires - time.time()) // 60, ua[:60],
+    log.info("resolve %s：返回 CDN 地址（%s，UA %s%s）", slug, _hls_left(v), ua[:60],
              f"，fetch_mode {fetch_mode}" if fetch_mode else "")
     return {"slug": slug, "url": v["hls_url"], "expires_at": expires,
             "ttl": max(0, int(expires - time.time())), "duration": v.get("duration")}
