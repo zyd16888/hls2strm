@@ -1,7 +1,6 @@
 services:
   jable-strm:
-    build: .
-    image: jable-strm:latest
+    image: ghcr.io/<你的 GitHub 用户名>/<仓库名>:nightly   # 或 :latest、:v0.2.0；本地构建把这行换成 build: .
     container_name: jable-strm
     restart: unless-stopped
     ports:

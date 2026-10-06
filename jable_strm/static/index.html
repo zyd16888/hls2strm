@@ -11,7 +11,7 @@
 <body x-data="app()" x-init="init()" x-cloak>
 
 <header>
-  <div class="brand">Jable STRM</div>
+  <div class="brand">Jable STRM <span class="small muted" style="font-weight:400" x-text="s.version || ''"></span></div>
   <nav>
     <template x-for="t in tabs" :key="t.id">
       <a href="#" :class="{active: tab === t.id}" @click.prevent="go(t.id)" x-text="t.name"></a>

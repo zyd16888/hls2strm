@@ -30,9 +30,18 @@ Emby/Jellyfin ──►│ /play  ──► 缓存的播放地址够用？ ─�
 
 ### Docker（推荐）
 
+GitHub Actions 会自动构建镜像并推送到 ghcr.io，同时提供 amd64 和 arm64：
+
+| 镜像标签 | 什么时候更新 |
+|---|---|
+| `nightly`、`nightly-<短 sha>` | 推送到默认分支（master / main） |
+| `v0.2.0` 这类 tag 名、`latest` | 推送 `v*` 格式的 git tag |
+
+页面顶栏和 `/api/status` 里的 `version` 会显示当前镜像的版本。第一次推送后，镜像包默认是私有的：可以在 GitHub 的 Packages 设置里改成公开，或者在服务器上先 `docker login ghcr.io`。
+
 ```bash
-# 先改 docker-compose.yml 里的 JABLE_UI_PASSWORD、JABLE_PUBLIC_BASE_URL 和 strm 输出目录
-docker compose up -d --build
+# 先改 docker-compose.yml 里的镜像名、JABLE_UI_PASSWORD、JABLE_PUBLIC_BASE_URL 和 strm 输出目录
+docker compose up -d
 # 需要兜底解题服务时：docker compose --profile solver up -d
 ```
 

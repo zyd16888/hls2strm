@@ -13,9 +13,16 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+# 先只装依赖：pyproject 不变时这一层走缓存，改代码不用重装依赖（arm64 用 QEMU 构建时很慢）
 COPY pyproject.toml README.md ./
+RUN mkdir jable_strm && touch jable_strm/__init__.py \
+    && pip install . && pip uninstall -y jable-strm && rm -rf jable_strm
 COPY jable_strm ./jable_strm
-RUN pip install . && mkdir -p /data /strm
+RUN pip install --no-deps . && mkdir -p /data /strm
+
+# 构建时注入版本号（CI 里是 git tag 或 nightly-<短 sha>），状态接口和页面上会显示
+ARG VERSION=dev
+ENV JABLE_VERSION=${VERSION}
 
 EXPOSE 8080
 VOLUME ["/data", "/strm"]
