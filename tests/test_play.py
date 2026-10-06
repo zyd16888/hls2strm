@@ -53,6 +53,10 @@ def test_play_and_resolve(tmp_path):
             assert r.status_code == 200  # <video> 元素直接加载，不受 CORS 限制
             assert c.get("/api/resolve/not-exist-1.m3u8", headers=h).status_code == 404
             assert c.get("/api/resolve/ipzz-983?token=tk").status_code == 200
+
+            # 解题服务检测：没填地址、地址格式不对都直接提示
+            assert c.post("/api/solver/test", json={}).status_code == 400
+            assert c.post("/api/solver/test", json={"url": "byparr:8191"}).status_code == 400
     finally:
         for h in logging.getLogger().handlers:
             h.close()

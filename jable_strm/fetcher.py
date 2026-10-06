@@ -167,6 +167,59 @@ async def call_solver(solver_url: str, url: str, proxy: str, timeout: int) -> So
     )
 
 
+_CONN_HINTS = (
+    ("curl: (6)", "域名解析失败：主机名不对，或者和本服务不在同一个 Docker 网络"),
+    ("curl: (7)", "连接被拒绝：端口不对，或者服务没有启动"),
+    ("curl: (28)", "连接超时：地址不可达，或者被防火墙拦了"),
+    ("curl: (35)", "TLS 握手失败：http / https 写反了"),
+)
+
+
+def explain_conn_error(e: Exception) -> str:
+    """把 curl 的连接错误换成看得懂的提示，后面附原始错误码。"""
+    text = str(e)
+    for code, hint in _CONN_HINTS:
+        if code in text:
+            return f"{hint}（curl 错误 {code.removeprefix('curl: (').rstrip(')')}）"
+    return text[:300]
+
+
+async def ping_solver(solver_url: str, timeout: int = 10) -> dict:
+    """检查解题服务能不能连上，并尽量识别类型和版本。
+
+    FlareSolverr 的 / 直接返回 {"msg": "FlareSolverr is ready!", "version": ...}；
+    Byparr 是 FastAPI，/ 跳到 /docs，名称和版本在 /openapi.json 里。
+    """
+    t0 = time.monotonic()
+    try:
+        async with AsyncSession(trust_env=False) as s:
+            resp = await s.get(f"{solver_url}/", timeout=timeout, allow_redirects=True)
+            ms = int((time.monotonic() - t0) * 1000)
+            info: dict = {"ok": resp.status_code < 500, "status": resp.status_code, "ms": ms,
+                          "service": "", "version": ""}
+            try:
+                data = resp.json()
+                if isinstance(data, dict) and data.get("msg"):
+                    info["service"] = str(data["msg"])
+                    info["version"] = str(data.get("version") or "")
+                    return info
+            except Exception:
+                pass
+            spec = await s.get(f"{solver_url}/openapi.json", timeout=timeout)
+            if spec.status_code == 200:
+                try:
+                    meta = spec.json().get("info") or {}
+                    info["service"] = str(meta.get("title") or "")
+                    info["version"] = str(meta.get("version") or "")
+                except Exception:
+                    pass
+    except Exception as e:
+        return {"ok": False, "error": explain_conn_error(e), "ms": int((time.monotonic() - t0) * 1000)}
+    if info["ok"] and not info["service"]:
+        info["warning"] = "能连上，但看起来不像 Byparr / FlareSolverr，确认地址和端口"
+    return info
+
+
 class Fetcher:
     def __init__(self, store: SettingsStore, metrics: Metrics) -> None:
         self.store = store
@@ -334,6 +387,20 @@ class Fetcher:
             self.metrics.inc("solver_ok")
             log.info("解题成功，%s 恢复使用（cookie %d 个）", dom.host, len(result.cookies))
             return Page(result.html, result.url, dom.base, via="solver")
+
+    async def try_solver(self, solver_url: str) -> dict:
+        """让解题服务实际打开一次首选域名首页（走当前代理），只返回结果，不注入 cookie。"""
+        s = self.store.current
+        target = self.domains[0].base + "/"
+        t0 = time.monotonic()
+        try:
+            r = await call_solver(solver_url, target, s.proxy, s.solver_timeout)
+        except Exception as e:
+            return {"ok": False, "target": target, "error": explain_conn_error(e),
+                    "ms": int((time.monotonic() - t0) * 1000)}
+        passed = r.status == 200 and not looks_like_challenge(r.html)
+        return {"ok": passed, "target": target, "status": r.status, "challenge": not passed,
+                "cookies": len(r.cookies), "user_agent": r.user_agent, "ms": int((time.monotonic() - t0) * 1000)}
 
     async def test_domains(self) -> list[dict]:
         """逐个测试域名连通性（忽略冷却），成功的解除冷却。"""

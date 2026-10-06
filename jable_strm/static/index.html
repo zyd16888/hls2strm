@@ -666,6 +666,16 @@
               <template x-if="fieldType(k) === 'text'">
                 <input type="text" x-model="draft[k]" spellcheck="false">
               </template>
+              <template x-if="k === 'solver_url'">
+                <div class="toolbar" style="margin:6px 0 0">
+                  <button class="sm" @click="testSolver('ping')" :disabled="solverTest.busy || !draft.solver_url">测试连通</button>
+                  <button class="sm" @click="testSolver('solve')" :disabled="solverTest.busy || !draft.solver_url"
+                          title="让解题服务实际打开一次首选域名（走当前代理），最长等到解题超时">试解一次</button>
+                  <span class="small muted" x-show="solverTest.busy" x-text="solverTest.mode === 'solve' ? '解题中，最长等到解题超时…' : '检测中…'"></span>
+                  <span class="small" :class="solverTest.result?.ok ? '' : 'err-text'" x-show="solverTest.result && !solverTest.busy"
+                        x-text="solverResultText()"></span>
+                </div>
+              </template>
               <div class="desc" x-text="settings.schema[k].description"></div>
             </div>
           </div>

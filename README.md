@@ -164,6 +164,8 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
 - 如果一直被拦：
   - 在「设置 → 站点域名」里加入新的镜像域名，或者换一个代理。
   - 也可以启用 Byparr，并在「设置 → 解题服务地址」填 `http://byparr:8191`。
+  - 填好地址后，可以点输入框下面的「测试连通」，看能不能连上，同时会识别出 Byparr 或 FlareSolverr 的版本；不需要先保存。
+  - 也可以点「试解一次」，让解题服务实际打开一次首选域名（会走当前代理），看能不能通过挑战。
 
 ## API
 

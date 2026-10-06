@@ -20,7 +20,7 @@ from . import __version__, sources
 from .config import Settings
 from .db import DEFAULT_LIBRARY_ID
 from .engine import snapshot_path
-from .fetcher import Blocked, FetchError, NotFound
+from .fetcher import Blocked, FetchError, NotFound, ping_solver
 from .observability import ring
 from .parser import ParseError, VideoGone, slug_from_url
 from .rules import describe_rule
@@ -95,6 +95,25 @@ async def fetcher_test(request: Request):
         c.engine.blocked_until = 0
         c.engine.notify()
     return result
+
+
+class SolverTestBody(BaseModel):
+    url: str = ""  # 留空用已保存的设置；设置页传输入框里的值，不用先保存
+    mode: Literal["ping", "solve"] = "ping"
+
+
+@router.post("/solver/test")
+async def solver_test(body: SolverTestBody, request: Request):
+    """ping：只看能不能连上；solve：让解题服务实际打开一次首选域名。"""
+    c = _ctx(request)
+    url = (body.url or c.store.current.solver_url).strip().rstrip("/")
+    if not url:
+        raise HTTPException(400, "还没有填写解题服务地址")
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(400, "地址要以 http:// 或 https:// 开头，如 http://byparr:8191")
+    if body.mode == "solve":
+        return await c.fetcher.try_solver(url)
+    return await ping_solver(url)
 
 
 # ---- job ----

@@ -69,6 +69,7 @@ function app() {
     settings: {},
     draft: {},
     needRewrite: false,
+    solverTest: { busy: false, mode: "", result: null },
     settingGroups: SETTING_GROUPS,
     labels: SETTING_LABELS,
     logs: [],
@@ -468,6 +469,28 @@ function app() {
       } catch (e) { this.notify(e.message, true); }
     },
     playModeName(m) { return PLAY_MODES[m] || m || "-"; },
+    async testSolver(mode) {
+      this.solverTest = { busy: true, mode, result: null };
+      try {
+        const result = await this.req("POST", "/api/solver/test", { url: this.draft.solver_url || "", mode });
+        this.solverTest = { busy: false, mode, result };
+      } catch (e) {
+        this.solverTest = { busy: false, mode, result: { ok: false, error: e.message } };
+      }
+    },
+    solverResultText() {
+      const { mode, result: r } = this.solverTest;
+      if (!r) return "";
+      if (r.error) return (mode === "solve" ? "解题失败：" : "连不上：") + r.error;
+      const ms = r.ms >= 1000 ? (r.ms / 1000).toFixed(1) + " 秒" : r.ms + " ms";
+      if (mode === "solve") {
+        return r.ok ? `通过挑战：HTTP ${r.status}，拿到 cookie ${r.cookies} 个（${ms}）`
+                    : `没通过挑战：HTTP ${r.status}（${ms}），可能需要换代理`;
+      }
+      if (!r.ok) return `能连上但服务出错：HTTP ${r.status}`;
+      const name = [r.service, r.version].filter(Boolean).join(" ");
+      return `已连上${name ? "：" + name : ""}（${ms}）` + (r.warning ? `。${r.warning}` : "");
+    },
 
     // ---- 日志 ----
     connectLogs() {
