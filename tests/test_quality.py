@@ -201,3 +201,40 @@ def test_resolve_modes_for_gateway(tmp_path):
         for hd in logging.getLogger().handlers:
             hd.close()
         logging.getLogger().handlers.clear()
+
+
+def test_resolve_relay_via_gateway(tmp_path):
+    """网关能转发（relay=gateway）：不用公网中转地址也能中转，地址是本服务的，网关只取路径；
+    能直连的源这个客户端连不了（浏览器跨域、CDN 拒绝的 UA）时也给中转；没有中转可用时照旧给 CDN 地址。"""
+    app = create_app(BootConfig(data_dir=tmp_path, default_public_base_url="http://hls2strm:8080"))
+    try:
+        with TestClient(app) as c:
+            html, ids = model_fixture()
+            fake = FakeFetcher(html, ids)
+            app.state.ctx.fetcher = app.state.ctx.resolver.fetcher = app.state.ctx.resolver.quality.fetcher = fake
+            h = {"Authorization": "Bearer tk"}
+            assert c.put("/api/settings", json={"resolve_token": "tk", "play_token": "pk"}).status_code == 200
+
+            def get(**params):
+                r = c.get("/api/resolve/play/ipzz-983.m3u8", headers=h, params=params)
+                assert r.status_code == 200, r.text
+                return r.json()
+
+            data = get(relay="gateway", mode="proxy")
+            assert (data["relay"], data["url"]) == (True, "http://testserver/play/ipzz-983.m3u8?proxy=1&t=pk")
+            data = get(relay="gateway", ua="Infuse/7.8")
+            assert data["relay"] is False and data["url"].endswith("/62384.m3u8")  # Jable 能直连：照样 302 到 CDN
+            assert get(relay="gateway", ua="Lavf/61.7")["relay"] is True  # Jable 的 CDN 拒绝 Lavf
+            assert get(relay="gateway", ua="Mozilla/5.0", origin="http://emby:8096")["relay"] is True  # 浏览器跨域
+            assert get(relay="gateway", ua="Mozilla/5.0", fetch_mode="cors")["relay"] is True
+            data = c.get("/api/resolve/play/ipzz-983@480p.m3u8", headers=h,
+                         params={"relay": "gateway", "mode": "proxy"}).json()
+            assert data["url"] == "http://testserver/play/ipzz-983@480p.m3u8?proxy=1&t=pk"
+            # 没有中转可用：照旧给 CDN 地址（只记日志）
+            data = get(ua="Lavf/61.7")
+            assert data["relay"] is False and data["url"].endswith("/62384.m3u8")
+            assert c.get("/api/resolve/play/ipzz-983.m3u8", headers=h, params={"mode": "proxy"}).status_code == 409
+    finally:
+        for hd in logging.getLogger().handlers:
+            hd.close()
+        logging.getLogger().handlers.clear()

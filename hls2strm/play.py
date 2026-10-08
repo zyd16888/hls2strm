@@ -620,17 +620,19 @@ async def cors_preflight():
 
 @router.get("/api/resolve/{name:path}")
 async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin: str = "", fetch_mode: str = "",
-                              min_remaining: int | None = None, mode: str = ""):
+                              min_remaining: int | None = None, mode: str = "", relay: str = ""):
     """给 embyGateway 的 http_resolver 后端用：返回客户端（外网）能播的地址，由网关 302。
 
     mode（不带用设置里的 resolve_mode）：
-      auto      按挑源偏好（画质优先 / 直连优先）挑：挑中的能直连给 CDN 地址，要中转给公网中转地址
-      redirect  只挑能直连的源（比如 Jable）；作品只有要中转的源时给公网中转地址
-      proxy     一律给公网中转地址，流量走本服务（经网关转发时能用上网关的统计）
-    公网中转地址就是 resolve_proxy_url，没设时：auto 退回只挑能直连的，只有要中转的源返回 409。
-    直连的源都取地址失败、或者站点拦截中，有公网中转地址就给它（中转时还能用别的源），不报错：
+      auto      按挑源偏好（画质优先 / 直连优先）挑：挑中的能直连给 CDN 地址，要中转给中转地址
+      redirect  只挑能直连的源（比如 Jable）；作品只有要中转的源时给中转地址
+      proxy     一律给中转地址，流量走本服务
+    中转地址：relay=gateway（网关能转发）时是本服务的地址，网关只取路径、经它转发（能用上网关的统计）；
+    否则是公网中转地址（resolve_proxy_url）下的，客户端直接连本服务。两者都没有时，auto 退回只挑能直连的，
+    只有要中转的源返回 409。返回里的 relay 说明给的是不是中转地址。
+    能直连的源这个客户端连不了（浏览器跨域请求、CDN 拒绝的 UA，和 /play 的判断一样），有中转就给中转。
+    直连的源都取地址失败、或者站点拦截中，有中转就给中转（中转时还能用别的源），不报错：
     网关遇到错误会回退去反代 Emby，Emby 再 302 到 strm 里的内网地址，外网客户端访问不到。
-    ua / origin / fetch_mode 只记日志，方便排查。
     name 可以是 slug、slug.m3u8，也可以是网关 objectKey 原样（如 play/ipzz-983.m3u8），取最后一段；
     多画质版本的 strm 是 ipzz-983@720p.m3u8，挑有这一档的源，多档的主播放列表给这一档的子清单。
     """
@@ -648,46 +650,51 @@ async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin:
         raise HTTPException(400, f"mode 只能是 auto、redirect、proxy：{mode}")
     ctx.metrics.inc("resolve_requests")
     extra = f"，UA {ua[:60]}" + (f"，fetch_mode {fetch_mode}" if fetch_mode else "")
-    relay = _relay_url(s, slug, want) if s.resolve_proxy_url else ""
+    base = str(request.base_url).rstrip("/") if relay == "gateway" else s.resolve_proxy_url
+    relay_url = _relay_url(s, base, slug, want) if base else ""
 
     def relayed(why: str, duration: int | None = None) -> dict:
-        log.info("resolve %s：%s，返回本服务中转地址（%s%s）", slug, why, mode, extra)
-        return {"slug": slug, "url": relay, "expires_at": 0, "ttl": 6 * 3600, "duration": duration}
+        log.info("resolve %s：%s，返回%s中转地址（%s%s）", slug, why, "经网关转发的" if relay == "gateway" else "公网",
+                 mode, extra)
+        return {"slug": slug, "url": relay_url, "relay": True, "expires_at": 0, "ttl": 6 * 3600, "duration": duration}
 
     if mode == "proxy":
-        if not relay:
-            raise HTTPException(409, "mode=proxy 要先设置公网中转地址")
+        if not relay_url:
+            raise HTTPException(409, "mode=proxy 要先设置公网中转地址，或者网关开经网关中转")
         return relayed("要求中转")
     resolver = ctx.resolver
     try:
-        if mode == "auto" and relay:
+        if mode == "auto" and relay_url:
             r = await resolver.resolve(slug, min_remaining=min_remaining, remote=True, want=want)
             if not (r.traits.direct and not r.traits.ip_bound):
                 return relayed(f"挑中 {_label(r)} 要中转", r.video.get("duration"))
         else:
             r = await resolver.resolve(slug, min_remaining=min_remaining, direct_only=True, remote=True, want=want)
     except NoDirectSource:
-        if not relay:
-            log.info("resolve %s：只有要中转的源，没设公网中转地址，返回 409（%s）", slug, extra.lstrip("，"))
+        if not relay_url:
+            log.info("resolve %s：只有要中转的源，没有中转地址，返回 409（%s）", slug, extra.lstrip("，"))
             raise HTTPException(409, "这部影片只有需要本服务中转的源，没有设置公网中转地址") from None
         return relayed("只有要中转的源")
     except (NotFound, VideoGone):
         raise HTTPException(404, f"影片不存在或已下架：{slug}") from None
     except (Blocked, FetchError, ParseError) as e:
-        if relay:
+        if relay_url:
             return relayed(f"能直连的源取地址失败（{e}）")
         if isinstance(e, Blocked):
             raise HTTPException(503, f"站点拦截中：{e}", headers={"Retry-After": str(int(e.retry_after))}) from None
         log.warning("解析播放地址失败 %s：%s", slug, e)
         raise HTTPException(502, f"解析播放地址失败：{e}") from None
+    blocked_uas = s.proxy_user_agents if r.traits.ua_block else []
+    if relay_url and (why := direct_blocker(blocked_uas, ua, origin, fetch_mode)):
+        return relayed(f"{_label(r)} 能直连，但{why}", r.video.get("duration"))
     expires = r.expires or 0
     log.info("resolve %s：返回 %s 的 CDN 地址（%s，%s%s）", slug, _label(r), _left(r), mode, extra)
-    return {"slug": slug, "url": await _pick_variant(ctx, r, want), "expires_at": expires,
+    return {"slug": slug, "url": await _pick_variant(ctx, r, want), "relay": False, "expires_at": expires,
             "ttl": max(0, int(expires - time.time())), "duration": r.video.get("duration")}
 
 
-def _relay_url(s, slug: str, want: int | None = None) -> str:
-    url = f"{s.resolve_proxy_url}/play/{slug}{'@' + quality_label(want).lower() if want else ''}.m3u8?proxy=1"
+def _relay_url(s, base: str, slug: str, want: int | None = None) -> str:
+    url = f"{base}/play/{slug}{'@' + quality_label(want).lower() if want else ''}.m3u8?proxy=1"
     return url + (f"&t={quote(s.play_token)}" if s.play_token else "")
 
 
