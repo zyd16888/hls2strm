@@ -137,23 +137,30 @@ def scan_directory(
     return rows
 
 
-def find_by_video(roots: list[Path], slug_by_id: dict[int, str], id_by_slug: dict[str, int]) -> dict[int, list[str]]:
+def find_by_video(roots: list[Path], slug_by_id: dict[int, str],
+                  id_by_slug: dict[str, int]) -> tuple[dict[int, list[str]], list[int]]:
     """按 strm 内容（本服务地址或 CDN 直链）找出每部影片的文件，不看文件名，所以外部工具改名也认得出。
+    返回 (每部影片的文件, 每个目录里认得出的 strm 数)。
 
-    跳过软链接：外部工具用软链接模式时，真正的文件还在库目录里，记录它就行。同步函数，放到线程里跑。
+    跳过软链接：外部工具用软链接模式时，真正的文件还在库目录里，记录它就行；但软链接算进数量（目录在用）。
+    同步函数，放到线程里跑。
     """
     now = time.time()
     found: dict[int, list[str]] = {}
+    counts = []
     for root in roots:
-        if not root.is_dir():
-            continue
-        for p, _, info in iter_strm(root, now):
-            if info.kind not in ("ours", "cdn") or os.path.islink(p):
+        n = 0
+        for p, _, info in iter_strm(root, now) if root.is_dir() else ():
+            if info.kind not in ("ours", "cdn"):
                 continue
             _, vid = video_of(info, slug_by_id, id_by_slug)
-            if vid is not None:
+            if vid is None:
+                continue
+            n += 1
+            if not os.path.islink(p):
                 found.setdefault(vid, []).append(p)
-    return {vid: sorted(paths) for vid, paths in found.items()}
+        counts.append(n)
+    return {vid: sorted(paths) for vid, paths in found.items()}, counts
 
 
 def replace_prefix_in_file(path: Path, old: str, new: str) -> tuple[str, str] | None:
@@ -202,7 +209,7 @@ class StrmManager:
     def __init__(self, engine: Engine) -> None:
         self.e = engine
         self.db = engine.db
-        self._index: dict[int, tuple[float, dict[int, list[str]]]] = {}
+        self._index: dict[int, tuple[float, dict[int, list[str]], int]] = {}  # 库 id -> (时间, 文件, 外部整理目录 strm 数)
 
     # ---- 按内容找文件 ----
 
@@ -213,10 +220,11 @@ class StrmManager:
         if cached and time.time() - cached[0] < max_age:
             return cached[1]
         keys = await self.db.video_keys()
-        roots = [self.e.writer.library_root(lib), self.e.writer.external_root(lib)]
-        found = await asyncio.to_thread(find_by_video, [r for r in roots if r], await self.db.cdn_video_map(),
-                                        {s: i for i, s in keys})
-        self._index[lib["id"]] = (time.time(), found)
+        ext = self.e.writer.external_root(lib)
+        roots = [self.e.writer.library_root(lib)] + ([ext] if ext else [])
+        found, counts = await asyncio.to_thread(find_by_video, roots, await self.db.cdn_video_map(),
+                                                {s: i for i, s in keys})
+        self._index[lib["id"]] = (time.time(), found, counts[1] if ext else 0)
         return found
 
     def pick(self, lib: dict, paths: list[str]) -> str:
@@ -229,10 +237,17 @@ class StrmManager:
                 return in_ext[0]
         return paths[0]
 
-    def external_available(self, lib: dict, found: dict[int, list[str]]) -> bool:
-        """外部整理目录在、而且这个库还找得到 strm：都不满足时多半是挂载出了问题，不能往收件目录补（会整库重刮）。"""
+    def external_problem(self, lib: dict) -> str:
+        """外部整理目录能不能用：不存在返回 absent，里面一个认得出的 strm 都没有返回 empty，能用返回空串。
+        前两种多半是挂载出了问题，不能往收件目录补（挂载恢复后会整库重刮）。
+
+        只数外部整理目录（上次 index 时的结果）：挂载掉了、挂载点剩个空目录时，收件目录里订阅刚写的几个新 strm 不能算数。
+        """
         ext = self.e.writer.external_root(lib)
-        return ext is not None and ext.is_dir() and bool(found)
+        if ext is None or not ext.is_dir():
+            return "absent"
+        cached = self._index.get(lib["id"])
+        return "" if cached and cached[2] else "empty"
 
     def remember(self, lib: dict, video_id: int, path: str) -> None:
         if (cached := self._index.get(lib["id"])) is not None:

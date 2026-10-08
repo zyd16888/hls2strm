@@ -37,10 +37,14 @@ function progressText(j: Job): string {
   if (j.kind === "verify" && st.checked != null) {
     text += `，检查 ${n("checked")}，正常 ${n("ok")}，strm 缺 ${n("strm")}，nfo 缺 ${n("nfo")}，封面缺 ${n("cover")}`;
     if (j.params.repair) text += `；补写 ${n("repaired")}，补封面 ${n("covers_queued")}`;
+    if (st.details_queued != null) text += `，抓详情 ${n("details_queued")}`;
     if (st.external_relocated) text += `；外部整理库找回位置 ${n("external_relocated")}`;
     if (st.external_rewritten) text += `，写回收件目录 ${n("external_rewritten")}`;
     if (st.external_missing) text += `，找不到 ${n("external_missing")}`;
-    if (st.external_unavailable) text += `，外部整理目录不在或是空的没补 ${n("external_unavailable")}`;
+    if (st.external_absent) text += `，外部整理目录不存在没补 ${n("external_absent")}`;
+    if (st.external_empty) text += `，外部整理目录是空的没补 ${n("external_empty")}`;
+    if (st.external_unavailable) text += `，外部整理目录不在或是空的没补 ${n("external_unavailable")}`; // 旧任务
+    if (st.external_absent || st.external_empty || st.external_unavailable) text += "（先检查挂载；确认要补，核对时勾「外部整理目录不在或是空的也写回」）";
   }
   return text;
 }
@@ -132,7 +136,7 @@ function NewJob() {
   const run = useRun();
   const [kind, setKind] = useState<Kind>("list");
   const [f, setF] = useState({ site: "jable", source: "", sort: "post_date", start_page: 1, end_page: 0, detail: true, urls: "", library_id: 1 });
-  const [verify, setVerify] = useState({ repair: true, covers: true, force_external: false });
+  const [verify, setVerify] = useState({ repair: true, covers: true, details: false, force_external: false });
   const set = (patch: Partial<typeof f>) => setF(prev => ({ ...prev, ...patch }));
   const site = meta.site(f.site);
   const allLibs = kind === "rewrite" || kind === "probe" || kind === "verify";
@@ -142,7 +146,13 @@ function NewJob() {
     if (kind === "list") Object.assign(body, { site: f.site, source: f.source, sort: f.sort, start_page: f.start_page || 1, end_page: f.end_page || 0, detail: f.detail });
     if (kind === "videos") Object.assign(body, { site: f.site, urls: f.urls });
     if (kind === "probe") body.site = f.site;
-    if (kind === "verify") Object.assign(body, { repair: verify.repair, covers: verify.repair && verify.covers, force_external: verify.repair && verify.force_external });
+    if (kind === "verify")
+      Object.assign(body, {
+        repair: verify.repair,
+        covers: verify.repair && verify.covers,
+        detail: verify.repair && verify.details,
+        force_external: verify.repair && verify.force_external,
+      });
     if (kind !== "backfill" && f.library_id) body.library_id = f.library_id;
     await run(() => api.post<{ id: number }>("/api/jobs", body), { success: r => `已创建任务 #${r.id}`, invalidate: [["jobs"], ["status"]] });
   };
@@ -152,7 +162,8 @@ function NewJob() {
     videos: "抓取指定影片的详情并加入所选的库，比批量任务先执行。",
     backfill: "为所有还没有详情的影片排队抓详情，写入它们所在的各个库。",
     probe: "给库里的影片找备用源：按番号到所选站点逐部查找（每部一次请求），找到就挂成这部影片的另一个源，播放时原来的源不能用会自动换过去。某个站没有的影片，在「补源重查间隔」内不再重复查。",
-    verify: "检查数据库里每条输出在磁盘上还在不在：strm 有没有、内容是不是当前的播放地址，nfo 和封面有没有。勾上「补回」会重新写 strm 和 nfo（不联网），封面先从别的库硬链接，没有再下载。外部整理库按 strm 内容在收件目录和外部整理目录里找，找到只更新记录的路径；两边都找不到才写回收件目录。",
+    verify:
+      "检查数据库里每条输出在磁盘上还在不在：strm 有没有、内容是不是当前的播放地址，nfo 和封面有没有。勾上「补回」会重新写 strm 和 nfo（不联网），封面先从别的库硬链接，没有再下载。没详情的影片不写 nfo，勾「抓详情」会给它们排队抓（按站点限速，外部整理库不抓）。外部整理库按 strm 内容在收件目录和外部整理目录里找，找到只更新记录的路径；两边都找不到才写回收件目录；外部整理目录不存在或是空的不补（多半是挂载出了问题）。",
     rewrite: "改了对外地址、播放模式、令牌或路径模板以后，用它重写已有的 strm 和 nfo（不联网），路径变了会搬动文件。",
   };
 
@@ -216,15 +227,18 @@ function NewJob() {
           </>
         )}
         {kind === "verify" && (
-          <div className="flex h-8 flex-wrap items-center gap-4">
+          <div className="flex min-h-8 flex-wrap items-center gap-x-4 gap-y-1">
             <Check checked={verify.repair} onChange={v => setVerify(p => ({ ...p, repair: v }))}>
               发现问题就补回
             </Check>
             <Check checked={verify.covers} disabled={!verify.repair} onChange={v => setVerify(p => ({ ...p, covers: v }))}>
               补封面（要下载）
             </Check>
+            <Check checked={verify.details} disabled={!verify.repair} onChange={v => setVerify(p => ({ ...p, details: v }))}>
+              没详情的抓详情（要联网）
+            </Check>
             <Check checked={verify.force_external} disabled={!verify.repair} onChange={v => setVerify(p => ({ ...p, force_external: v }))}>
-              外部整理目录是空的也写回
+              外部整理目录不在或是空的也写回
             </Check>
           </div>
         )}

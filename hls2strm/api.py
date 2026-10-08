@@ -176,12 +176,12 @@ class JobCreate(BaseModel):
     sort: str = ""
     start_page: int = 1
     end_page: int = 0
-    detail: bool | None = None
+    detail: bool | None = None  # list：抓详情；verify：没详情的排队抓详情（要联网）
     urls: str = ""
     library_id: int | None = None
     repair: bool = True  # verify：发现问题就补回；关掉只检查
     covers: bool = True  # verify：补封面（要下载）
-    force_external: bool = False  # verify：外部整理目录是空的也把找不到的写回收件目录
+    force_external: bool = False  # verify：外部整理目录不存在或是空的也把找不到的写回收件目录
 
 
 def _site_of_url(c, url: str) -> str | None:
@@ -227,7 +227,7 @@ async def create_job(body: JobCreate, request: Request):
             job_id = await e.create_probe(body.site, body.library_id or None)
         elif body.kind == "verify":
             job_id = await e.create_verify(body.library_id or None, repair=body.repair, covers=body.covers,
-                                           force_external=body.force_external)
+                                           force_external=body.force_external, details=bool(body.detail))
         else:
             job_id = await e.create_rewrite(body.library_id)
     except ValueError as err:

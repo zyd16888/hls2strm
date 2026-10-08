@@ -3,7 +3,7 @@
 job 种类：
   crawl        翻某个列表来源，输出到指定输出库（订阅的首轮全量也是它）
   probe        补源：按番号到某个站点找库里影片的备用源
-  verify       核对输出：数据库里的记录和磁盘上的 strm / nfo / 封面对不对得上，可选补回
+  verify       核对输出：数据库里的记录和磁盘上的 strm / nfo / 封面对不对得上，可选补回、给没详情的排队抓详情
   incremental  从第 1 页往后翻，连续遇到库里已有的影片就停（订阅的定时增量）
   videos       抓指定影片的详情（手动添加、补全缺失详情）
   rewrite      按当前设置重写输出（可限定某个库），路径变化时搬动文件
@@ -701,11 +701,11 @@ class Engine:
 
     async def restore_lost(self, v: dict, lib: dict, *, force: bool = False) -> str:
         """记录的 strm 不在了，补回或找回。返回 rewritten（重新写了）/ relocated（外部工具挪走了，已更新路径）/
-        missing（外部整理库找不到，按设置不补）/ unavailable（外部整理目录不在或是空的，没补）。
+        missing（外部整理库找不到，按设置不补）/ absent、empty（外部整理目录不存在、是空的，没补）。
 
         普通库：直接按模板重写（含 nfo、封面）。外部整理库：先按内容在收件目录和外部整理目录里找，
         外部工具改了目录、加了后缀也认得出，找到就只更新路径；都找不到才写回收件目录让外部工具再整理一次。
-        force：外部整理目录是空的也写回（「核对」里手动勾选）。
+        force：外部整理目录不存在或是空的也写回（「核对」里手动勾选）。
         """
         if not lib["external_dir"]:
             await self._output_one(v, lib["id"], cover=bool(v["detail_at"]))
@@ -718,8 +718,8 @@ class Engine:
         if paths:
             await self.db.set_output_paths(lib["id"], [(self.strm.pick(lib, paths), v["id"])])
             return "relocated"
-        if not force and not self.strm.external_available(lib, found):
-            return "unavailable"
+        if not force and (problem := self.strm.external_problem(lib)):
+            return problem
         if not force and not self.store.current.external_restore:
             return "missing"
         await self._output_one(v, lib["id"], cover=False, old_strm="", settle=True)
@@ -770,7 +770,7 @@ class Engine:
     async def _do_verify(self, job: dict, task: dict) -> None:
         p = job["params"]
         lib_id, repair, covers = p.get("library_id"), p.get("repair", True), p.get("covers", True)
-        force_external = p.get("force_external", False)
+        force_external, details = p.get("force_external", False), p.get("details", False)
         st = Counter()
         for lib in list(self.libs.values()):
             if lib["external_dir"] and lib_id in (None, lib["id"]):
@@ -809,15 +809,24 @@ class Engine:
                 log.info("核对输出：已检查 %d 部", st["checked"])
         if cover_targets:
             st["covers_queued"] = await self.db.add_tasks(job["id"], "cover", cover_targets, PRIORITY_DETAIL)
+        if repair and details:
+            # 没详情的不写 nfo，上面也不算缺：按需联网补。外部整理库跳过（只写 strm，元数据归外部工具刮）
+            lib_ids = [lid for lid, lib in self.libs.items() if not lib["external_dir"] and lib_id in (None, lid)]
+            items = await self.db.sources_missing_detail(self._rank, lib_ids) if lib_ids else []
+            st["details_queued"] = await self._add_detail_tasks(job["id"], items, PRIORITY_DETAIL)
         await self.db.update_job(job["id"], state=dict(st))
         await self.count_missing()
-        log.info("核对输出%s：检查 %d 部，正常 %d；strm 缺失或不对 %d，nfo 缺失 %d，封面缺失 %d%s",
+        log.info("核对输出%s：检查 %d 部，正常 %d；strm 缺失或不对 %d，nfo 缺失 %d，封面缺失 %d%s%s",
                  "并修复" if repair else "（只检查）", st["checked"], st["ok"], st["strm"], st["nfo"], st["cover"],
-                 f"；已补写 {st['repaired']} 部，排队补封面 {st['covers_queued']} 部" if repair else "")
+                 f"；已补写 {st['repaired']} 部，排队补封面 {st['covers_queued']} 部" if repair else "",
+                 f"，没详情的排队抓详情 {st['details_queued']} 部" if repair and details else "")
         ext = {k.removeprefix("external_"): n for k, n in st.items() if k.startswith("external_")}
         if ext:
             log.info("核对输出：外部整理库找不到的 %s", _restore_text(Counter(ext)).lstrip("，") or
                      f"{ext.get('missing', 0)} 部（只检查）")
+            if ext.get("absent") or ext.get("empty"):
+                log.warning("核对输出：外部整理目录不存在或是空的，没往收件目录补。先检查挂载；"
+                            "确认要补，核对时勾「外部整理目录不在或是空的也写回」")
 
     async def _do_cover(self, job: dict, task: dict) -> None:
         lib_id, vid = (int(x) for x in task["target"].split(":"))
@@ -828,11 +837,11 @@ class Engine:
         await self._output_one(v, lib_id, cover=True, old_strm=out["strm_path"])
 
     async def create_verify(self, library_id: int | None = None, *, repair: bool = True, covers: bool = True,
-                            force_external: bool = False) -> int:
+                            force_external: bool = False, details: bool = False) -> int:
         lib_name = self._library(library_id)["name"] if library_id else "全部库"
         name = f"核对输出：{lib_name}" + ("（修复）" if repair else "（只检查）")
         job_id = await self.db.create_job("verify", name, {"library_id": library_id, "repair": repair, "covers": covers,
-                                                           "force_external": force_external})
+                                                           "force_external": force_external, "details": details})
         await self.db.add_tasks(job_id, "verify", ["all"], PRIORITY_USER)
         log.info("新建任务 #%d「%s」", job_id, name)
         self.notify()
@@ -1067,14 +1076,17 @@ class Engine:
             self._library(library_id)
         name = name or f"影片 {items[0][1]}" + (f" 等 {len(items)} 部" if len(items) > 1 else "")
         job_id = await self.db.create_job("videos", name, {"count": len(items), "library_id": library_id})
-        by_site: dict[str, list[str]] = {}
-        for site, key in items:
-            by_site.setdefault(get_site(site).name, []).append(key)
-        for site, keys in by_site.items():
-            await self.db.add_tasks(job_id, "detail", keys, priority, site)
+        await self._add_detail_tasks(job_id, items, priority)
         log.info("新建任务 #%d「%s」", job_id, name)
         self.notify()
         return job_id
+
+    async def _add_detail_tasks(self, job_id: int, items: list[tuple[str, str]], priority: int) -> int:
+        """[(站点, key)] 按站点排详情子任务（各站分别限速），返回排上的数量。"""
+        by_site: dict[str, list[str]] = {}
+        for site, key in items:
+            by_site.setdefault(get_site(site).name, []).append(key)
+        return sum([await self.db.add_tasks(job_id, "detail", keys, priority, site) for site, keys in by_site.items()])
 
     async def create_backfill(self) -> int:
         items = await self.db.sources_missing_detail(self._rank)
@@ -1285,7 +1297,8 @@ def _restore_text(c: Counter) -> str:
     parts = [f"补回 {c['rewritten']} 部" if c["rewritten"] else "",
              f"外部工具挪走、改名的找回位置 {c['relocated']} 部" if c["relocated"] else "",
              f"外部整理库找不到、按设置没补 {c['missing']} 部" if c["missing"] else "",
-             f"外部整理目录不在或是空的、没补 {c['unavailable']} 部（检查挂载）" if c["unavailable"] else ""]
+             f"外部整理目录不存在、没补 {c['absent']} 部（检查挂载）" if c["absent"] else "",
+             f"外部整理目录是空的、没补 {c['empty']} 部（检查挂载）" if c["empty"] else ""]
     text = "，".join(p for p in parts if p)
     return f"，磁盘上丢失的：{text}" if text else ""
 

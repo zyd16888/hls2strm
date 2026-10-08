@@ -801,12 +801,15 @@ class Database:
         )
         return row["stream_url"] if row else ""
 
-    async def sources_missing_detail(self, rank: Callable[[str], int]) -> list[tuple[str, str]]:
-        """没有详情的作品，各取优先级最高的可用源，返回 [(站点, key)]。"""
-        rows = await self._all(
-            """SELECT s.video_id, s.site, s.key FROM sources s JOIN videos v ON v.id=s.video_id
-               WHERE v.detail_at IS NULL AND v.status='active' AND s.status='active' ORDER BY s.video_id DESC"""
-        )
+    async def sources_missing_detail(self, rank: Callable[[str], int],
+                                     library_ids: list[int] | None = None) -> list[tuple[str, str]]:
+        """没有详情的作品（给了 library_ids 就只要在这些库里的），各取优先级最高的可用源，返回 [(站点, key)]。"""
+        sql = """SELECT s.video_id, s.site, s.key FROM sources s JOIN videos v ON v.id=s.video_id
+                 WHERE v.detail_at IS NULL AND v.status='active' AND s.status='active'"""
+        if library_ids:
+            sql += (" AND EXISTS (SELECT 1 FROM outputs o WHERE o.video_id=v.id AND o.library_id IN (%s))"
+                    % ",".join("?" * len(library_ids)))
+        rows = await self._all(sql + " ORDER BY s.video_id DESC", library_ids or ())
         best: dict[int, tuple[str, str]] = {}
         for r in rows:
             cur = best.get(r["video_id"])
