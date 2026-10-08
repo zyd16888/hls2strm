@@ -1,9 +1,11 @@
 """分层抓取器。
 
 每个站点一条抓取通道（SiteFetcher），域名、冷却、限速各管各的；所有通道共用一个 curl_cffi 会话（代理、指纹）。
-L1：curl_cffi 模拟浏览器指纹，按顺序轮换该站的多个域名；某个域名被拦就冷却（连续被拦翻倍），切到下一个。
-L2：全部域名都被拦时，如果配置了 Byparr / FlareSolverr，用它拿 cookie 和页面；成功后 cookie 注入 L1 会话。
-全部失败抛 Blocked，由任务引擎暂停这个站点，等冷却结束。
+L1：curl_cffi 模拟浏览器指纹，按顺序试该站的多个域名。
+L2：某个域名被拦（挑战页、403 / 503、只有一段跳转的小页面）时，配置了 Byparr / FlareSolverr 就当场让它过这个域名
+    （过盾能力比 curl_cffi 强得多），过了 cookie、UA 注入 L1 接着用，不冷却、不降速；没配或者也没过，才冷却这个域名
+    （连续被拦翻倍）、换下一个。429 是限流，直接冷却。
+全部失败抛 Blocked（有网络错误时抛 FetchError），由任务引擎暂停这个站点，等冷却结束。
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from urllib.parse import urlsplit, urlunsplit
@@ -49,6 +52,7 @@ class DomainState:
     last_ok_at: float = 0.0
     cookies: dict[str, str] = field(default_factory=dict)
     user_agent: str = ""
+    solved_at: float = 0.0  # 上次解题服务过了这个域名的时间
 
     @property
     def host(self) -> str:
@@ -106,6 +110,15 @@ class RateLimiter:
 def looks_like_challenge(html: str) -> bool:
     head = html[:8000]
     return "<title>Just a moment" in head or "_cf_chl_opt" in head or "<title>请稍候" in head
+
+
+_REDIRECT_STUB_RE = re.compile(r"location\.(?:replace|assign)\(|location\.href\s*=|http-equiv=[\"']?refresh", re.I)
+
+
+def looks_like_redirect_stub(html: str) -> bool:
+    """只有一段 JS / meta 跳转的小页面：JS 验证，或者停放、被劫持的域名把访客引到别处（supjav.org 就是），
+    都不是站点内容；当成正常页面会解析出 0 条，把「没拿到」误当成「没有」。"""
+    return len(html) < 3000 and bool(_REDIRECT_STUB_RE.search(html))
 
 
 def split_proxy(proxy: str) -> tuple[str, str, str]:
@@ -380,38 +393,62 @@ class SiteFetcher:
         self.metrics.inc("fetch_blocked")
         log.warning("%s 被拦截（%s），冷却 %ss，限速降到 %.2f 次/秒", dom.host, reason, cool, self.limiter.rate)
 
+    async def _get(self, dom: DomainState, path: str):
+        """用 curl_cffi 请求这个域名，带上解题服务给的 cookie 和 UA。"""
+        return await self.session.get(dom.base + path, timeout=self.parent.store.current.request_timeout,
+                                      headers={"User-Agent": dom.user_agent} if dom.user_agent else None,
+                                      cookies=dom.cookies or None)
+
+    @staticmethod
+    def _block_reason(resp) -> str:
+        """被拦的原因，没被拦返回空串：Cloudflare 挑战、403 / 429 / 503、只有一段跳转的小页面。"""
+        status = resp.status_code
+        if "challenge" in (resp.headers.get("cf-mitigated") or "").lower() or looks_like_challenge(resp.text):
+            return f"HTTP {status} challenge"
+        if status in (403, 429, 503):
+            return f"HTTP {status}"
+        if status == 200 and looks_like_redirect_stub(resp.text):
+            return "HTTP 200 跳转页"
+        return ""
+
     async def get_page(self, path: str, *, priority: bool = False) -> Page:
-        """抓取站点页面。priority=True 时跳过限速（播放请求用）。"""
+        """抓取站点页面。priority=True 时跳过限速（播放请求用）。
+
+        按顺序试没在冷却的域名。被拦了先让解题服务当场过这个域名，过了接着用、不冷却不降速；
+        没配解题服务或者也没过，才冷却这个域名、换下一个。域名都在冷却时也给解题服务一次机会。
+        """
         path = self._to_path(path)
-        s = self.parent.store.current
         now = time.time()
         candidates = [d for d in self.domains if d.cooldown_until <= now]
         errors: list[str] = []
+        skipped: list[str] = []  # 前面没拿到页面的域名，后面的拿到了记一条 info，日志里看得出换过域名
         for dom in candidates:
             if not priority:
                 await self.limiter.acquire()
             url = dom.base + path
-            headers = {"User-Agent": dom.user_agent} if dom.user_agent else None
-            t0 = time.monotonic()
+            sent, t0 = time.time(), time.monotonic()
             try:
-                resp = await self.session.get(
-                    url, timeout=s.request_timeout, headers=headers, cookies=dom.cookies or None
-                )
+                resp = await self._get(dom, path)
             except Exception as e:
                 dom.errors += 1
                 dom.last_status = f"网络错误：{e}"[:200]
                 self.metrics.inc("fetch_error")
                 self.limiter.slow_down()
                 errors.append(f"{dom.host}: {e}")
+                skipped.append(f"{dom.host} 网络错误")
                 log.info("请求失败 %s（%.1fs）：%s", url, time.monotonic() - t0, e)
                 continue
             self.metrics.request()
             status = resp.status_code
             log.debug("%s %s → HTTP %d（%.1fs%s）", self.site.label, url, status, time.monotonic() - t0,
                       "，插队" if priority else "")
-            mitigated = (resp.headers.get("cf-mitigated") or "").lower()
-            if "challenge" in mitigated or status in (403, 429, 503) or looks_like_challenge(resp.text):
-                self._mark_blocked(dom, f"HTTP {status}" + (" challenge" if mitigated else ""))
+            if reason := self._block_reason(resp):
+                # 429 是限流，解题也没用
+                page = await self._solve(dom, path, reason, sent) if reason != "HTTP 429" else None
+                if page is not None:
+                    return self._served(page, skipped)
+                self._mark_blocked(dom, reason)
+                skipped.append(f"{dom.host} 被拦")
                 continue
             if status == 404:
                 dom.ok += 1
@@ -422,6 +459,7 @@ class SiteFetcher:
                 dom.last_status = f"HTTP {status}"
                 self.metrics.inc("fetch_error")
                 errors.append(f"{dom.host}: HTTP {status}")
+                skipped.append(f"{dom.host} HTTP {status}")
                 continue
             dom.ok += 1
             dom.block_streak = 0
@@ -429,14 +467,21 @@ class SiteFetcher:
             dom.last_status = "正常"
             self.limiter.reward()
             self.metrics.inc("fetch_ok")
-            return Page(resp.text, str(resp.url), dom.base)
+            return self._served(Page(resp.text, str(resp.url), dom.base), skipped)
 
+        if not candidates and self.domains:
+            page = await self._solve(self.domains[0], path, "域名都在冷却", time.time())
+            if page is not None:
+                return page
         if errors:
             raise FetchError("；".join(errors))
-        page = await self._solve(path)
-        if page is not None:
-            return page
         raise Blocked(f"{self.site.label} 的域名都被拦截（{self._blocked_reason()}）", self.blocked_for())
+
+    def _served(self, page: Page, skipped: list[str]) -> Page:
+        if skipped:
+            log.info("%s：%s，改用 %s%s", self.site.label, "、".join(skipped), urlsplit(page.domain).hostname,
+                     "（解题服务）" if page.via == "solver" else "")
+        return page
 
     def _blocked_reason(self) -> str:
         """域名都不能用时说明为什么：各域名还要冷却多久，解题服务有没有试。"""
@@ -451,34 +496,53 @@ class SiteFetcher:
             solver = "解题服务也没通过"
         return f"{cooling}；{solver}"
 
-    async def _solve(self, path: str) -> Page | None:
+    async def _solve(self, dom: DomainState, path: str, reason: str, since: float) -> Page | None:
+        """让解题服务打开被拦的域名；过了把 cookie、UA 注入这个域名，接着用、不冷却。没配置、本站没开或没过返回 None。
+
+        串行（解题慢、占资源）。排队时别的请求已经给这个域名解过题（since 之后），先带新 cookie 用 curl_cffi 再试一次，
+        省一次解题。落到了别的站（停放、被劫持的域名会把访客引走）也算没过。
+        """
         s = self.parent.store.current
-        if not s.solver_url or not self.cfg.solver or not self.domains:
+        if not s.solver_url or not self.cfg.solver:
             return None
-        async with self._solver_lock:  # 解题慢且占资源，串行
-            dom = self.domains[0]
+        async with self._solver_lock:
+            if dom.solved_at > since:
+                try:
+                    resp = await self._get(dom, path)
+                except Exception:
+                    resp = None
+                if resp is not None and resp.status_code == 200 and not self._block_reason(resp):
+                    return Page(resp.text, str(resp.url), dom.base)
             url = dom.base + path
-            log.info("%s 的域名全部被拦，调用解题服务：%s", self.site.label, url)
+            log.info("%s 被拦截（%s），调用解题服务：%s", dom.host, reason, url)
             t0 = time.monotonic()
             try:
                 result = await call_solver(s.solver_url, url, s.proxy, s.solver_timeout)
             except Exception as e:
                 self.metrics.inc("solver_error")
-                log.warning("解题服务失败：%s", e)
+                log.warning("解题服务失败（%.0fs）：%s", time.monotonic() - t0, e)
                 return None
             if result.status == 404:
                 raise NotFound(url)
-            if result.status != 200 or looks_like_challenge(result.html):
+            landed = urlsplit(result.url).hostname or ""
+            if landed.removeprefix("www.") != dom.host.removeprefix("www."):
+                fail = f"落到了别的站 {landed}"
+            elif result.status != 200 or looks_like_challenge(result.html) or looks_like_redirect_stub(result.html):
+                fail = f"HTTP {result.status}，没能通过挑战"
+            else:
+                fail = ""
+            if fail:
                 self.metrics.inc("solver_fail")
-                log.warning("解题服务未能通过挑战（HTTP %s）", result.status)
+                log.warning("解题服务没过 %s（%.0fs）：%s", dom.host, time.monotonic() - t0, fail)
                 return None
             dom.cookies = result.cookies
             dom.user_agent = result.user_agent
+            dom.solved_at = time.time()
             dom.cooldown_until = 0
             dom.block_streak = 0
             dom.last_status = "解题成功，已注入 cookie"
             self.metrics.inc("solver_ok")
-            log.info("解题成功（%.0fs），%s 恢复使用（cookie %d 个）", time.monotonic() - t0, dom.host,
+            log.info("解题成功（%.0fs），%s 接着用（cookie %d 个）", time.monotonic() - t0, dom.host,
                      len(result.cookies))
             return Page(result.html, result.url, dom.base, via="solver")
 
@@ -502,11 +566,9 @@ class SiteFetcher:
         for dom in self.domains:
             t0 = time.monotonic()
             try:
-                resp = await self.session.get(dom.base + "/", timeout=self.parent.store.current.request_timeout,
-                                              headers={"User-Agent": dom.user_agent} if dom.user_agent else None,
-                                              cookies=dom.cookies or None)
+                resp = await self._get(dom, "/")
                 ms = int((time.monotonic() - t0) * 1000)
-                blocked = "challenge" in (resp.headers.get("cf-mitigated") or "") or looks_like_challenge(resp.text)
+                blocked = bool(self._block_reason(resp))
                 ok = resp.status_code == 200 and not blocked
                 if ok:
                     dom.cooldown_until = 0

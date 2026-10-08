@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
+
+from selectolax.lexbor import LexborHTMLParser
 
 from ..errors import ParseError
 
@@ -153,11 +156,27 @@ class Site:
         return type(self).lookup is not Site.lookup or bool(self.key_for("ABC-001"))
 
     async def lookup(self, sf: SiteFetcher, code: str, uncensored: bool = False,
-                     priority: bool = False) -> list[SourceItem]:
-        """按番号找本站的影片，返回候选（由 find_by_code 核对）。默认直接拼 key（还没确认存在，要抓详情核对）；
-        要搜索的站点覆盖它，原样返回搜索结果。priority：不排限速队列（用户手动查、播放时现场找）。"""
+                     priority: bool = False) -> tuple[list[SourceItem], str]:
+        """按番号找本站的影片，返回 (候选, 哪个域名答的)，候选由 find_by_code 核对。默认直接拼 key（还没确认存在，
+        要抓详情核对，域名为空）；要搜索的站点覆盖它，用 search 原样返回搜索结果。
+        priority：不排限速队列（用户手动查、播放时现场找）。"""
         key = self.key_for(code, uncensored=uncensored)
-        return [SourceItem(key=key, code=code, title="", uncensored=uncensored)] if key else []
+        return ([SourceItem(key=key, code=code, title="", uncensored=uncensored)] if key else []), ""
+
+    async def search(self, sf: SiteFetcher, path: str, priority: bool = False) -> tuple[list[SourceItem], str]:
+        """打开站内搜索页，返回 (搜索结果, 哪个域名答的)。
+
+        一条结果都没有时，先确认页面上有站内搜索框（这些 WordPress 站的正常页面都有）：没有就不是本站的页面
+        （停放域名的跳板、没认出来的拦截页），报 ParseError 算失败，不能当成「没有」记下来、一个月不再查。
+        """
+        page = await sf.get_page(path, priority=priority)
+        host = urlsplit(page.domain).hostname or page.domain
+        items = self.parse_list(page.html).items
+        if not items and LexborHTMLParser(page.html).css_first("form.search-form") is None:
+            e = ParseError(f"{host} 返回的不是 {self.label} 的搜索页（没有站内搜索框）")
+            e.html = page.html
+            raise e
+        return items, host + ("（解题服务）" if page.via == "solver" else "")
 
     async def fetch_detail(self, sf: SiteFetcher, key: str, *, priority: bool = False) -> SourceDetail:
         page = await sf.get_page(self.detail_path(key), priority=priority)

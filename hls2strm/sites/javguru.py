@@ -169,12 +169,11 @@ class JavGuruSite(Site):
         )
 
     async def lookup(self, sf: SiteFetcher, code: str, uncensored: bool = False,
-                     priority: bool = False) -> list[SourceItem]:
+                     priority: bool = False) -> tuple[list[SourceItem], str]:
         ck = code_key(code)
         if not ck:
-            return []
-        page = await sf.get_page(f"/?s={quote(code.strip().upper())}", priority=priority)
-        return self.parse_list(page.html).items  # find_by_code 按番号核对
+            return [], ""
+        return await self.search(sf, f"/?s={quote(code.strip().upper())}", priority)  # find_by_code 按番号核对
 
     async def resolve_line(self, http: Fetcher, name: str, link: str) -> HostStream:
         """线路数据 https://jav.guru/searcho/?{L}d={HEX}… → /searcho/?{L}r={HEX 倒过来}，302 到嵌入页。"""

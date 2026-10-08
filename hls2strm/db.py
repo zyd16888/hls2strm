@@ -293,7 +293,14 @@ async def _migrate_v7(conn: aiosqlite.Connection) -> None:
         await conn.execute(sql)
 
 
-MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7]
+async def _migrate_v8(conn: aiosqlite.Connection) -> None:
+    """SupJav 的备用域名 supjav.org 被停放后只回一段跳转，曾被当成「搜索结果为空」：
+    清掉 SupJav 没找到的补源记录，补源时重新查。"""
+    await conn.execute("DELETE FROM source_checks WHERE site='supjav' AND found=0")
+
+
+MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
+              _migrate_v8]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")

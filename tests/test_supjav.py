@@ -2,6 +2,9 @@ import asyncio
 import json
 import time
 
+import pytest
+
+from hls2strm.errors import ParseError
 from hls2strm.fetcher import FetchError, Page
 from hls2strm.sites import SITES, find_by_code
 from hls2strm.sites.supjav import GATEWAY, parse_title
@@ -80,9 +83,23 @@ def test_lookup_by_code():
     notes = []
     found = asyncio.run(find_by_code(SUPJAV, sf, "SSIS-001", notes=notes))
     assert [x.key for x in found] == ["443625"]  # 搜索结果里还有 [无码破解] 版，属于另一部作品
-    assert notes == ["按番号 SSIS-001 搜到 2 条，不是这部的：SSIS-001（无码流出）"]
+    assert notes == ["supjav.com 按番号 SSIS-001 搜到 2 条，不是这部的：SSIS-001（无码流出）"]
     found = asyncio.run(find_by_code(SUPJAV, sf, "ssis-001", uncensored=True))
     assert [x.key for x in found] == ["458958"]
+
+
+def test_lookup_fake_page_is_not_none_found():
+    """搜不到结果时确认是本站的搜索页：停放域名的跳板页报错（算失败），真的空搜索页才算「没有」。"""
+    stub = "<html><head><title>Loading...</title></head><body><script>window.location.replace('/x');</script></body></html>"
+    empty = '<html><form action="https://supjav.com/zh/" class="search-form"></form><div class="posts"></div></html>'
+    sf = FakeSiteFetcher({"/zh/?s=HTTM-070": stub}, FakeHttp({}))
+    with pytest.raises(ParseError, match="不是 SupJav 的搜索页") as e:
+        asyncio.run(find_by_code(SUPJAV, sf, "HTTM-070"))
+    assert e.value.html == stub  # 存快照用
+    sf.pages["/zh/?s=HTTM-070"] = empty
+    notes = []
+    assert asyncio.run(find_by_code(SUPJAV, sf, "HTTM-070", notes=notes)) == []
+    assert notes == ["supjav.com 按番号 HTTM-070 搜到 0 条"]
 
 
 def test_server_streams():

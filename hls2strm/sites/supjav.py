@@ -60,7 +60,7 @@ def parse_title(title: str) -> tuple[str, str, bool]:
 class SupJavSite(Site):
     name = "supjav"
     label = "SupJav"
-    default_domains = ["https://supjav.com", "https://supjav.net", "https://supjav.org"]
+    default_domains = ["https://supjav.com", "https://supjav.net"]  # supjav.org 已被停放，会把访客引到广告站
     default_enabled = False  # 整站要过 CF 挑战，配好解题服务再启用
     lookup_verified = True
     stream = StreamTraits(direct=True, expires=True, ip_bound=True)
@@ -175,14 +175,13 @@ class SupJavSite(Site):
         )
 
     async def lookup(self, sf: SiteFetcher, code: str, uncensored: bool = False,
-                     priority: bool = False) -> list[SourceItem]:
+                     priority: bool = False) -> tuple[list[SourceItem], str]:
         """站内搜索番号（FC2 只搜数字），原样返回搜索结果，由 find_by_code 按番号和是否无码破解核对。"""
         ck = code_key(code)
         if not ck:
-            return []
+            return [], ""
         query = ck.split("-", 1)[1] if ck.startswith("FC2PPV-") else code.strip().upper()
-        page = await sf.get_page(f"/zh/?s={quote(query)}", priority=priority)
-        return self.parse_list(page.html).items
+        return await self.search(sf, f"/zh/?s={quote(query)}", priority)
 
     async def resolve_line(self, http: Fetcher, name: str, link: str) -> HostStream:
         """线路按钮的 data-link → 网关（倒序后放进 c=，302 到播放站）→ 播放站解出直链。

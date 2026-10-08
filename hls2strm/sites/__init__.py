@@ -30,13 +30,14 @@ async def find_by_code(site: Site, sf, code: str, uncensored: bool = False, prio
     """
     ck = code_key(code)
     notes = [] if notes is None else notes
-    items = await site.lookup(sf, code, uncensored, priority=priority)
+    items, domain = await site.lookup(sf, code, uncensored, priority=priority)
     if site.lookup_verified:
         out: list[SourceItem | SourceDetail] = []
         rest: list[SourceItem] = []
         for it in items:
             (out if code_key(it.code) == ck and it.uncensored == uncensored else rest).append(it)
-        notes.append(f"按番号 {code} 搜到 {len(items)} 条" + (f"，不是这部的：{_brief(rest)}" if rest else ""))
+        notes.append((f"{domain} " if domain else "") + f"按番号 {code} 搜到 {len(items)} 条"
+                     + (f"，不是这部的：{_brief(rest)}" if rest else ""))
         return out
     if not items:
         notes.append(f"番号 {code} 拼不出站内地址")

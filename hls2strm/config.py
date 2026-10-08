@@ -85,7 +85,7 @@ class SiteConfig(BaseModel):
     domains: list[str] = Field(default_factory=list)
     rate_per_sec: float = Field(1.0, gt=0, le=20)
     concurrency: int = Field(2, ge=1, le=16)
-    solver: bool = True  # 全部域名被拦时是否调用解题服务
+    solver: bool = True  # 域名被拦时是否当场调用解题服务（没过才冷却、换下一个域名）
     lines: dict[str, LineConfig] = Field(default_factory=dict)  # 多线路站点：每条线路的设置
     line_order: list[str] = Field(default_factory=list)  # 线路的优先顺序，前面的先试
 
