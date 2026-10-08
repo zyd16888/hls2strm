@@ -13,6 +13,7 @@ import logging
 import time
 from collections.abc import Callable, Iterable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -298,6 +299,115 @@ WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality
                       "categories", "tags", "maker", "director", "series")
 SOURCE_FAIL_COOLDOWN = 300
 SOURCE_FAIL_COOLDOWN_MAX = 6 * 3600
+
+
+VIDEO_SORTS = {  # 影片库排序：参数 -> 列
+    "created": "id",
+    "release": "release_date",
+    "duration": "duration",
+    "code": "code_key",
+    "views": "views",
+    "updated": "updated_at",
+}
+FACET_FIELDS = {"categories": "slug", "tags": "slug", "models": "id"}  # JSON 列 -> 元素里当 id 用的字段
+
+
+@dataclass
+class VideoQuery:
+    """影片库的筛选和排序。列表类条件组内任一满足即可，不同条件之间都要满足。"""
+
+    q: str = ""
+    status: str = ""  # no_detail / no_output / gone
+    library_id: int | None = None
+    has_site: list[str] = field(default_factory=list)  # 有其中任一站点的可用源
+    lacks_site: list[str] = field(default_factory=list)  # 这些站点都没有源
+    sources: str = ""  # single / multi / failing（有源最近取地址失败）/ none（没有可用源）
+    subtitle: str = ""  # zh / en / none（按可用源的字幕）
+    uncensored: bool | None = None
+    models: list[str] = field(default_factory=list)  # 女优 id
+    categories: list[str] = field(default_factory=list)  # 分类 slug
+    tags: list[str] = field(default_factory=list)
+    makers: list[str] = field(default_factory=list)
+    quality: list[str] = field(default_factory=list)
+    release_from: str = ""  # YYYY-MM-DD
+    release_to: str = ""
+    added_from: int | None = None  # 入库时间（unix 秒）
+    added_to: int | None = None
+    duration_min: int | None = None  # 秒
+    duration_max: int | None = None
+    sort: str = "created"
+    desc: bool = True
+
+    def where(self) -> tuple[str, list[Any]]:
+        where, params = ["1=1"], []
+
+        def marks(values: list) -> str:
+            params.extend(values)
+            return ",".join("?" * len(values))
+
+        if self.q.strip():
+            like = f"%{self.q.strip()}%"
+            where.append("(slug LIKE ? OR code LIKE ? OR title LIKE ? OR models LIKE ? OR tags LIKE ?)")
+            params += [like] * 5
+        if self.library_id:
+            where.append("EXISTS (SELECT 1 FROM outputs o WHERE o.video_id=videos.id AND o.library_id=?)")
+            params.append(self.library_id)
+        if self.status == "no_detail":
+            where.append("detail_at IS NULL AND status='active'")
+        elif self.status == "no_output":
+            where.append("status='active' AND NOT EXISTS "
+                         "(SELECT 1 FROM outputs o WHERE o.video_id=videos.id AND o.strm_path!='')")
+        elif self.status == "gone":
+            where.append("status='gone'")
+        elif self.status == "active":
+            where.append("status='active'")
+        active = "s.video_id=videos.id AND s.status='active'"
+        if self.has_site:
+            where.append(f"EXISTS (SELECT 1 FROM sources s WHERE {active} AND s.site IN ({marks(self.has_site)}))")
+        for site in self.lacks_site:
+            where.append("NOT EXISTS (SELECT 1 FROM sources s WHERE s.video_id=videos.id AND s.site=?)")
+            params.append(site)
+        n_active = f"(SELECT COUNT(*) FROM sources s WHERE {active})"
+        if self.sources == "single":
+            where.append(f"{n_active}=1")
+        elif self.sources == "multi":
+            where.append(f"{n_active}>=2")
+        elif self.sources == "none":
+            where.append(f"{n_active}=0")
+        elif self.sources == "failing":
+            where.append(f"EXISTS (SELECT 1 FROM sources s WHERE {active} AND s.fail_streak>0)")
+        if self.subtitle in ("zh", "en"):
+            where.append(f"EXISTS (SELECT 1 FROM sources s WHERE {active} AND s.subtitle=?)")
+            params.append(self.subtitle)
+        elif self.subtitle == "none":
+            where.append(f"NOT EXISTS (SELECT 1 FROM sources s WHERE {active} AND s.subtitle IN ('zh', 'en'))")
+        if self.uncensored is not None:
+            where.append("uncensored=?")
+            params.append(int(self.uncensored))
+        for col, values in (("models", self.models), ("categories", self.categories), ("tags", self.tags)):
+            if values:
+                where.append(f"EXISTS (SELECT 1 FROM json_each(videos.{col}) j "
+                             f"WHERE json_extract(j.value, '$.{FACET_FIELDS[col]}') IN ({marks(values)}))")
+        if self.makers:
+            where.append(f"maker IN ({marks(self.makers)})")
+        if self.quality:
+            where.append(f"quality IN ({marks(self.quality)})")
+        for cond, value in (("release_date!='' AND release_date>=?", self.release_from),
+                            ("release_date!='' AND release_date<=?", self.release_to),
+                            ("created_at>=?", self.added_from), ("created_at<=?", self.added_to),
+                            ("duration>=?", self.duration_min), ("duration<=?", self.duration_max)):
+            if value not in (None, ""):
+                where.append(cond)
+                params.append(value)
+        return " AND ".join(where), params
+
+    def order(self) -> str:
+        col = VIDEO_SORTS.get(self.sort, "id")
+        d = "DESC" if self.desc else "ASC"
+        if col == "id":
+            return f"id {d}"
+        # 没有值的（没抓详情、没日期）总排在最后
+        return f"({col} IS NULL OR {col}='') ASC, {col} {d}, id {d}"
 
 
 def now() -> int:
@@ -740,27 +850,11 @@ class Database:
     async def set_duration(self, video_id: int, duration: int) -> None:
         await self._write("UPDATE videos SET duration=? WHERE id=?", (duration, video_id))
 
-    async def search_videos(self, q: str = "", flt: str = "", offset: int = 0, limit: int = 50,
-                            library_id: int | None = None):
-        where, params = ["1=1"], []
-        if q:
-            like = f"%{q.strip()}%"
-            where.append("(slug LIKE ? OR code LIKE ? OR title LIKE ? OR models LIKE ? OR tags LIKE ?)")
-            params += [like] * 5
-        if library_id:
-            where.append("EXISTS (SELECT 1 FROM outputs o WHERE o.video_id=videos.id AND o.library_id=?)")
-            params.append(library_id)
-        if flt == "no_detail":
-            where.append("detail_at IS NULL AND status='active'")
-        elif flt == "no_output":
-            where.append("status='active' AND NOT EXISTS "
-                         "(SELECT 1 FROM outputs o WHERE o.video_id=videos.id AND o.strm_path!='')")
-        elif flt == "gone":
-            where.append("status='gone'")
-        cond = " AND ".join(where)
+    async def search_videos(self, query: VideoQuery, offset: int = 0, limit: int = 50):
+        cond, params = query.where()
         total = (await self._one(f"SELECT COUNT(*) AS n FROM videos WHERE {cond}", params))["n"]
         rows = await self._all(
-            f"SELECT * FROM videos WHERE {cond} ORDER BY id DESC LIMIT ? OFFSET ?", params + [limit, offset]
+            f"SELECT * FROM videos WHERE {cond} ORDER BY {query.order()} LIMIT ? OFFSET ?", params + [limit, offset]
         )
         return [_video_row(r) for r in rows], total
 
@@ -777,23 +871,32 @@ class Database:
             last = rows[-1]["id"]
 
     async def facets(self, limit: int = 300) -> dict:
-        """库里已有的分类、标签、女优及影片数，给规则编辑做候选。"""
-        out = {}
-        for field, key in (("categories", "slug"), ("tags", "slug"), ("models", "id")):
+        """库里已有的分类、标签、女优、发行商、画质及影片数，给规则编辑、影片库筛选做候选。"""
+        return {f: await self.facet(f, limit=limit) for f in (*FACET_FIELDS, "makers", "quality")}
+
+    async def facet(self, name: str, q: str = "", limit: int = 300) -> list[dict]:
+        """一种候选：[{item, name, n}]，按影片数排；q 按名称或 id 筛。"""
+        like = f"%{q.strip()}%"
+        if name in FACET_FIELDS:
+            key = FACET_FIELDS[name]
             # 别名不能叫 key：json_each 自带 key 列（数组下标），GROUP BY 会按它分组
             rows = await self._all(
                 f"""SELECT json_extract(j.value, '$.{key}') AS item, MAX(json_extract(j.value, '$.name')) AS name,
                            COUNT(*) AS n
-                    FROM videos v, json_each(v.{field}) j WHERE v.status='active'
-                    GROUP BY item ORDER BY n DESC LIMIT ?""",
-                (limit,),
+                    FROM videos v, json_each(v.{name}) j WHERE v.status='active'
+                    GROUP BY item HAVING ?='%%' OR item LIKE ? OR name LIKE ? ORDER BY n DESC LIMIT ?""",
+                (like, like, like, limit),
             )
-            out[field] = [dict(r) for r in rows]
-        rows = await self._all(
-            "SELECT quality AS name, COUNT(*) AS n FROM videos WHERE quality != '' GROUP BY quality ORDER BY n DESC"
-        )
-        out["quality"] = [dict(r) for r in rows]
-        return out
+        elif name in ("makers", "quality"):
+            col = "maker" if name == "makers" else "quality"
+            rows = await self._all(
+                f"""SELECT {col} AS item, {col} AS name, COUNT(*) AS n FROM videos
+                    WHERE status='active' AND {col}!='' AND {col} LIKE ? GROUP BY {col} ORDER BY n DESC LIMIT ?""",
+                (like, limit),
+            )
+        else:
+            raise ValueError(f"没有这种候选：{name}")
+        return [dict(r) for r in rows]
 
     async def video_stats(self) -> dict:
         row = await self._one(

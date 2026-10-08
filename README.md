@@ -94,8 +94,11 @@ docker compose up -d
 ```bash
 python -m venv .venv && . .venv/bin/activate      # Windows：.venv\Scripts\activate
 pip install -e ".[dev]"
+cd web && npm ci && npm run build && cd ..          # 编前端（Node 20.19+），产物写进 hls2strm/static/
 HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 ```
+
+前端没编时打开页面会提示先编前端；Docker 镜像里已经编好，不用管。
 
 ### 环境变量
 
@@ -298,7 +301,9 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 | POST | `/api/jobs` | 新建任务：`{"kind": "list\|videos\|backfill\|rewrite\|probe", "site": "jable", "library_id": 1, ...}` |
 | GET | `/api/jobs`、`/api/jobs/{id}/tasks?status=failed` | 任务列表、子任务列表 |
 | POST | `/api/jobs/{id}/pause\|resume\|cancel\|retry` | 控制任务 |
-| GET | `/api/videos?q=&filter=no_detail&library_id=&page=` | 影片库（每部影片带各个源、所在的库和 strm 路径） |
+| GET | `/api/videos?q=&filter=no_detail&library_id=&page=` | 影片库（每部影片带各个源、所在的库和 strm 路径）。还能按 `has_site`、`lacks_site`、`sources=single\|multi\|failing\|none`、`subtitle=zh\|en\|none`、`uncensored`、`model`、`category`、`tag`、`maker`、`quality`（列表参数可以重复，组内任一满足）、`release_from/to`、`added_from/to`、`duration_min/max` 筛，`sort=created\|release\|duration\|code\|views\|updated&order=asc\|desc` 排序 |
+| POST | `/api/videos/batch` | 批量：`{"action": "probe\|refresh\|add\|remove", "ids": [...], "library_id": 2}`；probe、refresh 排成任务，add、remove 当场改输出库 |
+| GET | `/api/facets?field=models\|categories\|tags\|makers\|quality&q=` | 库里已有的女优、分类等及影片数（筛选、规则的候选） |
 | GET / POST / PUT / DELETE | `/api/libraries`、`/api/libraries/{id}` | 输出库；DELETE 可带 `?delete_files=true` |
 | POST | `/api/libraries/{id}/locate` | 外部整理库：同步位置 |
 | GET / POST / PUT / DELETE | `/api/subscriptions`、`/api/subscriptions/{id}` | 订阅 |
@@ -317,7 +322,16 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 ```bash
 pip install -e ".[dev]"
 pytest
+
+cd web
+npm ci
+npm run dev        # 前端开发服务器（默认 http://localhost:5173），接口转给 127.0.0.1:8091，HLS2STRM_BACKEND 可改
+npm run build      # 类型检查并构建到 hls2strm/static/
 ```
+
+前端在 `web/`：Vite + React + TypeScript，Tailwind 和基于 Radix 的组件，数据用 TanStack Query 管。页面在 `web/src/pages/`，
+地址栏用 hash 路由（`#/videos?has_site=jable`），影片库的筛选条件都在地址里，可以收藏、分享。
+构建产物不进 git；Docker 镜像构建时先在 Node 阶段编前端，再放进 Python 包，最后还是一个容器、一个端口。
 
 代码结构（`hls2strm/`）：
 
@@ -331,6 +345,6 @@ pytest
 | `writer.py` | strm、nfo、封面输出 |
 | `play.py` | 挑源与故障切换、现场找源、播放地址缓存与换新、302 和中转 |
 | `db.py`、`config.py`、`observability.py` | 存储、设置、日志与指标 |
-| `api.py`、`static/` | Web 控制台 |
+| `api.py` | Web 控制台的 JSON 接口；页面本身在 `web/`，构建到 `static/` |
 
 测试用的页面样本在 `tests/fixtures/`。站点改版导致解析失败时，失败页面会被存到 `数据目录/snapshots/`，任务页的错误信息里有对应链接。

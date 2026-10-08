@@ -7,3 +7,6 @@ dist/
 .pytest_cache/
 .tmp/
 data/
+# 前端：依赖和构建产物（构建到 Python 包的 static/，镜像里现编）
+web/node_modules/
+hls2strm/static/

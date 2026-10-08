@@ -3,7 +3,8 @@ name: 构建镜像
 # 推送到默认分支：测试通过后构建 nightly（标签 nightly 和 nightly-<短 sha>）
 # 推送 v* tag：测试通过后构建 tag 同名版本，并更新 latest
 # 手动运行（workflow_dispatch）选其他分支：构建分支同名标签（/ 换成 -）和 dev-<短 sha>，不动 nightly、latest
-# PR：只跑测试
+# PR：只跑测试（Python 测试 + 前端类型检查和构建）
+# 镜像是单个容器：Dockerfile 里先编前端，产物放进 Python 包的 static/，由同一个服务提供
 on:
   push:
     branches: [master, main]
@@ -32,8 +33,25 @@ jobs:
       - name: 测试
         run: pytest -q
 
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+      - name: 类型检查并构建
+        run: npm run build
+
   image:
-    needs: test
+    needs: [test, web]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:

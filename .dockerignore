@@ -6,3 +6,6 @@ tests
 docs
 **/__pycache__
 *.egg-info
+web/node_modules
+hls2strm/static
+.github

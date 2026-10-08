@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import Depends, FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import api, play
@@ -25,12 +25,13 @@ log = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 
 
-class NoCacheStaticFiles(StaticFiles):
-    """前端文件每次都按 ETag 重新校验，升级后不会用到旧的 app.js。"""
+class FrontendFiles(StaticFiles):
+    """前端构建产物（web/ 构建到 static/）：assets/ 下的文件名带内容哈希，长期缓存；其他文件每次按 ETag 重新校验。"""
 
-    def file_response(self, *args, **kwargs):
-        resp = super().file_response(*args, **kwargs)
-        resp.headers["Cache-Control"] = "no-cache"
+    async def get_response(self, path: str, scope):
+        resp = await super().get_response(path, scope)
+        hashed = path.replace("\\", "/").startswith("assets/")
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable" if hashed else "no-cache"
         return resp
 
 
@@ -85,11 +86,15 @@ def create_app(boot: BootConfig | None = None) -> FastAPI:
     app = FastAPI(title="hls2strm", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.include_router(play.router)
     app.include_router(api.router)
-    app.mount("/static", NoCacheStaticFiles(directory=STATIC_DIR), name="static")
+    app.mount("/static", FrontendFiles(directory=STATIC_DIR, check_dir=False), name="static")
 
     @app.get("/", dependencies=[Depends(api.require_auth)], include_in_schema=False)
     async def index():
-        return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
+        page = STATIC_DIR / "index.html"
+        if not page.exists():
+            return PlainTextResponse("前端还没构建：在 web 目录执行 npm ci && npm run build（Docker 镜像里已经构建好）",
+                                     status_code=503)
+        return FileResponse(page, headers={"Cache-Control": "no-cache"})
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz():

@@ -13,14 +13,14 @@ import time
 from typing import Literal
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__
 from .config import Settings
-from .db import DEFAULT_LIBRARY_ID, source_cooldown
+from .db import DEFAULT_LIBRARY_ID, FACET_FIELDS, VIDEO_SORTS, VideoQuery, source_cooldown
 from .engine import snapshot_path
 from .fetcher import Blocked, FetchError, NotFound, ping_solver
 from .observability import get_level, ring, set_level
@@ -280,11 +280,44 @@ def _video_view(c, v: dict, sources: list[dict] | None = None, lines: dict[int, 
 
 
 @router.get("/videos")
-async def list_videos(request: Request, q: str = "", filter: str = "", page: int = 1, size: int = 50,
-                      library_id: int | None = None):
+async def list_videos(
+    request: Request,
+    q: str = "",
+    filter: Literal["", "active", "no_detail", "no_output", "gone"] = "",
+    library_id: int | None = None,
+    has_site: list[str] = Query([]),
+    lacks_site: list[str] = Query([]),
+    sources: Literal["", "single", "multi", "failing", "none"] = "",
+    subtitle: Literal["", "zh", "en", "none"] = "",
+    uncensored: bool | None = None,
+    model: list[str] = Query([]),
+    category: list[str] = Query([]),
+    tag: list[str] = Query([]),
+    maker: list[str] = Query([]),
+    quality: list[str] = Query([]),
+    release_from: str = "",
+    release_to: str = "",
+    added_from: int | None = None,
+    added_to: int | None = None,
+    duration_min: int | None = None,
+    duration_max: int | None = None,
+    sort: str = "created",
+    order: Literal["asc", "desc"] = "desc",
+    page: int = 1,
+    size: int = 50,
+):
+    """影片库：筛选条件见 VideoQuery；列表参数可以重复（has_site=jable&has_site=missav），组内任一满足。"""
     c = _ctx(request)
     size = max(1, min(size, 200))
-    items, total = await c.db.search_videos(q, filter, (max(page, 1) - 1) * size, size, library_id)
+    if sort not in VIDEO_SORTS:
+        raise HTTPException(422, f"不支持的排序：{sort}")
+    query = VideoQuery(
+        q=q, status=filter, library_id=library_id, has_site=has_site, lacks_site=lacks_site, sources=sources,
+        subtitle=subtitle, uncensored=uncensored, models=model, categories=category, tags=tag, makers=maker,
+        quality=quality, release_from=release_from, release_to=release_to, added_from=added_from,
+        added_to=added_to, duration_min=duration_min, duration_max=duration_max, sort=sort, desc=order == "desc",
+    )
+    items, total = await c.db.search_videos(query, (max(page, 1) - 1) * size, size)
     ids = [v["id"] for v in items]
     outputs = await c.db.outputs_for(ids)
     srcs = await c.db.sources_for(ids)
@@ -310,6 +343,30 @@ async def refresh_video(slug: str, request: Request):
     except (FetchError, ParseError) as err:
         raise HTTPException(502, str(err)) from None
     return await _full_view(c, v)
+
+
+class VideoBatch(BaseModel):
+    action: Literal["probe", "refresh", "add", "remove"]
+    ids: list[int] = Field(min_length=1, max_length=500)
+    library_id: int | None = None  # add / remove：哪个输出库
+
+
+@router.post("/videos/batch")
+async def videos_batch(body: VideoBatch, request: Request):
+    """影片库多选后的批量操作：probe、refresh 排成任务（按站点限速）；add、remove 当场改输出库。"""
+    e = _ctx(request).engine
+    try:
+        if body.action == "probe":
+            return {"job_id": await e.create_probe_videos(body.ids)}
+        if body.action == "refresh":
+            return {"job_id": await e.create_refresh(body.ids)}
+        if not body.library_id:
+            raise ValueError("要选一个输出库")
+        if body.action == "add":
+            return {"added": await e.add_to_library(body.ids, body.library_id)}
+        return {"removed": await e.remove_from_library(body.ids, body.library_id)}
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from None
 
 
 async def _full_view(c, v: dict) -> dict:
@@ -396,8 +453,15 @@ async def locate_library(lib_id: int, request: Request):
 
 
 @router.get("/facets")
-async def facets(request: Request):
-    return await _ctx(request).db.facets()
+async def facets(request: Request, field: str = "", q: str = "", limit: int = 300):
+    """库里已有的分类、标签、女优、发行商、画质及影片数；field 只取一种，q 按名称或 id 筛。"""
+    db = _ctx(request).db
+    limit = max(1, min(limit, 1000))
+    if not field:
+        return await db.facets(limit)
+    if field not in (*FACET_FIELDS, "makers", "quality"):
+        raise HTTPException(422, f"没有这种候选：{field}")
+    return await db.facet(field, q, limit)
 
 
 @router.delete("/libraries/{lib_id}")

@@ -582,6 +582,69 @@ class Engine:
         self.notify()
         return job_id
 
+    async def create_probe_videos(self, video_ids: list[int]) -> int:
+        """选中的影片排队补源：每部到每个启用、还没有它的源的站点找一次（不管之前查过没有），按站点限速执行。"""
+        cfg = self.store.current.sites
+        sites = [n for n in self.store.current.site_priority if cfg[n].enabled and SITES[n].can_lookup]
+        ids = list(dict.fromkeys(video_ids))
+        have = await self.db.sources_for(ids)
+        targets: dict[str, list[str]] = {}
+        for vid in ids:
+            got = {src["site"] for src in have.get(vid, [])}
+            for n in sites:
+                if n not in got:
+                    targets.setdefault(n, []).append(f"{n}:{vid}")
+        if not targets:
+            raise ValueError("选中的影片在启用的站点上都已经有源了")
+        name = f"补源：选中的 {len(ids)} 部 → " + "、".join(SITES[n].label for n in targets)
+        job_id = await self.db.create_job("probe", name, {"count": len(ids), "sites": list(targets)})
+        for n, t in targets.items():
+            await self.db.add_tasks(job_id, "probe", t, PRIORITY_USER, n)
+        log.info("新建任务 #%d「%s」", job_id, name)
+        self.notify()
+        return job_id
+
+    async def create_refresh(self, video_ids: list[int]) -> int:
+        """选中的影片重抓详情：每个可用源排一个详情子任务（按站点限速），不改影片所在的库。"""
+        cfg = self.store.current.sites
+        have = await self.db.sources_for(list(dict.fromkeys(video_ids)))
+        items = [(src["site"], src["key"]) for srcs in have.values() for src in srcs
+                 if src["status"] == "active" and src["site"] in cfg and cfg[src["site"]].enabled]
+        if not items:
+            raise ValueError("选中的影片没有可用的源")
+        return await self.create_videos(items, library_id=None,
+                                        name=f"刷新详情：选中的 {len(have)} 部（{len(items)} 个源）")
+
+    async def add_to_library(self, video_ids: list[int], library_id: int) -> int:
+        """选中的影片加入输出库（写 strm，有详情的带 nfo 和封面）。已在库里、在排除库里的跳过，返回新加入数。"""
+        lib = self._library(library_id)
+        added = 0
+        for vid in dict.fromkeys(video_ids):
+            v = await self.db.get_video_by_id(vid)
+            if v is None or v["status"] != "active" or await self.db.in_libraries(vid, lib["excludes"]):
+                continue
+            if await self.db.ensure_output(vid, library_id):
+                await self._output_one(v, library_id, cover=bool(v["detail_at"]))
+                added += 1
+        log.info("输出库「%s」：手动加入 %d 部", lib["name"], added)
+        return added
+
+    async def remove_from_library(self, video_ids: list[int], library_id: int) -> int:
+        """选中的影片移出输出库并删掉文件（外部整理库只删 strm）。规则库、来源库之后会按规则再把符合的加回来。"""
+        lib = self._library(library_id)
+        removed = 0
+        for vid in dict.fromkeys(video_ids):
+            out = await self.db.get_output(vid, library_id)
+            if out is None:
+                continue
+            if out["strm_path"]:
+                await asyncio.to_thread(self.writer.remove, Path(out["strm_path"]), self.keep_dirs(),
+                                        bool(lib["external_dir"]))
+            await self.db.delete_output(vid, library_id)
+            removed += 1
+        log.info("输出库「%s」：手动移出 %d 部", lib["name"], removed)
+        return removed
+
     async def refresh_video(self, slug: str) -> dict:
         """重抓作品每个可用源的详情；全部失败才报错（都下架时抛 NotFound）。"""
         v = await self.db.get_video(slug)
@@ -996,8 +1059,8 @@ class Engine:
         name: str = "",
         priority: int = PRIORITY_USER,
     ) -> int:
-        """抓指定影片的详情。items 是 [(站点, 站内 key)]。"""
-        items = list(dict.fromkeys((site, key.lower()) for site, key in items))
+        """抓指定影片的详情。items 是 [(站点, 站内 key)]（key 按站点的写法，有的站区分大小写）。"""
+        items = list(dict.fromkeys(items))
         if not items:
             raise ValueError("没有可抓取的影片")
         if library_id:

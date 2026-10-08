@@ -27,7 +27,8 @@ hls2strm = "hls2strm.__main__:main"
 include = ["hls2strm*"]
 
 [tool.setuptools.package-data]
-hls2strm = ["static/*", "static/vendor/*"]
+# static/ 是 web/ 的构建产物（npm run build），不进 git
+hls2strm = ["static/*", "static/assets/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

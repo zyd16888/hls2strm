@@ -1,3 +1,12 @@
+# 前端：在构建机本身的架构上编（产物是静态文件，和 CPU 架构无关，arm64 镜像不用走 QEMU）
+FROM --platform=$BUILDPLATFORM node:24-alpine AS web
+WORKDIR /src/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web/ ./
+# 输出到 /src/hls2strm/static（vite.config.ts 里的 outDir）
+RUN npm run build
+
 FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -18,6 +27,7 @@ COPY pyproject.toml README.md ./
 RUN mkdir hls2strm && touch hls2strm/__init__.py \
     && pip install . && pip uninstall -y hls2strm && rm -rf hls2strm
 COPY hls2strm ./hls2strm
+COPY --from=web /src/hls2strm/static ./hls2strm/static
 RUN pip install --no-deps . && mkdir -p /data /strm
 
 # 构建时注入版本号（CI 里是 git tag 或 nightly-<短 sha>），状态接口和页面上会显示

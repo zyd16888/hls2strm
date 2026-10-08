@@ -1,0 +1,142 @@
+@import "tailwindcss";
+@import "@fontsource/ibm-plex-sans/400.css";
+@import "@fontsource/ibm-plex-sans/500.css";
+@import "@fontsource/ibm-plex-sans/600.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/barlow-condensed/600.css";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* 颜色：浅色是冷灰底 + 树莓红强调；深色是墨蓝底。状态色和强调色分开（错误偏橙），不会把按钮看成报错 */
+:root {
+  --bg: #f3f5f8;
+  --panel: #ffffff;
+  --panel-2: #f7f8fa;
+  --ink: #1b2230;
+  --muted: #667085;
+  --line: #dde2ea;
+  --accent: #c2255c;
+  --accent-ink: #ffffff;
+  --accent-soft: #fbe7ef;
+  --ok: #2b8a3e;
+  --ok-soft: #e6f4ea;
+  --warn: #b86a12;
+  --warn-soft: #fdf1e2;
+  --err: #d9480f;
+  --err-soft: #fdebe3;
+  --info: #2f6fd0;
+  --info-soft: #e7f0fc;
+  color-scheme: light;
+}
+
+.dark {
+  --bg: #0f1420;
+  --panel: #161d2b;
+  --panel-2: #1c2435;
+  --ink: #e6eaf2;
+  --muted: #8b95a8;
+  --line: #273146;
+  --accent: #e2477c;
+  --accent-ink: #ffffff;
+  --accent-soft: #3a1c2a;
+  --ok: #5fcf78;
+  --ok-soft: #16301f;
+  --warn: #f0a23b;
+  --warn-soft: #36280f;
+  --err: #ff7849;
+  --err-soft: #3b1d13;
+  --info: #6ea8fe;
+  --info-soft: #172a47;
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-panel: var(--panel);
+  --color-panel-2: var(--panel-2);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-soft: var(--accent-soft);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-err: var(--err);
+  --color-err-soft: var(--err-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --font-sans: "IBM Plex Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --font-mono: "IBM Plex Mono", "Cascadia Mono", Consolas, "PingFang SC", "Microsoft YaHei", monospace;
+  /* 番号：窄体半粗，像录像带书脊上的标签 */
+  --font-code: "Barlow Condensed", "IBM Plex Sans", "Microsoft YaHei", sans-serif;
+}
+
+@layer base {
+  html {
+    font-size: 14px;
+  }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    font-variant-numeric: tabular-nums;
+  }
+  * {
+    border-color: var(--line);
+  }
+  ::selection {
+    background: var(--accent-soft);
+  }
+  input[type="checkbox"],
+  input[type="radio"] {
+    accent-color: var(--accent);
+    width: 15px;
+    height: 15px;
+  }
+  :focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+    outline-offset: 1px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  .code-label {
+    font-family: var(--font-code);
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+  }
+  .scroll-thin {
+    scrollbar-width: thin;
+  }
+}
+
+/* 弹层、抽屉的进出场：只在用户操作时出现 */
+@keyframes fade-in {
+  from { opacity: 0; }
+}
+@keyframes pop-in {
+  from { opacity: 0; transform: translate(-50%, -48%) scale(0.98); }
+}
+@keyframes slide-in-right {
+  from { transform: translateX(24px); opacity: 0; }
+}
+@keyframes slide-in-left {
+  from { transform: translateX(-24px); opacity: 0; }
+}
+.anim-fade { animation: fade-in 120ms ease-out; }
+.anim-pop { animation: pop-in 140ms ease-out; }
+.anim-right { animation: slide-in-right 180ms ease-out; }
+.anim-left { animation: slide-in-left 180ms ease-out; }
