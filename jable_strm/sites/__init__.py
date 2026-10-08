@@ -7,9 +7,11 @@ from ..errors import NotFound, VideoGone
 from .base import LineSpec, ListPage, Site, SourceDetail, SourceItem, Stream, StreamTraits
 from .jable import JableSite
 from .missav import MissAVSite
+from .javguru import JavGuruSite
+from .javmost import JavMostSite
 from .supjav import SupJavSite
 
-SITES: dict[str, Site] = {s.name: s for s in (JableSite(), MissAVSite(), SupJavSite())}
+SITES: dict[str, Site] = {s.name: s for s in (JableSite(), MissAVSite(), SupJavSite(), JavGuruSite(), JavMostSite())}
 
 
 def get_site(name: str) -> Site:

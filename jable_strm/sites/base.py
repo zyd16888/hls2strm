@@ -138,7 +138,7 @@ class Site:
 
     def line_traits(self, name: str, host: str = "") -> StreamTraits:
         """线路的播放特性：按解析时认出的播放站，没解析过按已知线路的默认播放站。"""
-        from ..hosts import HOST_TRAITS
+        from .hosts import HOST_TRAITS
 
         host = host or (self.line_specs.get(name).host if name in self.line_specs else "")
         return HOST_TRAITS.get(host, self.stream)

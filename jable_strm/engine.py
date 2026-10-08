@@ -470,7 +470,10 @@ class Engine:
         have = {s["site"] for s in await self.db.get_sources(v["id"])}
         for name in self.store.current.site_priority:
             if name not in have and cfg[name].enabled and SITES[name].can_lookup:
-                await self.probe_work(v["id"], name)
+                try:
+                    await self.probe_work(v["id"], name)
+                except (Blocked, FetchError, ParseError) as e:  # 一个站不通不影响去别的站找
+                    log.info("查找其他源 %s：%s 失败：%s", slug, SITES[name].label, e)
         return await self.db.get_video_by_id(v["id"])
 
     async def create_probe(self, site: str, library_id: int | None = None) -> int:

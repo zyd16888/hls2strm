@@ -308,3 +308,20 @@ M1 不加新站，只改结构，单独提交。这样即使后面的阶段有�
 - **实测**（本机）：Jable 老库从 v3 迁移到 v6 后 strm 不变、302 和中转都能播；MissAV 给 52 部 Jable 影片补源全部找到；
   禁用 Jable 后自动改用 MissAV 中转，ffprobe / ffmpeg（2025 版）能拉流；SupJav 用注入的 cookie 搜索、列表、详情都正常，
   FST / VOE / ST 的直链 302 和中转都能被 ffprobe 读出。没有 Byparr 环境，SupJav「解题 → 注入」这一步没有端到端实测。
+
+### 第二轮（站点 → 线路，JavGuru、JAVMost、nJAV）
+
+- **线路单独管理**：数据库 v7 的 source_lines 记每个源的线路（站点给的线路数据、认出的播放站、各自的直链缓存、
+  中转要带的 Referer、失败冷却）；设置里每条线路可调顺序、启用、强制中转；网关只用能 302、不绑出口、没强制中转的线路。
+- **嵌入播放站按页面内容识别**（sites/hosts.py），各站共用：VidHide / StreamHG、VOE、Streamtape、Vidara、LuluStream、
+  MaxStream、TurboVip、Dood、DooPlayer。
+- **SupJav**：ST 按用户实测改成不绑 IP（网关可用）；补上 VAS、LUC、TV；网关依次试 lk1 / lk2 / 根域名和 c= / l=。
+- **JavGuru**：curl_cffi 直接能抓。线路数据是 base64 的 /searcho/?{L}d={HEX}，倒过来请求 ?{L}r= 拿到 302。
+  用户说 JK 是直链：确实是 m3u8 直链（约 12 小时），但 MaxStream 的 CDN 要浏览器 TLS 指纹 + 浏览器 UA，
+  普通播放器 403，所以只能中转。SB、VO 能 302。AV 没做。
+- **JAVMost**：取嵌入页走 POST 接口（路径从页面脚本里取），服务器编号对应固定的播放站；分成多段的服务器跳过。
+  Dood 不认 JAVMost 当 Referer（"Video embed restricted"），不带 Referer 反而放行，取嵌入页时遇到这种情况自动重试。
+  TurboVid、PlayerSB 在本机代理下连不上，没实测。
+- **nJAV**：njavtv.com 是 MissAV 镜像，加进 MissAV 默认域名；njav.tv 已跳到 123av（单线路、只能中转），没接。
+- **实测**（本机）：JavGuru SB / VO 302，JK / LU / DD 中转；JAVMost DOO 302、DOOD 中转；SupJav AARM-370 的
+  ST / EVS / VOE 302、VAS / LUC 中转，都能被 ffprobe 读出。中转一个 1.7 GB 的 mp4 时中途断开，服务内存稳定在 73 MB。

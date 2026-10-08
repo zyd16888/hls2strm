@@ -1,6 +1,6 @@
 # jable-strm
 
-抓取 Jable、MissAV、SupJav 的影片列表和详情，生成 Emby / Jellyfin 可以直接播放的 `.strm`（附带 nfo 和封面），带 Web 控制台。
+抓取 Jable、MissAV、SupJav、JavGuru、JAVMost 的影片列表和详情，生成 Emby / Jellyfin 可以直接播放的 `.strm`（附带 nfo 和封面），带 Web 控制台。
 
 - **多站点、多源择优**：同一番号在不同站点的影片并成一部作品、一个 strm；播放时按字幕偏好、站点优先级挑源，挑中的源不能用自动换下一个，都不行时现场按番号去别的站找
 - **不用浏览器**：curl_cffi 模拟浏览器指纹，每个站点多个域名自动轮换（Jable 默认先走镜像 `fs1.app`，MissAV 走 `missav123.com` 等镜像）；可选接入 Byparr / FlareSolverr 兜底（SupJav 必须要）
@@ -33,7 +33,29 @@ Emby/Jellyfin ──►│ /play  ──► 缓存的播放地址够用？ ─�
 |---|---|---|---|
 | Jable | 镜像 `fs1.app` 直接抓，主站 `jable.tv` 备用 | 带签名，约 3 小时过期，不绑 IP | 302；ffmpeg 类客户端（UA 含 Lavf）中转 |
 | MissAV | 主域首页、列表被 CF 挑战，镜像 `missav123.com`、`missav.live` 直接抓 | `surrit.com/{uuid}/playlist.m3u8`，不过期 | **只能中转**：CDN 要 missav 的 Referer 和浏览器 TLS 指纹；分片 `video0.jpeg` 实际是 TS，中转时改名 `.ts` |
-| SupJav（默认不启用） | 整站在 CF 挑战后面，**要配解题服务**：解一次拿到 cookie，之后 curl_cffi 带同一个 UA 就能抓 | 线路 EVS / FST / VOE（HLS，4–36 小时过期）、ST（mp4，约 19 小时） | 302；直链绑出口 IP，网关 resolve 不用它 |
+| SupJav（默认不启用） | 整站在 CF 挑战后面，**要配解题服务**：解一次拿到 cookie，之后 curl_cffi 带同一个 UA 就能抓 | 多线路，见下表 | 按线路 |
+| JavGuru | 直接抓（挂在 CF 后面，目前不挑战） | 多线路，见下表 | 按线路 |
+| JAVMost | 直接抓 | 多线路，见下表；新片一般只有 DooPlayer | 按线路 |
+
+nJAV：`njavtv.com` 就是 MissAV 的镜像，已经加进 MissAV 的默认域名（老配置要在「设置 → 站点」里手动加上）；`njav.tv` 已经跳到 123av，只有一条只能中转的线路，没接。
+
+**线路**：多线路站点一部影片有好几个播放服务器，背后是不同的播放站（按页面内容识别，各站共用）：
+
+| 播放站 | 出现在 | 直链 | 播放 |
+|---|---|---|---|
+| Streamtape | SupJav ST | mp4，约 24 小时 | 302，网关也能用 |
+| VidHide / StreamHG | SupJav EVS、FST，JavGuru SB | m3u8，约 36 小时，带出口 ASN | 302（直链绑出口） |
+| VOE | SupJav VOE，JavGuru VO | m3u8，约 4 小时，带出口 IP 前两段 | 302（直链绑出口） |
+| DooPlayer | JAVMost DOO | mp4，有效期不明（按 2 小时换新） | 302（直链绑出口） |
+| MaxStream | JavGuru JK | m3u8（AES），约 12 小时 | 中转：CDN 只认浏览器 TLS 指纹和 UA |
+| LuluStream | SupJav LUC，JavGuru LU | m3u8（AES），约 8 小时 | 中转：同上 |
+| Vidara | SupJav VAS，JavGuru VI | m3u8，分片伪装成 .woff2 / .css | 中转（分片改名 .ts） |
+| TurboVip | SupJav TV | m3u8，分片带假 PNG 头 | 中转（剥掉假头） |
+| Dood | JavGuru DD，JAVMost DOOD | mp4，要 Referer | 中转 |
+
+「直链绑出口」是说地址里带了取地址时的出口 IP 或 ASN：和本服务同一个出口的播放器能 302，网关给外网客户端用不了。
+JavGuru 的 AV（JuicyCodes 混淆）、JAVMost 的 MostPlayer（CDN 封了非浏览器访问）、Fembed（已失效）暂不支持。
+
 
 - 作品 = 番号（+ 是否无码流出）。Jable 的 `ssis-001`、MissAV 的 `ssis-001-chinese-subtitle`、SupJav 的 `[中文字幕]SSIS-001` 是同一部作品的三个源；中字、英字是源的属性，无码流出 / 无码破解版算另一部作品（slug 加 `-u`）。
 - 番号匹配时统一写法：`fc2ppv-1066192`、`FC2-PPV-1066192` 是同一部；`ssis00001` 和 `SSIS-001` 是同一部。
@@ -138,7 +160,9 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
 - **现场找源**：已知的源都不能用、或者库里没有这部影片（比如别的工具生成的 strm）时，按番号到其他启用的站点找一次，找到就加成源再播。某个站最近查过没有的，「补源重查间隔」（默认 30 天）内不再查。
 - **补源任务**：「任务 → 补源」，选站点和输出库，逐部按番号去找备用源（每部一次请求；MissAV 页面上有中字版的话一并加上）。现有约 3.9 万部按每秒 1 次大约 11 小时。
 - **新片自动补源**：设置里「新片自动补源」填站点名（如 `missav`），列表任务、订阅收进新影片时顺手去这些站点找。
-- 影片库的详情里按播放顺序列出所有源，可以试播指定的源，也可以点「查找其他源」立即找一次。
+- 影片库的详情里按播放顺序列出所有源（多线路站点的源下面再列出各条线路），可以试播指定的源或线路，也可以点「查找其他源」立即找一次。
+- **线路**：「设置 → 站点」里每个多线路站点列出它的线路，可以调顺序、停用、强制中转。播放时按顺序找有新鲜直链的线路，
+  没有就逐条现取；取不到的线路进冷却、换下一条；全都不行时重抓一次详情（线路数据可能换了）再试。中转播到一半只认当前线路。
 - 中转：MissAV 的视频流量全部经过本服务（720p 每路约 2–3 Mbps）。
 
 ### 其他任务类型（「任务」页）
@@ -147,6 +171,8 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
   - Jable：分类 `/categories/x/`、标签 `/tags/x/`、女优 `/models/x/`、搜索 `/search/关键词/`、热门 `/hot/`
   - MissAV：`/cn/new`、`/cn/release`、`/cn/chinese-subtitle`、`/cn/uncensored-leak`、搜索 `/cn/search/关键词`、女优 `/cn/actresses/名字`、类型 `/cn/genres/名称`；每页 12 部，最多 2000 页
   - SupJav：`/zh/category/chinese-subtitles`、女优 `/zh/category/cast/xxx`、标签 `/zh/tag/xxx`、搜索 `/zh/search/关键词`
+  - JavGuru：最新 `/`、英文字幕 `/category/english-subbed`、无码破解 `/category/decensored`、女优 `/actress/xxx`、搜索 `/search/关键词`
+  - JAVMost：最新 `/category/all`、女优 `/star/名字`、发行商 `/maker/名称`、搜索 `/search/关键词`
   - 直接粘贴站点网址也行；同一番号已经在库里（别的站抓过）的只加一个源
 - **指定影片**：粘贴影片网址（按域名认站点）或站内 key（用所选站点），每行一个，加入所选的输出库
 - **补源**：见上一节
@@ -188,7 +214,7 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
 
 - 正常情况：返回 200 和 `{"slug", "url", "expires_at", "ttl", "duration"}`。
 - 不按客户端区分，一律返回 CDN 地址。网关传过来的 `ua`、`origin`、`fetch_mode` 只写进日志，方便排查。这样做的原因是：网关回退时会反代 Emby，Emby 再 302 到 strm 里的内网地址，外部客户端访问不到。
-- 只挑能让客户端直连的源（目前是 Jable）：MissAV 要中转，SupJav 的直链绑本服务的出口 IP，都不给网关。
+- 只挑能让客户端直连的源：Jable，以及多线路站点里能 302、直链不绑出口、没设强制中转的线路（目前是 SupJav 的 ST）。
 - 作品只有这类源时：设了「公网中转地址」就返回该地址下的中转链接（`{公网中转地址}/play/{slug}.m3u8?proxy=1`，需要本服务能从公网访问），没设返回 409。
 - 影片不存在：404；站点拦截中：503。
 
@@ -257,7 +283,7 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
 | GET / PUT | `/api/settings` | 读取或修改设置（PUT 只需要传改动的字段） |
 | POST | `/api/engine/pause\|resume`、`/api/fetcher/test\|reset?site=` | 引擎和抓取通道控制（不带 site 是全部站点） |
 | GET | `/api/logs/stream` | 实时日志（SSE） |
-| GET/HEAD | `/play/{slug}.m3u8` | strm 指向的播放入口（`?proxy=1` 强制中转，`?src=站点` 只用这个站点的源） |
+| GET/HEAD | `/play/{slug}.m3u8` | strm 指向的播放入口（`?proxy=1` 强制中转，`?src=站点` 只用这个站点的源，再加 `&line=线路` 只用这条线路） |
 
 ## 开发
 
@@ -271,7 +297,7 @@ pytest
 | 模块 | 职责 |
 |---|---|
 | `fetcher.py` | 分层抓取：每个站点一条通道（多域名轮换、冷却、自适应限速、拦截判定、Byparr/FlareSolverr），共用一个会话 |
-| `sites/` | 站点适配器：`jable.py`、`missav.py`、`supjav.py`，各自负责列表/详情地址、解析、按番号查找、取播放地址 |
+| `sites/` | 站点适配器：`jable.py`、`missav.py`、`supjav.py`、`javguru.py`、`javmost.py`，各自负责列表/详情地址、解析、按番号查找、线路、取播放地址；`hosts.py` 是各站共用的嵌入播放站解析 |
 | `codes.py` | 番号规范化和跨站匹配键 |
 | `parser.py`、`sources.py` | Jable 的列表页和详情页解析、列表地址规范化、分页 URL 构造 |
 | `engine.py` | 持久化队列、worker、重试策略、暂停/恢复、定时增量 |

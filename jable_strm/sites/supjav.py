@@ -18,7 +18,7 @@ from selectolax.lexbor import LexborHTMLParser
 
 from ..codes import code_key
 from ..errors import FetchError, ParseError
-from ..hosts import HostStream, resolve_embed
+from .hosts import HostStream, resolve_embed
 from .base import LineSpec, ListPage, Site, SourceDetail, SourceItem, StreamTraits
 
 if TYPE_CHECKING:

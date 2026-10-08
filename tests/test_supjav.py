@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 
 from jable_strm.fetcher import FetchError, Page
@@ -11,10 +12,14 @@ SUPJAV = SITES["supjav"]
 
 
 class Resp:
-    def __init__(self, status=200, text="", headers=None):
+    def __init__(self, status=200, text="", headers=None, url=""):
         self.status_code = status
         self.text = text
         self.headers = headers or {}
+        self.url = url  # 空串：调用方当作没跳转，用请求的地址
+
+    def json(self):
+        return json.loads(self.text)
 
 
 class FakeHttp:
@@ -23,9 +28,11 @@ class FakeHttp:
     def __init__(self, routes: dict[str, Resp]) -> None:
         self.routes = routes
         self.calls: list[tuple[str, str]] = []
+        self.bodies: list = []
 
-    async def fetch(self, url, *, headers=None, allow_redirects=True, method="GET", json=None):
+    async def fetch(self, url, *, headers=None, allow_redirects=True, method="GET", json=None, data=None):
         self.calls.append((url, (headers or {}).get("Referer", "")))
+        self.bodies.append(json or data)
         for prefix, resp in self.routes.items():
             if url.startswith(prefix):
                 return resp
@@ -127,7 +134,7 @@ def test_fst_hls2():
 
 def test_lines_order_failover_and_gateway(make_store):
     """多线路：按设置的顺序试，失败的进冷却换下一条；网关只拿不绑 IP、没强制中转的线路；中转剥假 PNG 头。"""
-    from jable_strm.hosts import HostStream, ts_start
+    from jable_strm.sites.hosts import HostStream, ts_start
     from jable_strm.observability import Metrics
     from jable_strm.play import NoDirectSource, Resolver
     from jable_strm.sites import SourceDetail

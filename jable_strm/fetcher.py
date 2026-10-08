@@ -276,10 +276,10 @@ class Fetcher:
     # ---- 站外请求：CDN、封面、播放器页 ----
 
     async def fetch(self, url: str, *, headers: dict | None = None, allow_redirects: bool = True,
-                    method: str = "GET", json: dict | None = None):
+                    method: str = "GET", json: dict | None = None, data: dict | None = None):
         """站外请求（网关、播放站等），返回原始响应；网络错误转成 FetchError。"""
         try:
-            return await self.session.request(method, url, headers=headers or None, json=json,
+            return await self.session.request(method, url, headers=headers or None, json=json, data=data,
                                               allow_redirects=allow_redirects,
                                               timeout=self.store.current.request_timeout)
         except Exception as e:

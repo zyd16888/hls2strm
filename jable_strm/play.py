@@ -27,7 +27,7 @@ from .db import Database, source_cooldown
 from .fetcher import Blocked, FetchError, Fetcher, NotFound
 from .observability import Metrics
 from .parser import ParseError, VideoGone
-from .hosts import ts_start
+from .sites.hosts import ts_start
 from .sites import SITES, Site, SourceDetail, StreamTraits, find_by_code, get_site
 
 log = logging.getLogger(__name__)
@@ -59,6 +59,8 @@ class Resolved:
         if self.line is None:
             return self.site.stream
         t = self.site.line_traits(self.line["line"], self.line["host"])
+        if self.line.get("referer"):
+            t = replace(t, headers={**t.headers, "Referer": self.line["referer"]})
         return replace(t, direct=False) if self.proxy_forced else t
 
     @property
@@ -348,7 +350,7 @@ class Resolver:
                         errors.append(f"{ln['line']}：{e}")
                         log.info("%s %s 线路 %s 取直链失败：%s", site.label, src["key"], ln["line"], e)
                         continue
-                    await self.db.set_line_stream(ln["id"], hs.url, hs.expires, hs.host)
+                    await self.db.set_line_stream(ln["id"], hs.url, hs.expires, hs.host, hs.referer)
                     self.metrics.inc("play_refresh")
                     return await self._resolved(v, src["id"], site, ln["id"])
                 if refreshed:

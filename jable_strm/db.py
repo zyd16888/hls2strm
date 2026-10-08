@@ -278,6 +278,7 @@ async def _migrate_v7(conn: aiosqlite.Connection) -> None:
           line TEXT NOT NULL,
           link TEXT NOT NULL DEFAULT '',
           host TEXT NOT NULL DEFAULT '',
+          referer TEXT NOT NULL DEFAULT '',
           stream_url TEXT NOT NULL DEFAULT '',
           stream_expires INTEGER,
           fail_streak INTEGER NOT NULL DEFAULT 0,
@@ -595,14 +596,14 @@ class Database:
             out.setdefault(r["source_id"], []).append(dict(r))
         return out
 
-    async def set_line_stream(self, line_id: int, url: str, expires: int | None, host: str) -> None:
-        """线路取到直链：记下直链，并设成这个源当前在用的线路。"""
+    async def set_line_stream(self, line_id: int, url: str, expires: int | None, host: str, referer: str = "") -> None:
+        """线路取到直链：记下直链（和中转时要带的 Referer），并设成这个源当前在用的线路。"""
         t = now()
         async with self._tx():
             await self.conn.execute(
-                """UPDATE source_lines SET stream_url=?, stream_expires=?, host=?, fail_streak=0, last_ok_at=?,
-                          last_error='', updated_at=? WHERE id=?""",
-                (url, expires, host, t, t, line_id),
+                """UPDATE source_lines SET stream_url=?, stream_expires=?, host=?, referer=?, fail_streak=0,
+                          last_ok_at=?, last_error='', updated_at=? WHERE id=?""",
+                (url, expires, host, referer, t, t, line_id),
             )
             await self.conn.execute(
                 """UPDATE sources SET stream_url=?, stream_expires=?, line=(SELECT line FROM source_lines WHERE id=?),

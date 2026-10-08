@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "jable-strm"
 version = "0.1.0"
-description = "抓取 Jable、MissAV、SupJav 影片并生成 Emby/Jellyfin 可用的 strm，多源择优，带 Web 控制台"
+description = "抓取 Jable、MissAV、SupJav、JavGuru、JAVMost 影片并生成 Emby/Jellyfin 可用的 strm，多源择优，带 Web 控制台"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

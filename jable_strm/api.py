@@ -227,7 +227,7 @@ async def snapshot(name: str, request: Request):
 
 
 def _line_view(c, site, ln: dict) -> dict:
-    from .hosts import HOST_LABELS
+    from .sites.hosts import HOST_LABELS
 
     cfg = c.store.current.site(site.name).line(ln["line"])
     t = site.line_traits(ln["line"], ln["host"])
@@ -631,7 +631,7 @@ async def put_settings(patch: dict, request: Request):
 
 
 def _line_specs(site) -> list[dict]:
-    from .hosts import HOST_LABELS, HOST_TRAITS
+    from .sites.hosts import HOST_LABELS, HOST_TRAITS
 
     out = []
     for name, spec in site.line_specs.items():

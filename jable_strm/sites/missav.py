@@ -104,7 +104,7 @@ def _person(name: str) -> str:
 class MissAVSite(Site):
     name = "missav"
     label = "MissAV"
-    default_domains = ["https://missav123.com", "https://missav.live", "https://missav.ws"]
+    default_domains = ["https://missav123.com", "https://missav.live", "https://njavtv.com", "https://missav.ws"]
     stream = StreamTraits(direct=False, expires=False, headers={"Referer": "https://missav.ws/"},
                           disguised_segments=True)
     sorts = {
