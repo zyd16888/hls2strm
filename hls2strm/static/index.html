@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Jable STRM</title>
+<title>hls2strm</title>
 <link rel="stylesheet" href="/static/app.css">
 <script src="/static/app.js"></script>
 <script defer src="/static/vendor/alpine.min.js"></script>
@@ -11,7 +11,7 @@
 <body x-data="app()" x-init="init()" x-cloak>
 
 <header>
-  <div class="brand">Jable STRM <span class="small muted" style="font-weight:400" x-text="s.version || ''"></span></div>
+  <div class="brand">hls2strm <span class="small muted" style="font-weight:400" x-text="s.version || ''"></span></div>
   <nav>
     <template x-for="t in tabs" :key="t.id">
       <a href="#" :class="{active: tab === t.id}" @click.prevent="go(t.id)" x-text="t.name"></a>

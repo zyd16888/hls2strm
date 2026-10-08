@@ -1,6 +1,7 @@
-# jable-strm
+# hls2strm
 
-抓取 Jable、MissAV、SupJav、JavGuru、JAVMost 的影片列表和详情，生成 Emby / Jellyfin 可以直接播放的 `.strm`（附带 nfo 和封面），带 Web 控制台。
+把在线视频站（目前支持 Jable、MissAV、SupJav、JavGuru、JAVMost）的影片抓成 Emby / Jellyfin 可以直接播放的 `.strm`（附带 nfo 和封面），带 Web 控制台。
+strm 里写的是本服务的地址，播放时才去现取直链：同一部影片可以挂多个站点、多条线路的源，哪个不能用就自动换下一个。
 
 - **多站点、多源择优**：同一番号在不同站点的影片并成一部作品、一个 strm；播放时按字幕偏好、站点优先级挑源，挑中的源不能用自动换下一个，都不行时现场按番号去别的站找
 - **不用浏览器**：curl_cffi 模拟浏览器指纹，每个站点多个域名自动轮换（Jable 默认先走镜像 `fs1.app`，MissAV 走 `missav123.com` 等镜像）；可选接入 Byparr / FlareSolverr 兜底（SupJav 必须要）
@@ -14,18 +15,16 @@
 ```
 strm 内容：http://<服务地址>/play/IPZZ-983.m3u8
                  │
-Emby/Jellyfin ──►│ /play  ──► 缓存的播放地址够用？ ──否──► 现抓详情页换新地址
-                 │                     │
-                 │   普通播放器：302 ──► mushroomtrack CDN
-                 │   ffmpeg 类客户端：本服务中转 m3u8 和分片
+Emby/Jellyfin ──►│ /play ──► 按字幕偏好、站点优先级挑一个源（多线路站点再按线路顺序挑一条线路）
+                 │             │ 缓存的直链够用就直接用，不够就去站点现取；取不到换下一个源 / 线路
+                 │             ▼
+                 │   播放器能直连的：302 到 CDN
+                 │   要 Referer、浏览器指纹或者分片伪装过的：本服务中转 m3u8 和分片
 ```
 
-几个实测得到的事实决定了这个设计：
-
-1. 详情页里的 `hlsUrl` 带签名和过期时间戳，**约 3 小时失效**，所以 strm 不能直接写 CDN 地址。
-2. 播放地址**不绑 IP**，可以 302 让播放器直连 CDN。
-3. CDN **拒绝 User-Agent 含 `Lavf`（ffmpeg 默认 UA）或 `python-requests` 的请求**。Emby/Jellyfin 服务端用 ffmpeg 探测和转封装，所以这类请求会自动改由本服务中转；其余客户端照常 302。中转时分片遇到 403 会自动换新地址重试，看到一半地址过期也不会断。
-4. 列表页使用 KVS 的异步块接口（`?mode=async&function=get_block…`），每页 24 部。最新更新约 1641 页，约 3.9 万部。
+- 直链大多带签名和过期时间（几小时到一两天），所以 strm 不直接写 CDN 地址，而是写本服务的 `/play/{作品}.m3u8`。
+- 同一番号在不同站点的影片并成一部作品、一个 strm；元数据以优先级最高的站点为准，其他站补空字段。
+- 抓取列表、详情都不用浏览器：curl_cffi 模拟浏览器指纹，每个站点多个域名轮换；被 Cloudflare 拦住时可以接解题服务。
 
 ## 支持的站点
 
@@ -36,6 +35,14 @@ Emby/Jellyfin ──►│ /play  ──► 缓存的播放地址够用？ ─�
 | SupJav（默认不启用） | 整站在 CF 挑战后面，**要配解题服务**：解一次拿到 cookie，之后 curl_cffi 带同一个 UA 就能抓 | 多线路，见下表 | 按线路 |
 | JavGuru | 直接抓（挂在 CF 后面，目前不挑战） | 多线路，见下表 | 按线路 |
 | JAVMost | 直接抓 | 多线路，见下表；新片一般只有 DooPlayer | 按线路 |
+
+Jable 的几个实测事实决定了最初的设计：
+
+1. 详情页里的 `hlsUrl` 带签名和过期时间戳，约 3 小时失效，所以 strm 不能直接写 CDN 地址。
+2. 播放地址不绑 IP，可以 302 让播放器直连 CDN。
+3. CDN 拒绝 User-Agent 含 `Lavf`（ffmpeg 默认 UA）或 `python-requests` 的请求。Emby/Jellyfin 服务端用 ffmpeg 探测和转封装，
+   所以这类请求会自动改由本服务中转；其余客户端照常 302。中转时分片遇到 403 会自动换新地址重试，播到一半地址过期也不会断。
+4. 列表页使用 KVS 的异步块接口（`?mode=async&function=get_block…`），每页 24 部。最新更新约 1641 页，约 3.9 万部。
 
 nJAV：`njavtv.com` 就是 MissAV 的镜像，已经加进 MissAV 的默认域名（老配置要在「设置 → 站点」里手动加上）；`njav.tv` 已经跳到 123av，只有一条只能中转的线路，没接。
 
@@ -75,7 +82,7 @@ GitHub Actions 会自动构建镜像并推送到 ghcr.io，同时提供 amd64 �
 页面顶栏和 `/api/status` 里的 `version` 会显示当前镜像的版本。第一次推送后，镜像包默认是私有的：可以在 GitHub 的 Packages 设置里改成公开，或者在服务器上先 `docker login ghcr.io`。
 
 ```bash
-# 先改 docker-compose.yml 里的镜像名、JABLE_UI_PASSWORD、JABLE_PUBLIC_BASE_URL 和 strm 输出目录
+# 先改 docker-compose.yml 里的 HLS2STRM_UI_PASSWORD、HLS2STRM_PUBLIC_BASE_URL 和 strm 输出目录
 docker compose up -d
 # 需要兜底解题服务时：docker compose --profile solver up -d
 ```
@@ -87,21 +94,24 @@ docker compose up -d
 ```bash
 python -m venv .venv && . .venv/bin/activate      # Windows：.venv\Scripts\activate
 pip install -e ".[dev]"
-JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
+HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 ```
 
 ### 环境变量
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `JABLE_DATA_DIR` | `data` | 数据库、日志、快照目录 |
-| `JABLE_HOST` / `JABLE_PORT` | `0.0.0.0` / `8080` | 监听地址 |
-| `JABLE_UI_USER` / `JABLE_UI_PASSWORD` | `admin` / 空 | Web 控制台的 Basic 认证；密码为空则不认证（启动日志会提示） |
-| `JABLE_OUTPUT_DIR` | `数据目录/strm` | strm 输出目录（设置页可覆盖） |
-| `JABLE_PUBLIC_BASE_URL` | `http://127.0.0.1:端口` | 写进 strm 的服务地址（设置页可覆盖） |
-| `JABLE_LOG_LEVEL` | `INFO` | 日志级别 |
+| `HLS2STRM_DATA_DIR` | `data` | 数据库、日志、快照目录 |
+| `HLS2STRM_HOST` / `HLS2STRM_PORT` | `0.0.0.0` / `8080` | 监听地址 |
+| `HLS2STRM_UI_USER` / `HLS2STRM_UI_PASSWORD` | `admin` / 空 | Web 控制台的 Basic 认证；密码为空则不认证（启动日志会提示） |
+| `HLS2STRM_OUTPUT_DIR` | `数据目录/strm` | strm 输出目录（设置页可覆盖） |
+| `HLS2STRM_PUBLIC_BASE_URL` | `http://127.0.0.1:端口` | 写进 strm 的服务地址（设置页可覆盖） |
+| `HLS2STRM_LOG_LEVEL` | `INFO` | 日志级别 |
 
 其余设置都在 Web「设置」页修改，保存在数据库里。
+
+从 jable-strm 升级：改名前的 `JABLE_*` 环境变量照样认（同时设了新旧两个名字时以旧名字为准，镜像里的默认值用的是新名字）；
+数据目录里已有的 `jable.db` 接着用，不会改名，新装的叫 `hls2strm.db`。
 
 ## 使用流程
 
@@ -308,7 +318,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-代码结构（`jable_strm/`）：
+代码结构（`hls2strm/`）：
 
 | 模块 | 职责 |
 |---|---|

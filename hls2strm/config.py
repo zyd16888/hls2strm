@@ -13,6 +13,13 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from .sites import SITES
 
 
+def env(name: str, default: str = "") -> str:
+    """环境变量 HLS2STRM_{name}；改名前的 JABLE_{name} 也认，而且优先：
+    镜像里用新名字设了默认值，老部署在 compose 里显式写的旧名字不能被默认值盖掉。"""
+    old = os.environ.get(f"JABLE_{name}")
+    return old if old is not None else os.environ.get(f"HLS2STRM_{name}", default)
+
+
 class BootConfig(BaseModel):
     """进程启动时就要确定、运行中不能改的配置。"""
 
@@ -28,17 +35,16 @@ class BootConfig(BaseModel):
 
     @classmethod
     def from_env(cls) -> BootConfig:
-        env = os.environ.get
-        port = int(env("JABLE_PORT", "8080"))
+        port = int(env("PORT", "8080"))
         return cls(
-            data_dir=Path(env("JABLE_DATA_DIR", "data")).resolve(),
-            host=env("JABLE_HOST", "0.0.0.0"),
+            data_dir=Path(env("DATA_DIR", "data")).resolve(),
+            host=env("HOST", "0.0.0.0"),
             port=port,
-            ui_user=env("JABLE_UI_USER", "admin"),
-            ui_password=env("JABLE_UI_PASSWORD", ""),
-            log_level=env("JABLE_LOG_LEVEL", "INFO").upper(),
-            default_output_dir=env("JABLE_OUTPUT_DIR", ""),
-            default_public_base_url=env("JABLE_PUBLIC_BASE_URL", f"http://127.0.0.1:{port}"),
+            ui_user=env("UI_USER", "admin"),
+            ui_password=env("UI_PASSWORD", ""),
+            log_level=env("LOG_LEVEL", "INFO").upper(),
+            default_output_dir=env("OUTPUT_DIR", ""),
+            default_public_base_url=env("PUBLIC_BASE_URL", f"http://127.0.0.1:{port}"),
         )
 
 
@@ -136,7 +142,7 @@ class Settings(BaseModel):
     )
     # 输出
     output_dir: str = Field(
-        "", description="输出根目录，各输出库的相对目录都在它下面；留空使用 JABLE_OUTPUT_DIR 或 数据目录/strm"
+        "", description="输出根目录，各输出库的相对目录都在它下面；留空使用 HLS2STRM_OUTPUT_DIR 或 数据目录/strm"
     )
     path_template: str = Field(
         "{slug}/{slug}",
@@ -146,7 +152,7 @@ class Settings(BaseModel):
     download_cover: bool = Field(True, description="下载封面 fanart")
     poster_crop: bool = Field(True, description="从封面裁出竖版 poster")
     # 播放
-    public_base_url: str = Field("", description="Emby/Jellyfin 访问本服务的地址，写进 strm；留空使用 JABLE_PUBLIC_BASE_URL")
+    public_base_url: str = Field("", description="Emby/Jellyfin 访问本服务的地址，写进 strm；留空使用 HLS2STRM_PUBLIC_BASE_URL")
     play_mode: Literal["redirect", "proxy", "direct"] = Field(
         "redirect",
         description="redirect：302 到 CDN；proxy：本服务中转视频流；direct：strm 直接写 CDN 地址（约 3 小时失效，仅调试）",

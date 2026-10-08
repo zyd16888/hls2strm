@@ -3,8 +3,8 @@ import time
 
 import pytest
 
-from jable_strm.fetcher import Blocked, Fetcher, FetchError, NotFound, RateLimiter, split_proxy
-from jable_strm.observability import Metrics
+from hls2strm.fetcher import Blocked, Fetcher, FetchError, NotFound, RateLimiter, split_proxy
+from hls2strm.observability import Metrics
 
 
 class Resp:

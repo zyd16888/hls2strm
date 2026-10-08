@@ -2,15 +2,15 @@ import logging
 
 from fastapi.testclient import TestClient
 
-from jable_strm.app import create_app
-from jable_strm.config import BootConfig
+from hls2strm.app import create_app
+from hls2strm.config import BootConfig
 
 from .conftest import FakeFetcher
 from .test_engine import model_fixture
 
 
 def test_play_and_resolve(tmp_path):
-    app = create_app(BootConfig(data_dir=tmp_path, default_public_base_url="http://jable-strm:8080"))
+    app = create_app(BootConfig(data_dir=tmp_path, default_public_base_url="http://hls2strm:8080"))
     try:
         with TestClient(app) as c:
             html, ids = model_fixture()

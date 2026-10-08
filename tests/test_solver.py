@@ -6,8 +6,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from jable_strm.fetcher import Fetcher, ping_solver
-from jable_strm.observability import Metrics
+from hls2strm.fetcher import Fetcher, ping_solver
+from hls2strm.observability import Metrics
 
 
 def serve(routes: dict) -> tuple[str, HTTPServer]:

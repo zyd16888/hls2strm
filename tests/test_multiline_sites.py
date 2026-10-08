@@ -1,9 +1,9 @@
 import asyncio
 import json
 
-from jable_strm.sites import SITES
-from jable_strm.sites.hosts import detect, resolve_embed
-from jable_strm.sites.javguru import parse_title
+from hls2strm.sites import SITES
+from hls2strm.sites.hosts import detect, resolve_embed
+from hls2strm.sites.javguru import parse_title
 
 from .conftest import fixture
 from .test_supjav import FakeHttp, FakeSiteFetcher, Resp

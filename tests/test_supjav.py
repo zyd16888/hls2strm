@@ -2,9 +2,9 @@ import asyncio
 import json
 import time
 
-from jable_strm.fetcher import FetchError, Page
-from jable_strm.sites import SITES
-from jable_strm.sites.supjav import GATEWAY, parse_title
+from hls2strm.fetcher import FetchError, Page
+from hls2strm.sites import SITES
+from hls2strm.sites.supjav import GATEWAY, parse_title
 
 from .conftest import fixture
 
@@ -134,10 +134,10 @@ def test_fst_hls2():
 
 def test_lines_order_failover_and_gateway(make_store):
     """多线路：按设置的顺序试，失败的进冷却换下一条；网关只拿不绑 IP、没强制中转的线路；中转剥假 PNG 头。"""
-    from jable_strm.sites.hosts import HostStream, ts_start
-    from jable_strm.observability import Metrics
-    from jable_strm.play import NoDirectSource, Resolver
-    from jable_strm.sites import SourceDetail
+    from hls2strm.sites.hosts import HostStream, ts_start
+    from hls2strm.observability import Metrics
+    from hls2strm.play import NoDirectSource, Resolver
+    from hls2strm.sites import SourceDetail
 
     async def run():
         db, store = await make_store()

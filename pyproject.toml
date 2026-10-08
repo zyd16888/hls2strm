@@ -3,7 +3,7 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "jable-strm"
+name = "hls2strm"
 version = "0.1.0"
 description = "抓取 Jable、MissAV、SupJav、JavGuru、JAVMost 影片并生成 Emby/Jellyfin 可用的 strm，多源择优，带 Web 控制台"
 readme = "README.md"
@@ -21,13 +21,13 @@ dependencies = [
 dev = ["pytest>=8", "httpx>=0.27"]
 
 [project.scripts]
-jable-strm = "jable_strm.__main__:main"
+hls2strm = "hls2strm.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["jable_strm*"]
+include = ["hls2strm*"]
 
 [tool.setuptools.package-data]
-jable_strm = ["static/*", "static/vendor/*"]
+hls2strm = ["static/*", "static/vendor/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

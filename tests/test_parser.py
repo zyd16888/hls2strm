@@ -1,6 +1,6 @@
 import pytest
 
-from jable_strm.parser import (
+from hls2strm.parser import (
     ParseError,
     VideoGone,
     hls_expires,
@@ -12,7 +12,7 @@ from jable_strm.parser import (
     slug_from_url,
     split_code,
 )
-from jable_strm.sources import normalize_source, page_url
+from hls2strm.sources import normalize_source, page_url
 
 from .conftest import fixture
 

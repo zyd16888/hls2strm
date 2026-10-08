@@ -4,7 +4,7 @@ import os
 
 from PIL import Image
 
-from jable_strm.writer import OutputWriter, build_nfo, crop_poster, sanitize
+from hls2strm.writer import OutputWriter, build_nfo, crop_poster, sanitize
 
 from .conftest import FakeFetcher, jpeg
 
@@ -56,7 +56,7 @@ def test_write_and_move(make_store):
         keep = frozenset({w.library_root(lib)})
         strm = w.write(VIDEO, lib)
         assert strm == store.output_dir / "全部" / "IPZZ-983" / "IPZZ-983.strm"
-        assert strm.read_text().strip() == "http://jable-strm:8080/play/ipzz-983.m3u8"
+        assert strm.read_text().strip() == "http://hls2strm:8080/play/ipzz-983.m3u8"
         assert (strm.parent / "IPZZ-983.nfo").exists()
         assert await w.write_cover(FakeFetcher("", {}), VIDEO, strm)
         assert (strm.parent / "IPZZ-983-poster.jpg").exists()

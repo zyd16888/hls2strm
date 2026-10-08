@@ -39,7 +39,7 @@ def require_auth(request: Request, cred: HTTPBasicCredentials | None = Depends(_
         secrets.compare_digest(cred.username.encode(), boot.ui_user.encode())
         and secrets.compare_digest(cred.password.encode(), boot.ui_password.encode())
     ):
-        raise HTTPException(401, "需要登录", headers={"WWW-Authenticate": 'Basic realm="jable-strm"'})
+        raise HTTPException(401, "需要登录", headers={"WWW-Authenticate": 'Basic realm="hls2strm"'})
 
 
 router = APIRouter(prefix="/api", dependencies=[Depends(require_auth)])

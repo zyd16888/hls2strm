@@ -46,6 +46,12 @@ class Context:
     engine: Engine
 
 
+def database_path(data_dir: Path) -> Path:
+    """数据库文件：新装用 hls2strm.db；改名前的数据目录里已经有 jable.db 的接着用它（不改名，换回旧镜像也认得）。"""
+    old, new = data_dir / "jable.db", data_dir / "hls2strm.db"
+    return old if old.exists() and not new.exists() else new
+
+
 def create_app(boot: BootConfig | None = None) -> FastAPI:
     boot = boot or BootConfig.from_env()
     boot.data_dir.mkdir(parents=True, exist_ok=True)
@@ -54,7 +60,7 @@ def create_app(boot: BootConfig | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         ring.bind_loop(asyncio.get_running_loop())
-        db = Database(boot.data_dir / "jable.db")
+        db = Database(database_path(boot.data_dir))
         await db.open()
         store = SettingsStore(boot, db)
         await store.load()
@@ -66,7 +72,7 @@ def create_app(boot: BootConfig | None = None) -> FastAPI:
         app.state.ctx = Context(boot, db, store, metrics, fetcher, writer, resolver, engine)
         log.info("启动：数据目录 %s，输出目录 %s，对外地址 %s", boot.data_dir, store.output_dir, store.public_base_url)
         if not boot.ui_password:
-            log.warning("未设置 JABLE_UI_PASSWORD，Web 控制台没有登录保护")
+            log.warning("未设置 HLS2STRM_UI_PASSWORD，Web 控制台没有登录保护")
         await engine.start()
         try:
             yield
@@ -76,7 +82,7 @@ def create_app(boot: BootConfig | None = None) -> FastAPI:
             await db.close()
             log.info("已退出")
 
-    app = FastAPI(title="jable-strm", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="hls2strm", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.include_router(play.router)
     app.include_router(api.router)
     app.mount("/static", NoCacheStaticFiles(directory=STATIC_DIR), name="static")

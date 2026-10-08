@@ -3,9 +3,9 @@ import json
 
 import aiosqlite
 
-from jable_strm.codes import code_key, work_slug
-from jable_strm.config import Settings, migrate_settings
-from jable_strm.db import MIGRATIONS, Database
+from hls2strm.codes import code_key, work_slug
+from hls2strm.config import Settings, migrate_settings
+from hls2strm.db import MIGRATIONS, Database
 
 
 def test_code_key():
@@ -70,7 +70,7 @@ def test_migrate_v5_to_v6(boot):
 
 def test_sources_merge_by_code(make_store):
     """不同站点的同一番号并成一部作品；元数据以优先级高的站点为准，其他站只补空字段。"""
-    from jable_strm.sites import SourceDetail, SourceItem
+    from hls2strm.sites import SourceDetail, SourceItem
 
     async def run():
         db, store = await make_store()
@@ -109,7 +109,7 @@ def test_sources_merge_by_code(make_store):
 
 def test_close_stream_aborts_transfer():
     """curl_cffi 的 aclose() 只等传输结束；关之前要先设 quit_now，不然会把整个文件下完。"""
-    from jable_strm.play import close_stream
+    from hls2strm.play import close_stream
 
     class Resp:
         def __init__(self):
@@ -122,3 +122,22 @@ def test_close_stream_aborts_transfer():
     r = Resp()
     asyncio.run(close_stream(r))
     assert r.closed_after_quit is True
+
+
+def test_env_names_and_database_file(tmp_path, monkeypatch):
+    """改名 hls2strm：环境变量用 HLS2STRM_*，旧的 JABLE_* 也认且优先（镜像里的默认值不能盖掉老部署显式写的）；
+    数据目录里已有 jable.db 就接着用。"""
+    from hls2strm.app import database_path
+    from hls2strm.config import BootConfig
+
+    monkeypatch.setenv("HLS2STRM_PORT", "9000")
+    monkeypatch.setenv("HLS2STRM_UI_PASSWORD", "new")
+    monkeypatch.setenv("JABLE_UI_PASSWORD", "old")
+    boot = BootConfig.from_env()
+    assert boot.port == 9000 and boot.ui_password == "old"
+
+    assert database_path(tmp_path).name == "hls2strm.db"
+    (tmp_path / "jable.db").write_bytes(b"")
+    assert database_path(tmp_path).name == "jable.db"
+    (tmp_path / "hls2strm.db").write_bytes(b"")
+    assert database_path(tmp_path).name == "hls2strm.db"

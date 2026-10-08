@@ -1,17 +1,17 @@
 services:
-  jable-strm:
-    image: ghcr.io/<你的 GitHub 用户名>/<仓库名>:nightly   # 或 :latest、:v0.2.0；本地构建把这行换成 build: .
-    container_name: jable-strm
+  hls2strm:
+    image: ghcr.io/zyd16888/hls2strm:nightly   # 或 :latest、:v0.2.0；本地构建把这行换成 build: .
+    container_name: hls2strm
     restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
-      JABLE_UI_PASSWORD: "change-me"                     # Web 控制台密码，用户名默认 admin（JABLE_UI_USER）
-      JABLE_PUBLIC_BASE_URL: "http://192.168.1.10:8080"  # Emby/Jellyfin 访问本服务的地址，会写进 strm
+      HLS2STRM_UI_PASSWORD: "change-me"                     # Web 控制台密码，用户名默认 admin（HLS2STRM_UI_USER）
+      HLS2STRM_PUBLIC_BASE_URL: "http://192.168.1.10:8080"  # Emby/Jellyfin 访问本服务的地址，会写进 strm
       TZ: Asia/Shanghai
     volumes:
       - ./data:/data              # 数据库、日志、解析失败快照
-      - /srv/media/jable:/strm    # strm 输出目录；Emby/Jellyfin 挂载同一个宿主机目录
+      - /srv/media/hls2strm:/strm # strm 输出目录；Emby/Jellyfin 挂载同一个宿主机目录
     # user: "1000:1000"           # 需要和媒体服务器保持同一属主时打开
 
   # 可选：所有域名都被 Cloudflare 拦截时的兜底解题服务。

@@ -1,12 +1,12 @@
 import asyncio
 
-from jable_strm.engine import Engine
-from jable_strm.fetcher import NotFound
-from jable_strm.observability import Metrics
-from jable_strm.play import Resolver, _decode_x, _upstream, Resolved, rewrite_playlist
-from jable_strm.sites import SITES
-from jable_strm.sites.missav import split_variant
-from jable_strm.writer import OutputWriter
+from hls2strm.engine import Engine
+from hls2strm.fetcher import NotFound
+from hls2strm.observability import Metrics
+from hls2strm.play import Resolver, _decode_x, _upstream, Resolved, rewrite_playlist
+from hls2strm.sites import SITES
+from hls2strm.sites.missav import split_variant
+from hls2strm.writer import OutputWriter
 
 from .conftest import FakeFetcher, fixture
 from .test_engine import model_fixture, wait_job
@@ -110,7 +110,7 @@ def test_probe_failover_and_discover(make_store, boot):
         assert (await db.find_source("jable", "ipzz-983"))["status"] == "gone"
         assert (await db.get_video("ipzz-983"))["status"] == "active"
         # 网关只要能直连的源：只剩 MissAV（要中转）时报 NoDirectSource
-        from jable_strm.play import NoDirectSource
+        from hls2strm.play import NoDirectSource
         try:
             await resolver.resolve("ipzz-983", direct_only=True)
             raise AssertionError("应当没有能直连的源")

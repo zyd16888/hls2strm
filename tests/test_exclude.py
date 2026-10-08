@@ -2,9 +2,9 @@ import asyncio
 
 import pytest
 
-from jable_strm.engine import Engine
-from jable_strm.observability import Metrics
-from jable_strm.writer import OutputWriter
+from hls2strm.engine import Engine
+from hls2strm.observability import Metrics
+from hls2strm.writer import OutputWriter
 
 from .conftest import FakeFetcher, fixture
 from .test_engine import model_fixture, wait_job

@@ -3,12 +3,12 @@ import time
 
 import pytest
 
-from jable_strm.engine import Engine
-from jable_strm.fetcher import Blocked, FetchError
-from jable_strm.observability import Metrics
-from jable_strm.parser import parse_list
-from jable_strm.play import Resolver
-from jable_strm.writer import OutputWriter
+from hls2strm.engine import Engine
+from hls2strm.fetcher import Blocked, FetchError
+from hls2strm.observability import Metrics
+from hls2strm.parser import parse_list
+from hls2strm.play import Resolver
+from hls2strm.writer import OutputWriter
 
 from .conftest import FakeFetcher, fixture
 
@@ -53,7 +53,7 @@ def test_list_job_writes_strm_nfo_and_covers(make_store, boot):
         assert stats["total"] == 24 and stats["with_detail"] == 24 and stats["with_strm"] == 24 and stats["with_cover"] == 24
         for slug in ids:
             d = store.output_dir / "全部" / slug.upper()
-            assert (d / f"{slug.upper()}.strm").read_text().strip() == f"http://jable-strm:8080/play/{slug}.m3u8"
+            assert (d / f"{slug.upper()}.strm").read_text().strip() == f"http://hls2strm:8080/play/{slug}.m3u8"
             assert (d / f"{slug.upper()}.nfo").exists()
             assert (d / f"{slug.upper()}-poster.jpg").exists()
         # 列表请求走异步块接口
@@ -240,7 +240,7 @@ def test_migrate_v1_database(boot):
     import json
     import sqlite3
 
-    from jable_strm.db import MIGRATIONS, SCHEMA_V1, Database
+    from hls2strm.db import MIGRATIONS, SCHEMA_V1, Database
 
     path = boot.data_dir / "old.db"
     conn = sqlite3.connect(path)

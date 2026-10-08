@@ -7,9 +7,9 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from jable_strm.config import BootConfig, SettingsStore
-from jable_strm.db import Database
-from jable_strm.fetcher import NotFound, Page
+from hls2strm.config import BootConfig, SettingsStore
+from hls2strm.db import Database
+from hls2strm.fetcher import NotFound, Page
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -83,7 +83,7 @@ class FakeSite:
 
 @pytest.fixture
 def boot(tmp_path) -> BootConfig:
-    return BootConfig(data_dir=tmp_path, default_public_base_url="http://jable-strm:8080")
+    return BootConfig(data_dir=tmp_path, default_public_base_url="http://hls2strm:8080")
 
 
 @pytest.fixture

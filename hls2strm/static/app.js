@@ -1,4 +1,4 @@
-// Jable STRM 控制台（Alpine.js）
+// hls2strm 控制台（Alpine.js）
 
 const KIND_NAMES = {
   list: "列表页", detail: "详情页", rewrite: "重写输出", purge: "删除库", reclassify: "重新归库",

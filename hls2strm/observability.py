@@ -36,7 +36,7 @@ class RingHandler(logging.Handler):
                 "id": next(self._ids),
                 "ts": record.created,
                 "level": record.levelname,
-                "name": record.name.removeprefix("jable_strm."),
+                "name": record.name.removeprefix("hls2strm."),
                 "msg": msg,
             }
             self.records.append(item)
@@ -74,7 +74,7 @@ def setup_logging(data_dir: Path, level: str = "INFO") -> None:
     fmt = logging.Formatter(LOG_FORMAT)
     stdout = logging.StreamHandler(sys.stdout)
     stdout.setFormatter(fmt)
-    file = RotatingFileHandler(log_dir / "jable-strm.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    file = RotatingFileHandler(log_dir / "hls2strm.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
     file.setFormatter(fmt)
 
     root = logging.getLogger()
@@ -82,7 +82,7 @@ def setup_logging(data_dir: Path, level: str = "INFO") -> None:
     root.setLevel(logging.WARNING)
     for h in (stdout, file, ring):
         root.addHandler(h)
-    logging.getLogger("jable_strm").setLevel(level)
+    logging.getLogger("hls2strm").setLevel(level)
     for name in ("uvicorn", "uvicorn.error"):
         logging.getLogger(name).setLevel(logging.INFO)
 
