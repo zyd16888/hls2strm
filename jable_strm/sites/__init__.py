@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from ..codes import code_key
 from ..errors import NotFound, VideoGone
-from .base import ListPage, Site, SourceDetail, SourceItem, Stream, StreamTraits
+from .base import LineSpec, ListPage, Site, SourceDetail, SourceItem, Stream, StreamTraits
 from .jable import JableSite
 from .missav import MissAVSite
 from .supjav import SupJavSite
@@ -39,5 +39,5 @@ async def find_by_code(site: Site, sf, code: str, uncensored: bool = False) -> l
     return out
 
 
-__all__ = ["SITES", "ListPage", "Site", "SourceDetail", "SourceItem", "Stream", "StreamTraits", "find_by_code",
-           "get_site"]
+__all__ = ["SITES", "LineSpec", "ListPage", "Site", "SourceDetail", "SourceItem", "Stream", "StreamTraits",
+           "find_by_code", "get_site"]

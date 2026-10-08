@@ -3,36 +3,30 @@
 - 解一次拿到 cf_clearance，连同解题服务的 UA 一起注入 curl_cffi 会话就能一直抓（UA 必须一致，TLS 指纹不影响）。
 - 详情页 /zh/{数字 id}.html；番号只能搜索 /zh/?s=番号（FC2 只搜数字）。标题前缀标出版本：
   [中文字幕]、[英文字幕]、[无码破解]、[4K]。
-- 播放：详情页的线路按钮 a.btn-server[data-link] → 网关 lk1.supremejav.com/supjav.php?c={倒序的 data-link}
-  （要 Referer: https://supjav.com/，302 到播放站）→ 在播放站页面里解出直链（播放站要 Referer: lk1.supremejav.com）。
-  EVS、FST：packer 解包取 hls2（签名 m3u8，s + e 秒后过期）；VOE：跳转页 → 混淆的 JSON 解码取 source；
-  ST（streamtape）：robotlink 拼出 get_video（302 到 mp4）。
-  直链带出口 IP / ASN，和本服务同一出口的播放器能 302；网关给外网客户端用不了。VAS、LUC 只能中转，暂不支持。
+- 线路：详情页的线路按钮 a.btn-server[data-link] → 网关 lk1.supremejav.com/supjav.php?c={倒序的 data-link}
+  （要 Referer: https://supjav.com/，302 到播放站）→ 播放站（要 Referer: lk1.supremejav.com）解出直链，见 hosts.py。
+  线路名对应的播放站：EVS、FST = VidHide 一系，VOE，ST = Streamtape，VAS = Vidara，LUC = LuluStream；TV 没见过。
 """
 
 from __future__ import annotations
 
-import base64
-import codecs
-import json
 import re
-import time
 from typing import TYPE_CHECKING
-from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from selectolax.lexbor import LexborHTMLParser
 
 from ..codes import code_key
 from ..errors import FetchError, ParseError
-from .base import ListPage, Site, SourceDetail, SourceItem, Stream, StreamTraits
-from .missav import unpack
+from ..hosts import HostStream, resolve_embed
+from .base import LineSpec, ListPage, Site, SourceDetail, SourceItem, StreamTraits
 
 if TYPE_CHECKING:
     from ..fetcher import Fetcher, SiteFetcher
 
-GATEWAY = "https://lk1.supremejav.com/supjav.php?c="
+GATEWAYS = ("https://lk1.supremejav.com", "https://lk2.supremejav.com", "https://supremejav.com")
+GATEWAY = GATEWAYS[0] + "/supjav.php?c="
 GATEWAY_REFERER = "https://lk1.supremejav.com/"
-SERVER_ORDER = ("EVS", "FST", "VOE", "ST")  # 都能 302；VAS、LUC 只能中转，没做
 _KEY_RE = re.compile(r"/(?:(?:zh|ja|en)/)?(\d+)\.html")
 _TAGS_RE = re.compile(r"^\s*((?:\[[^\]]*\]\s*)+)")
 _FC2_RE = re.compile(r"^FC2[\s-]*(?:PPV)?[\s-]*(\d{5,9})", re.I)
@@ -40,13 +34,6 @@ _CODE_RE = re.compile(r"^([A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-\d+)(?=\s|$|[^\w-])")
 _HEYZO_RE = re.compile(r"^(HEYZO)[\s-]*(\d+)", re.I)
 _DATE_CODE_RE = re.compile(r"(?<!\d)(\d{6}[-_]\d{2,3})(?!\d)")
 _PAGE_RE = re.compile(r"/page/(\d+)")
-_HLS2_RE = re.compile(r'"?hls2"?\s*:\s*"([^"]+)"')
-_VOE_JUMP_RE = re.compile(r"window\.location\.href\s*=\s*'([^']+)'")
-_VOE_JSON_RE = re.compile(r'<script type="application/json">\s*(\[.*?\])\s*</script>', re.S)
-_ST_RE = re.compile(
-    r"getElementById\(\s*['\"]robotlink['\"]\s*\)\.innerHTML\s*=\s*['\"]([^'\"]*)['\"]\s*\+\s*(?:['\"]{2}\s*\+\s*)?"
-    r"\(?\s*['\"]([^'\"]*)['\"]\s*\)?((?:\.substring\(\s*\d+\s*\))+)"
-)
 
 
 def parse_title(title: str) -> tuple[str, str, bool]:
@@ -70,36 +57,22 @@ def parse_title(title: str) -> tuple[str, str, bool]:
     return code, subtitle, uncensored
 
 
-def _expires(url: str, default_ttl: int) -> int:
-    """EVS / FST / VOE 的地址里有 s（签发时间）和 e（有效秒数）；streamtape 有 expires。"""
-    q = parse_qs(urlsplit(url).query)
-    if "expires" in q and q["expires"][0].isdigit():
-        return int(q["expires"][0])
-    if q.get("s", [""])[0].isdigit() and q.get("e", [""])[0].isdigit():
-        return int(q["s"][0]) + int(q["e"][0])
-    return int(time.time()) + default_ttl
-
-
-def decode_voe(html: str) -> dict:
-    """VOE 页面里混淆的 JSON：rot13 → 去掉干扰符号 → base64 → 每个字符减 3 → 倒序 → base64。"""
-    m = _VOE_JSON_RE.search(html)
-    if not m:
-        raise ParseError("VOE 页面里没有播放数据")
-    s = codecs.decode(json.loads(m.group(1))[0], "rot13")
-    for junk in ("@$", "^^", "~@", "%?", "*~", "!!", "#&"):
-        s = s.replace(junk, "")
-    s = base64.b64decode(s + "=" * (-len(s) % 4)).decode("latin-1")
-    s = "".join(chr(ord(c) - 3) for c in s)[::-1]
-    return json.loads(base64.b64decode(s + "=" * (-len(s) % 4)).decode("utf-8"))
-
-
 class SupJavSite(Site):
     name = "supjav"
     label = "SupJav"
-    default_domains = ["https://supjav.com"]
+    default_domains = ["https://supjav.com", "https://supjav.net", "https://supjav.org"]
     default_enabled = False  # 整站要过 CF 挑战，配好解题服务再启用
     lookup_verified = True
     stream = StreamTraits(direct=True, expires=True, ip_bound=True)
+    line_specs = {
+        "ST": LineSpec("streamtape", "mp4，约 24 小时，播放器能直连"),
+        "EVS": LineSpec("vidhide", "m3u8，约 36 小时，带出口 ASN"),
+        "FST": LineSpec("vidhide", "老片常见，m3u8，约 36 小时，带出口 ASN"),
+        "VOE": LineSpec("voe", "m3u8，约 4 小时，带出口 IP 前两段"),
+        "VAS": LineSpec("vidara", "分片伪装成 .woff2，只能中转"),
+        "LUC": LineSpec("lulustream", "CDN 只认浏览器，只能中转；1080p"),
+        "TV": LineSpec("turbovip", "TurboVip，分片带假 PNG 头，只能中转"),
+    }
     sorts = {"": "最新", "views": "最多观看", "day": "今日热门", "week": "本周热门", "month": "本月热门"}
     presets = [
         {"name": "有码", "source": "/zh/category/censored-jav", "sort": ""},
@@ -177,7 +150,7 @@ class SupJavSite(Site):
         h1 = doc.css_first("div.archive-title h1")
         title = (h1.text(strip=True) if h1 else "") or (meta.css_first("h2").text(strip=True)
                                                         if meta and meta.css_first("h2") else "")
-        servers = [[a.text(strip=True).upper(), a.attributes.get("data-link") or ""]
+        servers = [(a.text(strip=True).upper(), a.attributes.get("data-link") or "")
                    for a in doc.css("a.btn-server[data-link]")]
         if meta is None or not servers:
             raise ParseError("详情页没有播放线路")
@@ -198,7 +171,7 @@ class SupJavSite(Site):
         return SourceDetail(
             key=key, code=code or f"SUPJAV-{key}", title=title, site_vid=key, subtitle=subtitle, uncensored=uncensored,
             cover_url=(img.attributes.get("src") or "") if img else "", models=models, categories=categories,
-            tags=tags, maker=maker, extra={"servers": servers},
+            tags=tags, maker=maker, lines=[(n, link) for n, link in servers if n and link],
         )
 
     async def lookup(self, sf: SiteFetcher, code: str, uncensored: bool = False) -> list[SourceItem]:
@@ -211,55 +184,21 @@ class SupJavSite(Site):
         return [it for it in self.parse_list(page.html).items
                 if code_key(it.code) == ck and it.uncensored == uncensored]
 
-    async def fetch_stream(self, sf: SiteFetcher, key: str) -> Stream:
-        d = await self.fetch_detail(sf, key, priority=True)
-        servers = d.extra.get("servers") or []
-        errors = []
-        for want in SERVER_ORDER:
-            for name, link in servers:
-                if name != want or not link:
-                    continue
-                try:
-                    url, expires = await self._server_stream(sf.parent, name, link)
-                except (FetchError, ParseError, ValueError, KeyError) as e:
-                    errors.append(f"{name}：{e}")
-                    continue
-                return Stream(url, expires, d)
-        names = "、".join(n for n, _ in servers) or "无"
-        raise FetchError("；".join(errors) if errors else f"没有支持的线路（页面上的线路：{names}）")
+    async def resolve_line(self, http: Fetcher, name: str, link: str) -> HostStream:
+        """线路按钮的 data-link → 网关（倒序后放进 c=，302 到播放站）→ 播放站解出直链。
 
-    async def _server_stream(self, http: Fetcher, name: str, link: str) -> tuple[str, int]:
-        resp = await http.fetch(GATEWAY + link[::-1], headers={"Referer": "https://supjav.com/"},
-                                allow_redirects=False)
-        embed = (resp.headers.get("location") or "").split("#", 1)[0]
-        if resp.status_code not in (301, 302, 303, 307) or not embed:
-            raise FetchError(f"网关没有跳转到播放站（HTTP {resp.status_code}）")
-        page = await http.fetch(embed, headers={"Referer": GATEWAY_REFERER})
-        if page.status_code != 200:
-            raise FetchError(f"播放站返回 HTTP {page.status_code}")
-        html = page.text
-        if name in ("EVS", "FST"):
-            for js in unpack(html):
-                if m := _HLS2_RE.search(js):
-                    url = urljoin(embed, m.group(1).replace("\\/", "/"))
-                    return url, _expires(url, 36 * 3600)
-            raise ParseError("播放站页面里没有 hls2 地址")
-        if name == "VOE":
-            if "application/json" not in html and (m := _VOE_JUMP_RE.search(html)):
-                page = await http.fetch(m.group(1), headers={"Referer": GATEWAY_REFERER})
-                html = page.text
-            data = decode_voe(html)
-            url = data.get("source") or ""
-            if not url:
-                raise ParseError("VOE 播放数据里没有 source")
-            return url, _expires(url, 4 * 3600)
-        if name == "ST":
-            m = _ST_RE.search(html)
-            if not m:
-                raise ParseError("streamtape 页面里没有 robotlink")
-            prefix, suffix, ops = m.groups()
-            for n in re.findall(r"substring\(\s*(\d+)\s*\)", ops):
-                suffix = suffix[int(n):]
-            url = "https:" + prefix + suffix + "&stream=1"
-            return url, _expires(url, 12 * 3600)
-        raise ValueError(f"不支持的线路 {name}")
+        网关有几个域名，也认 l=（不倒序）；依次试，第一个跳转到播放站的为准。
+        """
+        status = 0
+        for param in (f"c={link[::-1]}", f"l={link}"):
+            for gw in GATEWAYS:
+                try:
+                    resp = await http.fetch(f"{gw}/supjav.php?{param}", headers={"Referer": "https://supjav.com/"},
+                                            allow_redirects=False)
+                except FetchError:
+                    continue
+                status = resp.status_code
+                embed = (resp.headers.get("location") or "").split("#", 1)[0]
+                if status in (301, 302, 303, 307) and embed:
+                    return await resolve_embed(http, embed, gw + "/", name)
+        raise FetchError(f"网关没有跳转到播放站（HTTP {status}），线路数据可能已失效")

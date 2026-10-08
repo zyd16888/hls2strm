@@ -58,7 +58,7 @@ class SourceDetail:
     director: str = ""
     series: str = ""
     variants: list[str] = field(default_factory=list)  # 同一部片在本站其他版本的 key（中字、无码流出等）
-    extra: dict = field(default_factory=dict)  # 站点私有数据（比如 SupJav 的播放线路）
+    lines: list[tuple[str, str]] = field(default_factory=list)  # 多线路站点：[(线路名, 取直链要用的数据)]
 
 
 @dataclass
@@ -69,6 +69,20 @@ class StreamTraits:
     disguised_segments: bool = False  # 分片伪装成图片（video0.jpeg），中转时改名 .ts
     ip_bound: bool = False  # 直链绑了取地址时的出口 IP：和本服务同一出口的播放器能 302，网关（外网客户端）不行
     ua_block: bool = False  # CDN 拒绝 ffmpeg 默认 UA（Lavf）等，这类客户端改走中转（设置里的「中转 UA 片段」）
+    fake_header: bool = False  # 分片前面加了假文件头（比如 PNG），中转时从第一个 TS 同步字节开始转发
+
+
+@dataclass
+class LineSpec:
+    """多线路站点上一条已知线路：背后是哪个播放站、默认特性。"""
+
+    host: str  # hosts.py 里的播放站类型；空串表示还不支持
+    note: str = ""
+    default_enabled: bool = True
+
+    @property
+    def supported(self) -> bool:
+        return bool(self.host)
 
 
 @dataclass
@@ -84,6 +98,7 @@ class Site:
     default_domains: list[str] = []
     default_enabled = True
     lookup_verified = False  # lookup 返回的结果已经按番号核对过（搜索结果），不用再抓详情确认
+    line_specs: dict[str, LineSpec] = {}  # 多线路站点的已知线路（按默认优先顺序）；单线路站点为空
     stream = StreamTraits()
     sorts: dict[str, str] = {}
     presets: list[dict] = []
@@ -116,6 +131,21 @@ class Site:
     def variant_of(self, key: str) -> tuple[str, bool]:
         """从站内 key 看出的 (字幕, 是否无码流出)；看不出返回 ('', False)。"""
         return "", False
+
+    @property
+    def multi_line(self) -> bool:
+        return bool(self.line_specs)
+
+    def line_traits(self, name: str, host: str = "") -> StreamTraits:
+        """线路的播放特性：按解析时认出的播放站，没解析过按已知线路的默认播放站。"""
+        from ..hosts import HOST_TRAITS
+
+        host = host or (self.line_specs.get(name).host if name in self.line_specs else "")
+        return HOST_TRAITS.get(host, self.stream)
+
+    async def resolve_line(self, http, name: str, link: str):
+        """多线路站点：按详情页给的线路数据取直链，返回 hosts.HostStream。"""
+        raise NotImplementedError
 
     @property
     def can_lookup(self) -> bool:

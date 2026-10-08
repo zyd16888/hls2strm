@@ -226,25 +226,44 @@ async def snapshot(name: str, request: Request):
 # ---- 影片 ----
 
 
-def _source_view(c, src: dict) -> dict:
+def _line_view(c, site, ln: dict) -> dict:
+    from .hosts import HOST_LABELS
+
+    cfg = c.store.current.site(site.name).line(ln["line"])
+    t = site.line_traits(ln["line"], ln["host"])
+    spec = site.line_specs.get(ln["line"])
+    return {**ln, "host_label": HOST_LABELS.get(ln["host"] or (spec.host if spec else ""), ln["host"]),
+            "enabled": cfg.enabled, "supported": spec is None or spec.supported,
+            "direct": t.direct and not cfg.proxy, "ip_bound": t.ip_bound, "expires_stream": t.expires,
+            "cooldown_until": source_cooldown(ln)}
+
+
+def _source_view(c, src: dict, lines: list[dict] | None = None) -> dict:
     site = SITES.get(src["site"])
     out = dict(src)
     out["label"] = site.label if site else src["site"]
     out["direct"] = bool(site and site.stream.direct)
     out["expires_stream"] = bool(site and site.stream.expires)
     out["cooldown_until"] = source_cooldown(src)
+    if site and site.multi_line:
+        cfg = c.store.current.site(site.name)
+        out["lines"] = sorted((_line_view(c, site, ln) for ln in lines or []),
+                              key=lambda ln: (not ln["enabled"], cfg.line_rank(ln["line"])))
+        traits = site.line_traits(src["line"]) if src["line"] else None
+        if traits is not None:
+            out["direct"], out["expires_stream"] = traits.direct, traits.expires
     if site:
         domains = c.store.current.site(src["site"]).domains or site.default_domains
         out["page_url"] = domains[0] + site.detail_path(src["key"]) if domains else ""
     return out
 
 
-def _video_view(c, v: dict, sources: list[dict] | None = None) -> dict:
+def _video_view(c, v: dict, sources: list[dict] | None = None, lines: dict[int, list[dict]] | None = None) -> dict:
     v = dict(v)
     v["play_url"] = c.writer.play_url(v)
     ranked = c.resolver.rank(sources or [])
     order = {s["id"]: i for i, s in enumerate(ranked)}
-    v["sources"] = sorted((_source_view(c, s) for s in sources or []),
+    v["sources"] = sorted((_source_view(c, s, (lines or {}).get(s["id"])) for s in sources or []),
                           key=lambda s: (order.get(s["id"], len(order)), s["id"]))
     for s in v["sources"]:
         s["rank"] = order.get(s["id"])
@@ -260,9 +279,10 @@ async def list_videos(request: Request, q: str = "", filter: str = "", page: int
     ids = [v["id"] for v in items]
     outputs = await c.db.outputs_for(ids)
     srcs = await c.db.sources_for(ids)
+    lines = await c.db.lines_for([s["id"] for ss in srcs.values() for s in ss])
     views = []
     for v in items:
-        view = _video_view(c, v, srcs.get(v["id"], []))
+        view = _video_view(c, v, srcs.get(v["id"], []), lines)
         view["outputs"] = outputs.get(v["id"], [])
         views.append(view)
     return {"items": views, "total": total, "page": page, "size": size}
@@ -280,7 +300,12 @@ async def refresh_video(slug: str, request: Request):
         raise HTTPException(503, str(err)) from None
     except (FetchError, ParseError) as err:
         raise HTTPException(502, str(err)) from None
-    view = _video_view(c, v, await c.db.get_sources(v["id"]))
+    return await _full_view(c, v)
+
+
+async def _full_view(c, v: dict) -> dict:
+    sources = await c.db.get_sources(v["id"])
+    view = _video_view(c, v, sources, await c.db.lines_for([s["id"] for s in sources]))
     view["outputs"] = await c.db.get_outputs(v["id"])
     return view
 
@@ -297,9 +322,7 @@ async def probe_video(slug: str, request: Request):
         raise HTTPException(503, str(err)) from None
     except (FetchError, ParseError) as err:
         raise HTTPException(502, str(err)) from None
-    view = _video_view(c, v, await c.db.get_sources(v["id"]))
-    view["outputs"] = await c.db.get_outputs(v["id"])
-    return view
+    return await _full_view(c, v)
 
 
 # ---- 输出库 ----
@@ -607,11 +630,22 @@ async def put_settings(patch: dict, request: Request):
             "effective": {"output_dir": str(c.store.output_dir), "public_base_url": c.store.public_base_url}}
 
 
+def _line_specs(site) -> list[dict]:
+    from .hosts import HOST_LABELS, HOST_TRAITS
+
+    out = []
+    for name, spec in site.line_specs.items():
+        t = HOST_TRAITS.get(spec.host)
+        out.append({"name": name, "host": spec.host, "host_label": HOST_LABELS.get(spec.host, ""), "note": spec.note,
+                    "supported": spec.supported, "direct": bool(t and t.direct), "ip_bound": bool(t and t.ip_bound)})
+    return out
+
+
 @router.get("/meta")
 async def meta():
     return {"sites": {name: {"label": s.label, "presets": s.presets, "sorts": s.sorts, "default_sort": s.default_sort,
-                             "hint": s.source_hint, "direct": s.stream.direct,
-                             "ip_bound": s.stream.ip_bound}
+                             "hint": s.source_hint, "direct": s.stream.direct, "ip_bound": s.stream.ip_bound,
+                             "lines": _line_specs(s)}
                       for name, s in SITES.items()}}
 
 

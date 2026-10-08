@@ -269,7 +269,29 @@ async def _migrate_v6(conn: aiosqlite.Connection) -> None:
     await conn.execute("CREATE INDEX videos_code_key ON videos(code_key)")
 
 
-MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6]
+async def _migrate_v7(conn: aiosqlite.Connection) -> None:
+    """多线路站点：每个源的线路，各自缓存直链、记健康度；源上记当前在用的线路。"""
+    for sql in (
+        """CREATE TABLE source_lines (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          source_id INTEGER NOT NULL,
+          line TEXT NOT NULL,
+          link TEXT NOT NULL DEFAULT '',
+          host TEXT NOT NULL DEFAULT '',
+          stream_url TEXT NOT NULL DEFAULT '',
+          stream_expires INTEGER,
+          fail_streak INTEGER NOT NULL DEFAULT 0,
+          last_ok_at INTEGER,
+          last_fail_at INTEGER,
+          last_error TEXT NOT NULL DEFAULT '',
+          updated_at INTEGER NOT NULL,
+          UNIQUE(source_id, line))""",
+        "ALTER TABLE sources ADD COLUMN line TEXT NOT NULL DEFAULT ''",
+    ):
+        await conn.execute(sql)
+
+
+MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")
@@ -516,11 +538,18 @@ class Database:
         async with self._tx():
             video_id, source_id, _ = await self._attach(site, d.key, d.code, d.uncensored, slug, d.site_vid,
                                                         d.title, d.subtitle, video_id)
-            await self.conn.execute(
-                """UPDATE sources SET stream_url=?, stream_expires=?, subtitle=?, detail_at=?, status='active',
-                          fail_streak=0, last_ok_at=?, last_error='', updated_at=? WHERE id=?""",
-                (d.stream_url, d.stream_expires, d.subtitle, t, t, t, source_id),
-            )
+            if d.lines:
+                await self._set_lines(source_id, d.lines)
+                await self.conn.execute(
+                    "UPDATE sources SET subtitle=?, detail_at=?, status='active', updated_at=? WHERE id=?",
+                    (d.subtitle, t, t, source_id),
+                )
+            else:
+                await self.conn.execute(
+                    """UPDATE sources SET stream_url=?, stream_expires=?, subtitle=?, detail_at=?, status='active',
+                              fail_streak=0, last_ok_at=?, last_error='', updated_at=? WHERE id=?""",
+                    (d.stream_url, d.stream_expires, d.subtitle, t, t, t, source_id),
+                )
             primary = await self._is_primary(video_id, site, rank)
             async with self.conn.execute("SELECT * FROM videos WHERE id=?", (video_id,)) as cur:
                 work = _video_row(await cur.fetchone())
@@ -529,6 +558,69 @@ class Database:
             fields["detail_at"] = t
             await self._update_work(video_id, fields, d.code if primary else "")
         return video_id
+
+    async def _set_lines(self, source_id: int, lines: list[tuple[str, str]]) -> None:
+        """在事务里调用：按详情页更新源的线路；线路数据变了就清掉缓存的直链，页面上没有了的线路删掉。"""
+        t = now()
+        for name, link in lines:
+            await self.conn.execute(
+                """INSERT INTO source_lines(source_id, line, link, updated_at) VALUES(?, ?, ?, ?)
+                   ON CONFLICT(source_id, line) DO UPDATE SET
+                     stream_url=CASE WHEN link!=excluded.link THEN '' ELSE stream_url END,
+                     stream_expires=CASE WHEN link!=excluded.link THEN NULL ELSE stream_expires END,
+                     link=excluded.link, updated_at=excluded.updated_at""",
+                (source_id, name, link, t),
+            )
+        names = [n for n, _ in lines]
+        await self.conn.execute(
+            f"DELETE FROM source_lines WHERE source_id=? AND line NOT IN ({','.join('?' * len(names))})",
+            (source_id, *names),
+        )
+
+    async def set_lines(self, source_id: int, lines: list[tuple[str, str]]) -> None:
+        async with self._tx():
+            await self._set_lines(source_id, lines)
+
+    async def get_lines(self, source_id: int) -> list[dict]:
+        rows = await self._all("SELECT * FROM source_lines WHERE source_id=? ORDER BY id", (source_id,))
+        return [dict(r) for r in rows]
+
+    async def lines_for(self, source_ids: list[int]) -> dict[int, list[dict]]:
+        if not source_ids:
+            return {}
+        marks = ",".join("?" * len(source_ids))
+        rows = await self._all(f"SELECT * FROM source_lines WHERE source_id IN ({marks}) ORDER BY id", source_ids)
+        out: dict[int, list[dict]] = {}
+        for r in rows:
+            out.setdefault(r["source_id"], []).append(dict(r))
+        return out
+
+    async def set_line_stream(self, line_id: int, url: str, expires: int | None, host: str) -> None:
+        """线路取到直链：记下直链，并设成这个源当前在用的线路。"""
+        t = now()
+        async with self._tx():
+            await self.conn.execute(
+                """UPDATE source_lines SET stream_url=?, stream_expires=?, host=?, fail_streak=0, last_ok_at=?,
+                          last_error='', updated_at=? WHERE id=?""",
+                (url, expires, host, t, t, line_id),
+            )
+            await self.conn.execute(
+                """UPDATE sources SET stream_url=?, stream_expires=?, line=(SELECT line FROM source_lines WHERE id=?),
+                          status='active', fail_streak=0, last_ok_at=?, last_error='', updated_at=?
+                   WHERE id=(SELECT source_id FROM source_lines WHERE id=?)""",
+                (url, expires, line_id, t, t, line_id),
+            )
+
+    async def use_line(self, source_id: int, line: dict) -> None:
+        """改用这条线路已缓存的直链。"""
+        await self._write("UPDATE sources SET stream_url=?, stream_expires=?, line=? WHERE id=?",
+                          (line["stream_url"], line["stream_expires"], line["line"], source_id))
+
+    async def line_failed(self, line_id: int, error: str) -> None:
+        await self._write(
+            "UPDATE source_lines SET fail_streak=fail_streak+1, last_fail_at=?, last_error=? WHERE id=?",
+            (now(), error[:500], line_id),
+        )
 
     async def get_video_by_id(self, video_id: int) -> dict | None:
         return _video_row(await self._one("SELECT * FROM videos WHERE id=?", (video_id,)))

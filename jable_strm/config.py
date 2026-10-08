@@ -65,6 +65,13 @@ def normalize_domains(v: list[str]) -> list[str]:
     return out
 
 
+class LineConfig(BaseModel):
+    """多线路站点上一条线路的设置。"""
+
+    enabled: bool = True
+    proxy: bool = False  # 强制由本服务中转（比如直链在外网播放器上打不开时）
+
+
 class SiteConfig(BaseModel):
     """单个站点的抓取设置；每个站点各自限速、冷却，一个站被拦不影响其他站。"""
 
@@ -73,6 +80,14 @@ class SiteConfig(BaseModel):
     rate_per_sec: float = Field(1.0, gt=0, le=20)
     concurrency: int = Field(2, ge=1, le=16)
     solver: bool = True  # 全部域名被拦时是否调用解题服务
+    lines: dict[str, LineConfig] = Field(default_factory=dict)  # 多线路站点：每条线路的设置
+    line_order: list[str] = Field(default_factory=list)  # 线路的优先顺序，前面的先试
+
+    def line(self, name: str) -> LineConfig:
+        return self.lines.get(name) or LineConfig()
+
+    def line_rank(self, name: str) -> int:
+        return self.line_order.index(name) if name in self.line_order else len(self.line_order)
 
     @field_validator("domains")
     @classmethod
@@ -162,6 +177,10 @@ class Settings(BaseModel):
             cfg = self.sites.get(name) or SiteConfig(enabled=site.default_enabled)
             if not cfg.domains:
                 cfg.domains = list(site.default_domains)
+            for line, spec in site.line_specs.items():
+                cfg.lines.setdefault(line, LineConfig(enabled=spec.default_enabled))
+            order = [n for n in dict.fromkeys(cfg.line_order) if n in cfg.lines]
+            cfg.line_order = order + [n for n in cfg.lines if n not in order]
             self.sites[name] = cfg
         self.sites = {k: v for k, v in self.sites.items() if k in SITES}
         order = [n for n in dict.fromkeys(self.site_priority) if n in SITES]

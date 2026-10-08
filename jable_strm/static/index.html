@@ -719,6 +719,27 @@
                         <label class="small"><input type="checkbox" x-model="draft.sites[name].enabled"> 启用</label>
                         <label class="small"><input type="checkbox" x-model="draft.sites[name].solver"> 被拦时用解题服务</label>
                       </div>
+                      <template x-if="(siteMeta(name).lines || []).length">
+                        <div class="table-wrap" style="margin-bottom:8px">
+                          <table class="small">
+                            <thead><tr><th>顺序</th><th>线路</th><th>播放站</th><th>播放方式</th><th>启用</th><th>强制中转</th><th>说明</th></tr></thead>
+                            <tbody>
+                              <template x-for="(ln, i) in draft.sites[name].line_order" :key="ln">
+                                <tr :class="{muted: !draft.sites[name].lines[ln]?.enabled || !lineSpec(name, ln).supported}">
+                                  <td class="nowrap"><button class="sm" :disabled="i === 0" @click="moveLine(name, i, -1)">↑</button>
+                                    <button class="sm" :disabled="i === draft.sites[name].line_order.length - 1" @click="moveLine(name, i, 1)">↓</button></td>
+                                  <td class="mono" x-text="ln"></td>
+                                  <td x-text="lineSpec(name, ln).host_label || '-'"></td>
+                                  <td><span class="chip" x-text="lineModeText(lineSpec(name, ln), draft.sites[name].lines[ln])"></span></td>
+                                  <td><input type="checkbox" x-model="draft.sites[name].lines[ln].enabled" :disabled="!lineSpec(name, ln).supported"></td>
+                                  <td><input type="checkbox" x-model="draft.sites[name].lines[ln].proxy" :disabled="!lineSpec(name, ln).direct"></td>
+                                  <td class="small muted" x-text="lineSpec(name, ln).note"></td>
+                                </tr>
+                              </template>
+                            </tbody>
+                          </table>
+                        </div>
+                      </template>
                       <div class="form-row">
                         <label class="field grow"><span>域名（每行一个，按顺序优先）</span>
                           <textarea :value="(draft.sites[name].domains || []).join('\n')" @input="draft.sites[name].domains = $event.target.value.split('\n').map(x => x.trim()).filter(Boolean)"></textarea></label>
@@ -807,23 +828,34 @@
             <table class="small">
               <thead><tr><th>站点</th><th>站内页面</th><th>字幕</th><th>状态</th><th>播放地址（缓存）</th><th></th></tr></thead>
               <tbody>
-                <template x-for="src in detail.sources || []" :key="src.id">
-                  <tr>
-                    <td class="nowrap"><span x-text="src.label"></span> <span class="chip" x-text="src.direct ? '302' : '中转'"></span></td>
-                    <td class="mono"><a :href="src.page_url" target="_blank" rel="noreferrer" x-text="src.key"></a></td>
-                    <td x-text="subtitleName(src.subtitle)"></td>
-                    <td><span class="chip" :class="srcState(src).cls" x-text="srcState(src).text"></span>
-                      <div class="small muted ellipsis" x-show="src.last_error" :title="src.last_error" x-text="src.last_error"></div></td>
-                    <td class="nowrap"><button class="sm" x-show="src.stream_url" @click="copy(src.stream_url)" :title="src.stream_url">复制</button>
-                      <span class="muted" x-show="!src.stream_url">播放时获取</span></td>
-                    <td class="nowrap"><button class="sm" x-show="src.status === 'active'" @click="playVideo(detail, src)">试播此源</button></td>
+                <template x-for="row in sourceRows(detail)" :key="row.key">
+                  <tr :class="{muted: row.line && !row.line.enabled}">
+                    <template x-if="!row.line">
+                      <td class="nowrap"><span x-text="row.src.label"></span>
+                        <span class="chip" x-show="!row.src.lines" x-text="row.src.direct ? '302' : '中转'"></span>
+                        <span class="chip" x-show="row.src.lines" x-text="(row.src.lines || []).length + ' 条线路'"></span></td>
+                    </template>
+                    <template x-if="row.line">
+                      <td class="nowrap" style="padding-left:22px">└ <span class="mono" x-text="row.line.line"></span>
+                        <span class="small muted" x-text="row.line.host_label"></span>
+                        <span class="chip" x-text="row.line.direct ? (row.line.ip_bound ? '302·绑 IP' : '302') : '中转'"></span></td>
+                    </template>
+                    <td class="mono"><a x-show="!row.line" :href="row.src.page_url" target="_blank" rel="noreferrer" x-text="row.src.key"></a>
+                      <span class="small muted" x-show="row.line && row.src.line === row.line.line">当前在用</span></td>
+                    <td x-text="row.line ? '' : subtitleName(row.src.subtitle)"></td>
+                    <td><span class="chip" :class="srcState(row.line || row.src).cls" x-text="row.line && !row.line.enabled ? '已停用' : srcState(row.line || row.src).text"></span>
+                      <div class="small muted ellipsis" x-show="(row.line || row.src).last_error" :title="(row.line || row.src).last_error" x-text="(row.line || row.src).last_error"></div></td>
+                    <td class="nowrap"><button class="sm" x-show="(row.line || row.src).stream_url" @click="copy((row.line || row.src).stream_url)" :title="(row.line || row.src).stream_url">复制</button>
+                      <span class="muted" x-show="!(row.line || row.src).stream_url" x-text="row.src.lines && !row.line ? '' : '播放时获取'"></span></td>
+                    <td class="nowrap"><button class="sm" x-show="row.src.status === 'active' && (!row.line || (row.line.enabled && row.line.supported))"
+                        @click="playVideo(detail, row.src, row.line)" x-text="row.line ? '试播此线路' : '试播此源'"></button></td>
                   </tr>
                 </template>
                 <tr x-show="!(detail.sources || []).length"><td colspan="6" class="muted">没有源</td></tr>
               </tbody>
             </table>
           </div>
-          <div class="small muted">Jable 的地址约 3 小时过期，能 302 直连；MissAV 等要中转的源，地址只能由本服务带上请求头去取。</div>
+          <div class="small muted">Jable 的地址约 3 小时过期，能 302 直连；MissAV 和标着「中转」的线路，地址只能由本服务带上请求头去取。多线路站点按设置里的线路顺序试，一条不能用自动换下一条。</div>
         </div>
         <div class="url-row">
           <div class="url-label">本服务播放地址（strm 内容）</div>

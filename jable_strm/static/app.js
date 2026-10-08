@@ -292,6 +292,23 @@ function app() {
       if (left <= 0) return { text: "已过期", cls: "" };
       return { text: "剩 " + this.fmtDur(left), cls: left > 3600 ? "ok" : "warn" };
     },
+    sourceRows(v) {
+      // 多线路站点的源下面列出各条线路
+      return (v.sources || []).flatMap(src => [{ key: "s" + src.id, src, line: null },
+        ...(src.lines || []).map(ln => ({ key: "l" + ln.id, src, line: ln }))]);
+    },
+    lineSpec(site, name) {
+      return (this.siteMeta(site).lines || []).find(l => l.name === name) || { name, supported: true, direct: true, note: "站点上新出现的线路，按页面内容识别播放站" };
+    },
+    lineModeText(spec, cfg) {
+      if (!spec.supported) return "暂不支持";
+      if (!spec.direct || cfg?.proxy) return "中转";
+      return spec.ip_bound ? "302（直链绑出口 IP）" : "302";
+    },
+    moveLine(site, i, d) {
+      const order = this.draft.sites[site].line_order;
+      [order[i], order[i + d]] = [order[i + d], order[i]];
+    },
     srcTitle(src) { return `${src.label} ${src.key}：${this.srcState(src).text}` + (src.last_error ? `\n${src.last_error}` : ""); },
     subtitleName(code) { return SUBTITLES[code ?? ""] || code; },
     subtitleTag(code) { return code === "zh" ? "·中字" : code === "en" ? "·英字" : ""; },
@@ -313,11 +330,12 @@ function app() {
       if (ok) this.notify("已复制：" + text);
       else prompt("复制失败，请手动复制", text);
     },
-    async playVideo(v, source = null) {
+    async playVideo(v, source = null, line = null) {
       this.closePlayer();
-      this.player = { slug: v.slug, title: (source ? `[${source.label}] ` : "") + v.title };
+      this.player = { slug: v.slug, title: (source ? `[${source.label}${line ? " " + line.line : ""}] ` : "") + v.title };
       const token = new URL(v.play_url, location.href).searchParams.get("t");
-      const src = `/play/${v.slug}.m3u8?proxy=1` + (source ? `&src=${source.site}` : "") + (token ? `&t=${encodeURIComponent(token)}` : "");
+      const src = `/play/${v.slug}.m3u8?proxy=1` + (source ? `&src=${source.site}` : "") + (line ? `&line=${encodeURIComponent(line.line)}` : "")
+        + (token ? `&t=${encodeURIComponent(token)}` : "");
       await this.$nextTick();
       const video = this.$refs.video;
       if (video.canPlayType("application/vnd.apple.mpegurl")) { video.src = src; return; }

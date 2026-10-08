@@ -1,6 +1,7 @@
 """播放解析：strm 指向 /play/{slug}.m3u8，挑一个源换取新鲜的播放地址，302 过去或由本服务中转。
 
 一部作品可以有多个源（不同站点）。挑源顺序见 Resolver.rank；某个源取地址失败（下架、被拦、解析失败）就换下一个。
+多线路站点（SupJav 等）的一个源下面还有多条线路：按设置里的顺序试，每条线路各自缓存直链、各自冷却。
 中转：/hls/{源 id}/{相对路径} 按源的播放地址所在目录拼出上游地址，带上站点要求的请求头。
 多层播放列表（master → 子清单 → 分片）里的地址都改写成本服务的相对地址；不在同一目录下的地址签名后放进 _x/。
 """
@@ -15,7 +16,7 @@ import logging
 import re
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from urllib.parse import quote, urljoin
 
 from fastapi import APIRouter, HTTPException, Request
@@ -26,7 +27,8 @@ from .db import Database, source_cooldown
 from .fetcher import Blocked, FetchError, Fetcher, NotFound
 from .observability import Metrics
 from .parser import ParseError, VideoGone
-from .sites import SITES, Site, SourceDetail, find_by_code, get_site
+from .hosts import ts_start
+from .sites import SITES, Site, SourceDetail, StreamTraits, find_by_code, get_site
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +37,7 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
 HLS_PATH_RE = re.compile(
     r"^(?:_x/[0-9a-f]{16}/[A-Za-z0-9_-]+(?:\.[a-z0-9]{1,5})?|[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+){0,5})$")
 _EXT_RE = re.compile(r"\.([a-z0-9]{1,5})$")
-DISGUISE_EXTS = (".jpeg", ".jpg", ".png", ".gif", ".webp", ".html", ".txt", ".js", ".css")
+DISGUISE_EXTS = (".jpeg", ".jpg", ".png", ".gif", ".webp", ".html", ".txt", ".js", ".css", ".woff2", ".woff")
 SUBTITLE_CODES = {"zh": "zh", "none": "", "en": "en"}
 _SIGN_KEY = secrets.token_bytes(16)  # _x/ 地址的签名密钥，进程重启后旧地址失效（播放器会重新请求 /play）
 
@@ -49,6 +51,15 @@ class Resolved:
     video: dict
     source: dict
     site: Site
+    line: dict | None = None  # 多线路站点：这次用的线路
+    proxy_forced: bool = False  # 线路设置了强制中转
+
+    @property
+    def traits(self) -> StreamTraits:
+        if self.line is None:
+            return self.site.stream
+        t = self.site.line_traits(self.line["line"], self.line["host"])
+        return replace(t, direct=False) if self.proxy_forced else t
 
     @property
     def url(self) -> str:
@@ -86,7 +97,7 @@ class Resolver:
                 continue
             if site and src["site"] != site:
                 continue
-            if direct_only and (not st.stream.direct or st.stream.ip_bound):
+            if direct_only and not self._direct_ok(st):
                 continue
             out.append(src)
 
@@ -99,12 +110,45 @@ class Resolver:
         return sorted(out, key=lambda x: (tier(x), source_cooldown(x) > t, s.site_rank(x["site"]),
                                           not self._fresh(x, 60), -(x["height"] or 0)))
 
+    def _direct_ok(self, site: Site) -> bool:
+        """能不能给网关（外网客户端直连）：要能 302、直链不绑本服务的出口 IP；多线路站点看有没有这样的线路。"""
+        if not site.multi_line:
+            return site.stream.direct and not site.stream.ip_bound
+        cfg = self.store.current.site(site.name)
+        return any(self._line_direct_ok(site, cfg, name, "") for name in site.line_specs)
+
+    @staticmethod
+    def _line_direct_ok(site: Site, cfg, name: str, host: str) -> bool:
+        lc = cfg.line(name)
+        t = site.line_traits(name, host)
+        return lc.enabled and not lc.proxy and t.direct and not t.ip_bound
+
     def _fresh(self, src: dict, need: int) -> bool:
         if not src["stream_url"]:
             return False
-        if not get_site(src["site"]).stream.expires:
+        site = get_site(src["site"])
+        traits = site.line_traits(src["line"]) if site.multi_line else site.stream
+        if not traits.expires:
             return True
         return (src["stream_expires"] or 0) - time.time() >= need
+
+    def rank_lines(self, site: Site, lines: list[dict], *, want: str | None = None,
+                   direct_only: bool = False) -> list[dict]:
+        """一个源的线路按设置排好：启用的、支持的；不在失败冷却中的在前，再按设置里的线路顺序。"""
+        cfg = self.store.current.site(site.name)
+        t = time.time()
+        out = []
+        for ln in lines:
+            name = ln["line"]
+            spec = site.line_specs.get(name)
+            if want and name != want:
+                continue
+            if not cfg.line(name).enabled or (spec is not None and not spec.supported):
+                continue
+            if direct_only and not self._line_direct_ok(site, cfg, name, ln["host"]):
+                continue
+            out.append(ln)
+        return sorted(out, key=lambda ln: (source_cooldown(ln) > t, cfg.line_rank(ln["line"])))
 
     def _need(self, v: dict, min_remaining: int | None) -> int:
         if min_remaining is not None:
@@ -114,8 +158,8 @@ class Resolver:
     # ---- 取地址 ----
 
     async def resolve(self, slug: str, *, min_remaining: int | None = None, site: str | None = None,
-                      direct_only: bool = False) -> Resolved:
-        """挑一个能用的源并返回它的新鲜地址；依次尝试，全部失败才报错。"""
+                      line: str | None = None, direct_only: bool = False) -> Resolved:
+        """挑一个能用的源并返回它的新鲜地址；依次尝试，全部失败才报错。line 只在指定了 site 时有效。"""
         v = await self.db.get_video(slug.lower())
         if v is None:
             v = await self.discover(slug.lower())
@@ -139,7 +183,8 @@ class Resolver:
                 break
             label = f"{get_site(src['site']).label} {src['key']}"
             try:
-                r = await asyncio.wait_for(self._ensure(v, src, self._need(v, min_remaining)), left)
+                r = await asyncio.wait_for(self._ensure(v, src, self._need(v, min_remaining), line=line if site else None,
+                                                        direct_only=direct_only), left)
             except (NotFound, VideoGone) as e:
                 await self.db.mark_source_gone(src["site"], src["key"])
                 gone += 1
@@ -182,7 +227,7 @@ class Resolver:
             site = SITES[name]
             if name in have or not s.site(name).enabled or not site.can_lookup:
                 continue
-            if direct_only and (not site.stream.direct or site.stream.ip_bound):
+            if direct_only and not self._direct_ok(site):
                 continue
             check = await self.db.get_source_check(v["id"], name)
             if check and not check["found"] and check["checked_at"] > cutoff:
@@ -247,9 +292,12 @@ class Resolver:
             raise hard[0]
         raise NotFound(slug)
 
-    async def _ensure(self, v: dict, src: dict, need: int, stale: str | None = None) -> Resolved:
+    async def _ensure(self, v: dict, src: dict, need: int, stale: str | None = None, *, line: str | None = None,
+                      direct_only: bool = False) -> Resolved:
         """保证这个源有剩余有效期 ≥ need 的地址；stale 是调用方确认已失效的地址，缓存仍是它时强制刷新。"""
         site = get_site(src["site"])
+        if site.multi_line:
+            return await self._ensure_lines(v, src, site, need, stale, line, direct_only)
         if stale is None and self._fresh(src, need):
             self.metrics.inc("play_cache_hit")
             return Resolved(v, src, site)
@@ -272,15 +320,63 @@ class Resolver:
             self._locks = {k: lk for k, lk in self._locks.items() if lk.locked()}
         return Resolved(v, src, site)
 
+    async def _ensure_lines(self, v: dict, src: dict, site: Site, need: int, stale: str | None,
+                            want: str | None, direct_only: bool) -> Resolved:
+        """多线路站点：按顺序找一条有新鲜直链的线路，没有就逐条现取；全失败时重抓一次详情（线路数据可能换了）再试。"""
+        lock = self._locks.setdefault(src["id"], asyncio.Lock())
+        errors: list[str] = []
+        async with lock:
+            lines = await self.db.get_lines(src["id"])
+            refreshed = False
+            if not lines:
+                await self._refresh_detail(v, src, site)
+                refreshed = True
+                lines = await self.db.get_lines(src["id"])
+            for _ in range(2):
+                for ln in self.rank_lines(site, lines, want=want, direct_only=direct_only):
+                    traits = site.line_traits(ln["line"], ln["host"])
+                    fresh = ln["stream_url"] and (not traits.expires or (ln["stream_expires"] or 0) - time.time() >= need)
+                    if fresh and ln["stream_url"] != stale:
+                        if (src["line"], src["stream_url"]) != (ln["line"], ln["stream_url"]):
+                            await self.db.use_line(src["id"], ln)
+                        self.metrics.inc("play_cache_hit")
+                        return await self._resolved(v, src["id"], site, ln["id"])
+                    try:
+                        hs = await site.resolve_line(self.fetcher, ln["line"], ln["link"])
+                    except (FetchError, ParseError, NotFound, ValueError, KeyError) as e:
+                        await self.db.line_failed(ln["id"], str(e))
+                        errors.append(f"{ln['line']}：{e}")
+                        log.info("%s %s 线路 %s 取直链失败：%s", site.label, src["key"], ln["line"], e)
+                        continue
+                    await self.db.set_line_stream(ln["id"], hs.url, hs.expires, hs.host)
+                    self.metrics.inc("play_refresh")
+                    return await self._resolved(v, src["id"], site, ln["id"])
+                if refreshed:
+                    break
+                await self._refresh_detail(v, src, site)
+                refreshed = True
+                lines = await self.db.get_lines(src["id"])
+        raise FetchError("；".join(errors) or "没有可用的线路（都停用了，或者都不支持）")
+
+    async def _refresh_detail(self, v: dict, src: dict, site: Site) -> None:
+        d = await site.fetch_detail(self.fetcher.site(site.name), src["key"], priority=True)
+        await self.db.upsert_detail(site.name, d, v["slug"], self.store.current.site_rank)
+
+    async def _resolved(self, v: dict, source_id: int, site: Site, line_id: int) -> Resolved:
+        src = await self.db.get_source(source_id)
+        line = next(ln for ln in await self.db.get_lines(source_id) if ln["id"] == line_id)
+        forced = self.store.current.site(site.name).line(line["line"]).proxy
+        return Resolved(await self.db.get_video_by_id(v["id"]) or v, src, site, line, forced)
+
     async def ensure_source(self, source_id: int, *, min_remaining: int = 60, stale: str | None = None) -> Resolved:
-        """中转分片时用：只认这一个源（不同站点切片不一样，播到一半不能换站）。"""
+        """中转分片时用：只认这一个源、这条线路（不同站点、不同线路切片不一样，播到一半不能换）。"""
         src = await self.db.get_source(source_id)
         if src is None:
             raise NotFound(f"源 #{source_id}")
         v = await self.db.get_video_by_id(src["video_id"])
         if v is None:
             raise NotFound(f"源 #{source_id} 的作品")
-        return await self._ensure(v, src, min_remaining, stale)
+        return await self._ensure(v, src, min_remaining, stale, line=src["line"] or None)
 
 
 router = APIRouter()
@@ -321,7 +417,7 @@ def direct_blocker(proxy_user_agents: list[str], ua: str, origin: str, fetch_mod
 
 
 def _left(r: Resolved) -> str:
-    if not r.site.stream.expires:
+    if not r.traits.expires:
         return "地址长期有效"
     if not r.expires:
         return "地址有效期未知"  # 地址格式不认识，取不到过期时间
@@ -329,7 +425,7 @@ def _left(r: Resolved) -> str:
 
 
 def _label(r: Resolved) -> str:
-    return f"{r.site.label} {r.source['key']}"
+    return f"{r.site.label} {r.source['key']}" + (f" 线路 {r.line['line']}" if r.line else "")
 
 
 async def _resolve_or_http(request: Request, slug: str, **kw) -> Resolved:
@@ -345,21 +441,22 @@ async def _resolve_or_http(request: Request, slug: str, **kw) -> Resolved:
 
 
 @router.api_route("/play/{name}", methods=["GET", "HEAD"])
-async def play(name: str, request: Request, t: str = "", proxy: int = 0, src: str = ""):
-    """proxy=1 强制中转（网页试播用）；src=站点 只用这个站点的源。浏览器跨域请求（带 Origin）也走中转并返回 CORS 头。"""
+async def play(name: str, request: Request, t: str = "", proxy: int = 0, src: str = "", line: str = ""):
+    """proxy=1 强制中转（网页试播用）；src=站点 只用这个站点的源，line=线路 再限定线路。
+    浏览器跨域请求（带 Origin）也走中转并返回 CORS 头。"""
     ctx = _ctx(request)
     _check_token(request, t)
     slug = name.lower().removesuffix(".m3u8")
     if not SLUG_RE.fullmatch(slug):
         raise HTTPException(404)
     ctx.metrics.inc("play_requests")
-    r = await _resolve_or_http(request, slug, site=src or None)
+    r = await _resolve_or_http(request, slug, site=src or None, line=line or None)
     s = ctx.store.current
     ua = request.headers.get("user-agent", "")
     origin = request.headers.get("origin", "")
     fetch_mode = request.headers.get("sec-fetch-mode", "")
-    blocked_uas = s.proxy_user_agents if r.site.stream.ua_block else []
-    proxied = (bool(proxy) or s.play_mode == "proxy" or not r.site.stream.direct
+    blocked_uas = s.proxy_user_agents if r.traits.ua_block else []
+    proxied = (bool(proxy) or s.play_mode == "proxy" or not r.traits.direct
                or bool(direct_blocker(blocked_uas, ua, origin, fetch_mode)))
     log.info("播放 %s：%s %s（%s，客户端 %s，UA %s）", slug, _label(r), "中转" if proxied else "302", _left(r),
              request.client.host if request.client else "?", ua[:60])
@@ -416,7 +513,7 @@ async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin:
         log.info("resolve %s：返回本服务中转地址（UA %s%s）", slug, ua[:60], extra)
         return {"slug": slug, "url": url, "expires_at": 0, "ttl": 6 * 3600, "duration": None}
     expires = r.expires or 0
-    log.info("resolve %s：返回 %s 的 CDN 地址（%s，UA %s%s）", slug, r.site.label, _left(r), ua[:60], extra)
+    log.info("resolve %s：返回 %s 的 CDN 地址（%s，UA %s%s）", slug, _label(r), _left(r), ua[:60], extra)
     return {"slug": slug, "url": r.url, "expires_at": expires,
             "ttl": max(0, int(expires - time.time())), "duration": r.video.get("duration")}
 
@@ -475,7 +572,7 @@ def rewrite_playlist(text: str, playlist_url: str, root: str, up: str, q: str, d
 def _upstream(r: Resolved, path: str) -> str | None:
     if path.startswith("_x/"):
         return _decode_x(path)
-    if r.site.stream.disguised_segments and path.endswith(".ts") and path[:-3].lower().endswith(DISGUISE_EXTS):
+    if r.traits.disguised_segments and path.endswith(".ts") and path[:-3].lower().endswith(DISGUISE_EXTS):
         path = path[:-3]
     return r.url.rsplit("/", 1)[0] + "/" + path
 
@@ -495,7 +592,7 @@ def _is_hls(url: str) -> bool:
 async def _proxy_file(request: Request, r: Resolved) -> Response:
     """直链是 mp4 这类单文件（如 streamtape）：原样转发，带上 Range，支持拖动。"""
     ctx = _ctx(request)
-    headers = dict(r.site.stream.headers)
+    headers = dict(r.traits.headers)
     if rng := request.headers.get("range"):
         headers["Range"] = rng
     try:
@@ -527,7 +624,7 @@ async def _proxy_file(request: Request, r: Resolved) -> Response:
 async def _proxy_playlist(request: Request, r: Resolved, t: str) -> Response:
     ctx = _ctx(request)
     try:
-        raw = await ctx.fetcher.get_bytes(r.url, headers=r.site.stream.headers)
+        raw = await ctx.fetcher.get_bytes(r.url, headers=r.traits.headers)
     except (FetchError, NotFound) as e:
         raise HTTPException(502, f"获取播放列表失败：{e}") from None
     q = f"?t={quote(t)}" if t else ""
@@ -537,7 +634,7 @@ async def _proxy_playlist(request: Request, r: Resolved, t: str) -> Response:
     if heights and max(heights) != r.source["height"]:
         await ctx.db.update_source(r.source["id"], height=max(heights))  # 多码率的源记下最高分辨率，挑源时用
     # /play/{slug}.m3u8 回到 /hls/{源 id}/：相对地址解析，不依赖对外地址的写法
-    text = rewrite_playlist(body, r.url, root, f"../hls/{r.source['id']}/", q, r.site.stream.disguised_segments)
+    text = rewrite_playlist(body, r.url, root, f"../hls/{r.source['id']}/", q, r.traits.disguised_segments)
     return Response(text, media_type="application/vnd.apple.mpegurl")
 
 
@@ -556,7 +653,7 @@ async def hls_file(source_id: int, path: str, request: Request, t: str = ""):
         raise HTTPException(503, f"站点拦截中：{e}", headers={"Retry-After": str(int(e.retry_after))}) from None
     except (FetchError, ParseError) as e:
         raise HTTPException(502, f"解析播放地址失败：{e}") from None
-    headers_up = r.site.stream.headers or None
+    headers_up = r.traits.headers or None
     for attempt in range(2):
         url = _upstream(r, path)
         if url is None:
@@ -584,18 +681,28 @@ async def hls_file(source_id: int, path: str, request: Request, t: str = ""):
             q = f"?t={quote(t)}" if t else ""
             up = "../" * path.count("/")  # 从当前子清单的位置回到 /hls/{源 id}/
             root = r.url.rsplit("/", 1)[0] + "/"
-            text = rewrite_playlist(body.decode("utf-8", "replace"), url, root, up, q, r.site.stream.disguised_segments)
+            text = rewrite_playlist(body.decode("utf-8", "replace"), url, root, up, q, r.traits.disguised_segments)
             return Response(text, media_type="application/vnd.apple.mpegurl", headers=cors)
+
+        strip = r.traits.fake_header
 
         async def stream(resp=resp):
             try:
+                head = b""
                 async for chunk in resp.aiter_content():
+                    if strip and head is not None:
+                        head += chunk  # 攒够一段再找 TS 起点，剥掉前面的假文件头
+                        if len(head) < 8192 + 188 * 5:
+                            continue
+                        chunk, head = head[max(ts_start(head), 0):], None
                     yield chunk
+                if strip and head:
+                    yield head[max(ts_start(head), 0):]
             finally:
                 await close_stream(resp)
 
         headers = cors
-        if cl := resp.headers.get("content-length"):
+        if (cl := resp.headers.get("content-length")) and not strip:
             headers["Content-Length"] = cl
         media = resp.headers.get("content-type") or "video/mp2t"
         if path.endswith(".ts"):

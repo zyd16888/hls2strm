@@ -1,7 +1,7 @@
 import asyncio
 import time
 
-from jable_strm.fetcher import Page
+from jable_strm.fetcher import FetchError, Page
 from jable_strm.sites import SITES
 from jable_strm.sites.supjav import GATEWAY, parse_title
 
@@ -57,7 +57,7 @@ def test_titles_lists_and_sources():
 
     d = SUPJAV.parse_detail(fixture("supjav_detail.html"), "443625")
     assert d.code == "SSIS-001" and d.maker == "S1 NO.1 STYLE" and len(d.models) == 2
-    assert [s[0] for s in d.extra["servers"]] == ["FST", "ST", "VOE"]
+    assert [n for n, _ in d.lines] == ["FST", "ST", "VOE"]
 
     assert SUPJAV.normalize_source("https://supjav.com/zh/category/chinese-subtitles/page/3?sort=views") == \
         "/zh/category/chinese-subtitles"
@@ -78,7 +78,7 @@ def test_lookup_by_code():
 
 def test_server_streams():
     detail = fixture("supjav_detail_aarm370.html")
-    servers = dict(SUPJAV.parse_detail(detail, "463322").extra["servers"])
+    servers = dict(SUPJAV.parse_detail(detail, "463322").lines)
     gw = lambda name: GATEWAY + servers[name][::-1]  # noqa: E731
 
     # EVS：网关 302 到播放站，packer 解包取 hls2；过期时间 = s + e
@@ -86,35 +86,102 @@ def test_server_streams():
         gw("EVS"): Resp(302, headers={"location": "https://evsishere.xyz/embed/kmsebjxu7891#supjav.com@AARM-370"}),
         "https://evsishere.xyz/embed/kmsebjxu7891": Resp(200, fixture("supjav_host_evs.html")),
     })
-    sf = FakeSiteFetcher({"/zh/463322.html": detail}, http)
-    st = asyncio.run(SUPJAV.fetch_stream(sf, "463322"))
-    assert "/master.m3u8?" in st.url and st.expires == 1791427648 + 129600
+    st = asyncio.run(SUPJAV.resolve_line(http, "EVS", servers["EVS"]))
+    assert "/master.m3u8?" in st.url and st.expires == 1791427648 + 129600 and st.host == "vidhide"
     assert http.calls[0][1] == "https://supjav.com/" and http.calls[1] == (
         "https://evsishere.xyz/embed/kmsebjxu7891", "https://lk1.supremejav.com/")
 
-    # EVS 不行时换下一条：ST 拼出 get_video
-    http.routes[gw("EVS")] = Resp(200, "404")
+    # 网关没跳转：线路数据失效，报错（由播放解析换下一条线路）
+    http.routes[gw("VOE")] = Resp(200, "404")
+    try:
+        asyncio.run(SUPJAV.resolve_line(http, "VOE", servers["VOE"]))
+        raise AssertionError("网关没跳转时应当报错")
+    except FetchError:
+        pass
+
+    # ST：拼出 get_video
     http.routes[gw("ST")] = Resp(302, headers={"location": "https://streamtape.com/e/6qxlM0ja1jf97A1/AARM-370.mp4"})
     http.routes["https://streamtape.com/e/"] = Resp(200, fixture("supjav_host_st.html"))
-    http.routes[gw("VOE")] = Resp(200, "404")
-    st = asyncio.run(SUPJAV.fetch_stream(sf, "463322"))
+    st = asyncio.run(SUPJAV.resolve_line(http, "ST", servers["ST"]))
     assert st.url.startswith("https://streamtape.com/get_video?id=6qxlM0ja1jf97A1&expires=") and st.url.endswith("&stream=1")
-    assert st.expires == 1791497652
+    assert st.expires == 1791497652 and st.host == "streamtape"
 
     # VOE：跳转页 → 混淆的 JSON → source
     http.routes[gw("VOE")] = Resp(302, headers={"location": "https://voe.sx/e/g2a9jasyavw3#supjav.com@AARM-370.mp4"})
     http.routes["https://voe.sx/e/"] = Resp(200, fixture("supjav_host_voe_jump.html"))
     http.routes["https://teresapoliticallearn.com/e/"] = Resp(200, fixture("supjav_host_voe.html"))
-    url, expires = asyncio.run(SUPJAV._server_stream(http, "VOE", servers["VOE"]))
-    assert "/master.m3u8?" in url and expires > time.time() - 10 ** 7
+    st = asyncio.run(SUPJAV.resolve_line(http, "VOE", servers["VOE"]))
+    assert "/master.m3u8?" in st.url and st.expires > time.time() - 10 ** 7 and st.host == "voe"
 
 
 def test_fst_hls2():
     detail = fixture("supjav_detail.html")
-    servers = dict(SUPJAV.parse_detail(detail, "443625").extra["servers"])
+    servers = dict(SUPJAV.parse_detail(detail, "443625").lines)
     http = FakeHttp({
         GATEWAY + servers["FST"][::-1]: Resp(302, headers={"location": "https://fc2stream.tv/e/8san2ha28cfy#x"}),
         "https://fc2stream.tv/e/8san2ha28cfy": Resp(200, fixture("supjav_host_fst.html")),
     })
-    url, expires = asyncio.run(SUPJAV._server_stream(http, "FST", servers["FST"]))
-    assert "/hls2/" in url and url.split("?", 1)[0].endswith("master.m3u8") and expires == 1791427677 + 129600
+    st = asyncio.run(SUPJAV.resolve_line(http, "FST", servers["FST"]))
+    assert "/hls2/" in st.url and st.url.split("?", 1)[0].endswith("master.m3u8") and st.expires == 1791427677 + 129600
+
+
+def test_lines_order_failover_and_gateway(make_store):
+    """多线路：按设置的顺序试，失败的进冷却换下一条；网关只拿不绑 IP、没强制中转的线路；中转剥假 PNG 头。"""
+    from jable_strm.hosts import HostStream, ts_start
+    from jable_strm.observability import Metrics
+    from jable_strm.play import NoDirectSource, Resolver
+    from jable_strm.sites import SourceDetail
+
+    async def run():
+        db, store = await make_store()
+        rank = store.current.site_rank
+        await store.update({"play_discover": False,
+                            "sites": {"supjav": {"enabled": True, "line_order": ["EVS", "ST", "VOE"]}}})
+        await db.upsert_detail("supjav", SourceDetail(key="463322", code="AARM-370", title="t",
+                                                      lines=[("EVS", "e"), ("ST", "s"), ("VOE", "v")]),
+                               "aarm-370", rank)
+        calls = []
+
+        async def resolve_line(http, name, link):
+            calls.append(name)
+            if name == "EVS":
+                raise FetchError("网关没有跳转")
+            return HostStream(f"https://cdn/{name}.m3u8", int(time.time()) + 86400,
+                              {"ST": "streamtape", "VOE": "voe"}[name])
+
+        site = SITES["supjav"]
+        orig = site.resolve_line
+        site.resolve_line = resolve_line
+        try:
+            r = Resolver(db, None, store, Metrics())
+            res = await r.resolve("aarm-370")
+            assert calls == ["EVS", "ST"] and res.line["line"] == "ST" and res.url == "https://cdn/ST.m3u8"
+            assert res.traits.direct and not res.traits.ip_bound  # ST 能 302，也能给网关
+            lines = {ln["line"]: ln for ln in await db.get_lines(res.source["id"])}
+            assert lines["EVS"]["fail_streak"] == 1
+            # 再来一次：缓存的 ST 还新鲜，不再请求；EVS 在冷却中排到后面
+            await r.resolve("aarm-370")
+            assert calls == ["EVS", "ST"]
+            # 指定线路试播
+            res = await r.resolve("aarm-370", site="supjav", line="VOE")
+            assert res.line["line"] == "VOE" and res.traits.ip_bound
+            # 网关：只要不绑 IP 的线路；ST 设成强制中转后就没有能给网关的线路了
+            assert (await r.resolve("aarm-370", direct_only=True)).line["line"] == "ST"
+            await store.update({"sites": {"supjav": {"lines": {**{k: v.model_dump() for k, v in
+                                                                  store.current.site("supjav").lines.items()},
+                                                               "ST": {"enabled": True, "proxy": True}}}}})
+            try:
+                await r.resolve("aarm-370", direct_only=True)
+                raise AssertionError("ST 强制中转后不该给网关")
+            except NoDirectSource:
+                pass
+            res = await r.resolve("aarm-370")
+            assert not res.traits.direct  # 强制中转
+        finally:
+            site.resolve_line = orig
+        await db.close()
+
+    asyncio.run(run())
+
+    ts = bytes([0x47] + [0] * 187) * 6
+    assert ts_start(b"\x89PNG\r\n\x1a\n" + b"x" * 62 + ts) == 70 and ts_start(ts) == 0 and ts_start(b"junk") == -1
