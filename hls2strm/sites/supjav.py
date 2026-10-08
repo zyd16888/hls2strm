@@ -18,6 +18,7 @@ from selectolax.lexbor import LexborHTMLParser
 
 from ..codes import code_key
 from ..errors import FetchError, ParseError
+from ..quality import from_labels
 from .hosts import HostStream, resolve_embed
 from .base import LineSpec, ListPage, Site, SourceDetail, SourceItem, StreamTraits
 
@@ -55,6 +56,13 @@ def parse_title(title: str) -> tuple[str, str, bool]:
     else:
         code = ""
     return code, subtitle, uncensored
+
+
+def claimed_height(title: str) -> int:
+    """标题前面标签里标注的画质（'[4K][英文字幕]…' → 2160）；没标注返回 0。"""
+    m = _TAGS_RE.match(title)
+    q = from_labels(re.findall(r"\[([^\]]*)\]", m.group(1)), "claimed") if m else None
+    return q.height if q else 0
 
 
 class SupJavSite(Site):
@@ -172,6 +180,7 @@ class SupJavSite(Site):
             key=key, code=code or f"SUPJAV-{key}", title=title, site_vid=key, subtitle=subtitle, uncensored=uncensored,
             cover_url=(img.attributes.get("src") or "") if img else "", models=models, categories=categories,
             tags=tags, maker=maker, lines=[(n, link) for n, link in servers if n and link],
+            claimed_height=claimed_height(title),
         )
 
     async def lookup(self, sf: SiteFetcher, code: str, uncensored: bool = False,

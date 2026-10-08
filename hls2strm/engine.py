@@ -31,6 +31,10 @@ from .db import DEFAULT_LIBRARY_ID, Database
 from .fetcher import Blocked, FetchError, Fetcher, NotFound
 from .observability import Metrics
 from .parser import ParseError, VideoGone, m3u8_duration
+from .play import Resolved, Resolver
+from .quality import RETRY_AFTER as QUALITY_RETRY_AFTER, SOURCE_NAMES as QUALITY_SOURCES, Quality
+from .quality import label as quality_label, needed as quality_needed
+from .sites.hosts import MP4_HOSTS
 from .rules import describe_rule, match_rule, normalize_rule
 from .sites import SITES, Site, SourceDetail, SourceItem, find_by_code, get_site
 from .strm_manage import StrmManager
@@ -68,6 +72,7 @@ class Engine:
         self.writer = writer
         self.store = store
         self.metrics = metrics
+        self.resolver = Resolver(db, fetcher, store, metrics)  # 播放和画质探测共用：同一个源取地址只抓一次
         self.snapshot_dir = boot.data_dir / "snapshots"
         self.paused = False
         self.blocked: dict[str, float] = {}  # 站点 -> 被拦截到什么时候
@@ -103,6 +108,7 @@ class Engine:
 
     async def stop(self) -> None:
         self._stopping = True
+        self.resolver.quality.cancel()
         tasks = [t for t in self._workers if not t.done()]
         if self._scheduler:
             tasks.append(self._scheduler)
@@ -214,7 +220,7 @@ class Engine:
                        "purge": self._do_purge, "reclassify": self._do_reclassify,
                        "scan": self.strm.do_scan, "adopt": self.strm.do_adopt,
                        "prefix": self.strm.do_prefix, "revert": self.strm.do_revert,
-                       "locate": self.strm.do_locate}[task["kind"]]
+                       "locate": self.strm.do_locate, "quality": self._do_quality}[task["kind"]]
             await handler(job, task)
             await self.db.finish_task(tid, "done", duration_ms=int((time.monotonic() - t0) * 1000))
             log.debug("子任务 #%d %s %s 完成（%.1fs）", tid, task["kind"], task["target"], time.monotonic() - t0)
@@ -445,6 +451,11 @@ class Engine:
         v = await self.upsert_detail(site, d)
         if not v["duration"] and d.stream_url:
             await self._fill_duration(v, site, d.stream_url)
+        if d.stream_url and self.store.current.quality_capture:
+            # 详情页给了播放地址：后台顺手读一次播放列表认出画质（只请求 CDN）
+            src = await self.db.find_source(site.name, d.key)
+            if src is not None and quality_needed(src):
+                self.resolver.quality.spawn(src["id"], None, d.stream_url, site.stream.headers)
         if library_id:
             await self.db.ensure_output(v["id"], library_id)
         await self._output_all(v, cover=True)
@@ -1093,6 +1104,72 @@ class Engine:
         return await self.create_videos(items, library_id=None, name=f"补全缺失详情（{len(items)} 部）",
                                         priority=PRIORITY_DETAIL)
 
+    # ---- 画质探测 ----
+
+    async def create_quality(self, library_id: int | None = None) -> int:
+        """画质探测：给还不知道画质的源排队，按站点限速取播放地址、读播放列表；多线路的源每条线路各探一次。
+        地址过期的要重新访问源站（详情页、播放页），所以只手动发起；最近试过没认出来的（mp4 等）跳过。"""
+        lib_name = self._library(library_id)["name"] if library_id else "全部影片"
+        cfg = self.store.current.sites
+        by_site: dict[str, list[int]] = {}
+        for r in await self.db.sources_needing_quality(int(time.time()) - QUALITY_RETRY_AFTER, library_id):
+            if r["site"] in cfg and cfg[r["site"]].enabled:
+                by_site.setdefault(r["site"], []).append(r["id"])
+        n = sum(len(ids) for ids in by_site.values())
+        if not n:
+            raise ValueError(f"{lib_name}里没有要探测画质的源（都知道了，或者最近试过）")
+        name = f"画质探测：{lib_name}（{n} 个源）"
+        job_id = await self.db.create_job("quality", name, {"library_id": library_id, "count": n})
+        for site, ids in by_site.items():
+            await self.db.add_tasks(job_id, "quality", ids, PRIORITY_DETAIL, site)
+        log.info("新建任务 #%d「%s」", job_id, name)
+        self.notify()
+        return job_id
+
+    async def _do_quality(self, job: dict, task: dict) -> None:
+        src = await self.db.get_source(int(task["target"]))
+        if src is None or src["status"] != "active":
+            return
+        v = await self.db.get_video_by_id(src["video_id"])
+        site = get_site(src["site"])
+        probe = self.resolver.quality.probe_and_save
+        if not site.multi_line:
+            r = await self.resolver._ensure(v, src, 60)  # 现成的地址没过期就不访问源站
+            q = await probe(src["id"], None, r.url, r.traits.headers)
+            log.info("画质探测 %s %s：%s", site.label, src["key"], _quality_text(q))
+            return
+        lines = await self.db.get_lines(src["id"])
+        if not lines:
+            await self.resolver._refresh_detail(v, src, site)
+            lines = await self.db.get_lines(src["id"])
+        found = []
+        for ln in self.resolver.rank_lines(site, lines):
+            if not quality_needed(ln):
+                continue
+            spec = site.line_specs.get(ln["line"])
+            if (ln["host"] or (spec.host if spec else "")) in MP4_HOSTS:
+                await self.db.set_quality(src["id"], ln["id"], None)  # mp4 直链读不出画质，不白取地址
+                continue
+            traits = site.line_traits(ln["line"], ln["host"])
+            if not (ln["stream_url"] and (not traits.expires or (ln["stream_expires"] or 0) - time.time() >= 60)):
+                try:
+                    hs = await site.resolve_line(self.fetcher, ln["line"], ln["link"])
+                except (FetchError, ParseError, NotFound, ValueError, KeyError) as e:
+                    await self.db.line_failed(ln["id"], str(e))
+                    await self.db.set_quality(src["id"], ln["id"], None)
+                    found.append(f"{ln['line']} 取直链失败")
+                    continue
+                await self.db.set_line_stream(ln["id"], hs.url, hs.expires, hs.host, hs.referer, use=False)
+                if hs.quality is not None:
+                    await self.db.set_quality(src["id"], ln["id"], hs.quality)
+                    found.append(f"{ln['line']} {_quality_text(hs.quality)}")
+                    continue
+                ln = next(x for x in await self.db.get_lines(src["id"]) if x["id"] == ln["id"])
+            r = Resolved(v, src, site, ln)
+            q = await probe(src["id"], ln["id"], ln["stream_url"], r.traits.headers)
+            found.append(f"{ln['line']} {_quality_text(q)}")
+        log.info("画质探测 %s %s：%s", site.label, src["key"], "，".join(found) or "没有要探测的线路")
+
     async def create_rewrite(self, library_id: int | None = None) -> int:
         name = f"重写输出：{self._library(library_id)['name']}" if library_id else "重写全部输出"
         job_id = await self.db.create_job("rewrite", name, {"library_id": library_id})
@@ -1285,6 +1362,13 @@ def _fmt_secs(s: float) -> str:
 def _counts_text(counts: dict) -> str:
     """子任务各状态的个数：'完成 120，失败 3，待处理 375'。"""
     return "，".join(f"{name} {counts[k]}" for k, name in TASK_STATUS_NAMES.items() if counts.get(k)) or "没有子任务"
+
+
+def _quality_text(q: Quality | None) -> str:
+    """'1080p / 720p（主播放列表）'；没认出来返回'没认出画质'。"""
+    if q is None or not q.heights:
+        return "没认出画质"
+    return " / ".join(quality_label(h) for h in q.heights) + f"（{QUALITY_SOURCES.get(q.src, q.src)}）"
 
 
 def _lookup_text(notes: list[str], t0: float) -> str:

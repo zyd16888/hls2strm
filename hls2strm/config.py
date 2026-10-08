@@ -173,12 +173,35 @@ class Settings(BaseModel):
     subtitle_fallback: bool = Field(
         True, description="首选字幕的源都不能用时，是否用其他字幕的源顶上（比如中字源失效时播无字幕版）"
     )
+    quality_first: bool = Field(
+        True, description="挑源时画质优先：先比画质（源里最清楚的一档），再看站点优先顺序；关掉则站点优先，画质只用来分先后"
+    )
+    quality_max: int = Field(0, ge=0, le=4320, description="画质上限（分辨率的高，如 1080）：超过的源排到不超过的后面；0 不限")
+    quality_unknown: int = Field(
+        720, ge=0, le=4320, description="还不知道画质的源按多少算（分辨率的高）；Jable 实测多为 720"
+    )
+    prefer_direct: bool = Field(
+        False,
+        description="直连优先：能 302 的源排在要本服务中转的前面（省本服务带宽），画质其次；"
+                    "关掉则画质优先，更清楚的源要中转也用它",
+    )
+    quality_capture: bool = Field(
+        True,
+        description="顺手探测画质：抓详情、播放拿到播放地址时读一次播放列表认出分辨率；只请求 CDN，不多访问源站",
+    )
+    resolve_mode: Literal["auto", "redirect", "proxy"] = Field(
+        "auto",
+        description="网关 resolve 默认给什么地址（网关请求里带 mode 时以它为准）：auto 按上面的偏好挑源，"
+                    "能直连给 CDN 地址、要中转给公网中转地址；redirect 只挑能直连的源；proxy 一律给公网中转地址",
+    )
     resolve_timeout: int = Field(20, ge=5, le=120, description="一次播放请求挑源、取地址的总时限（秒），超时不再试后面的源")
     play_discover: bool = Field(
         True, description="现场找源：影片已知的源都不能用（或库里没有这部影片）时，按番号到其他启用的站点找一次"
     )
     resolve_proxy_url: str = Field(
-        "", description="网关 resolve 用：作品只有要中转的源（如 MissAV）时返回这个地址下的中转链接，须能从公网访问；留空返回 409"
+        "",
+        description="网关 resolve 用的公网中转地址：挑中的源要中转（如 MissAV）、或直连的源都失败时，返回这个地址下的中转链接，"
+                    "须能从外网访问（本服务的公网地址，或网关转发到本服务的地址）；留空则只给能直连的源，没有时返回 409",
     )
 
     @model_validator(mode="after")

@@ -3,7 +3,7 @@ import { ExternalLink, Play, RefreshCw, Search, X } from "lucide-react";
 import { useState } from "react";
 import { api, type ProbeResult, type Source, type SourceLine, type Video } from "@/lib/api";
 import { fmtClockDur, fmtNum, fmtTime } from "@/lib/format";
-import { PROBE_STATUS, SUBTITLES } from "@/lib/labels";
+import { PROBE_STATUS, qualityChip, SUBTITLES } from "@/lib/labels";
 import { useRun } from "@/lib/queries";
 import { createStore } from "@/lib/store";
 import { CopyButton, streamState } from "./common";
@@ -199,7 +199,7 @@ function SourceRow({ v, src }: { v: Video; src: Source }) {
         <span className="font-medium">{src.label}</span>
         {lines ? <Chip>{lines.length ? `${lines.length} 条线路` : "线路待取（播放或刷新时）"}</Chip> : <Chip>{src.direct ? "302" : "中转"}</Chip>}
         {src.subtitle && <Chip tone="info">{SUBTITLES[src.subtitle] ?? src.subtitle}</Chip>}
-        {src.height ? <Chip>{src.height}p</Chip> : null}
+        <QualityChip row={src} />
         {!lines && <Chip tone={state.tone}>{state.text}</Chip>}
         {lines && src.status !== "active" && <Chip tone={state.tone}>{state.text}</Chip>}
         <div className="ml-auto flex items-center gap-1">
@@ -232,6 +232,15 @@ function SourceRow({ v, src }: { v: Video; src: Source }) {
   );
 }
 
+function QualityChip({ row }: { row: Source | SourceLine }) {
+  const q = qualityChip(row);
+  return q ? (
+    <Chip tone="info" title={q.title}>
+      {q.text}
+    </Chip>
+  ) : null;
+}
+
 function LineRow({ v, src, ln }: { v: Video; src: Source; ln: SourceLine }) {
   const state = streamState(ln);
   const usable = src.status === "active" && ln.enabled && ln.supported;
@@ -240,6 +249,7 @@ function LineRow({ v, src, ln }: { v: Video; src: Source; ln: SourceLine }) {
       <span className="font-mono">{ln.line}</span>
       <span className="text-muted">{ln.host_label}</span>
       <Chip>{ln.direct ? (ln.ip_bound ? "302·绑 IP" : "302") : "中转"}</Chip>
+      <QualityChip row={ln} />
       <Chip tone={ln.enabled ? state.tone : "neutral"}>{ln.enabled ? state.text : "已停用"}</Chip>
       {src.line === ln.line && <span className="text-xs text-accent">当前在用</span>}
       <div className="ml-auto flex items-center gap-1">

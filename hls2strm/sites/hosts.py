@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, quote, urljoin, urlsplit
 
 from ..errors import FetchError, ParseError
+from ..quality import Quality, from_labels
 from .base import StreamTraits
 from .missav import unpack
 
@@ -48,12 +49,14 @@ HOST_TRAITS: dict[str, StreamTraits] = {
     "dood": StreamTraits(direct=False, expires=True),
     "dooplayer": StreamTraits(direct=True, expires=True, ip_bound=True),
 }
+MP4_HOSTS = {"streamtape", "dood", "dooplayer"}  # 直链是 mp4，读播放列表认不出画质
 HOST_LABELS = {"vidhide": "VidHide", "voe": "VOE", "streamtape": "Streamtape", "vidara": "Vidara",
                "lulustream": "LuluStream", "turbovip": "TurboVip", "maxstream": "MaxStream", "dood": "Dood",
                "dooplayer": "DooPlayer"}
 EMBED_HEADERS = {"Sec-Fetch-Dest": "iframe", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "cross-site"}
 
 _HLS2_RE = re.compile(r'"?hls2"?\s*:\s*"([^"]+)"')
+_QUALITY_LABELS_RE = re.compile(r"""qualityLabels['"]?\s*:\s*\{([^}]*)\}""")  # {"3176":"1080p","1563":"720p"}
 _FILE_RE = re.compile(r'file\s*:\s*"(https?://[^"]+?\.m3u8[^"]*)"')
 _VOE_JUMP_RE = re.compile(r"window\.location\.href\s*=\s*'([^']+)'")
 _VOE_JSON_RE = re.compile(r'<script type="application/json">\s*(\[.*?\])\s*</script>', re.S)
@@ -83,6 +86,7 @@ class HostStream:
     expires: int
     host: str
     referer: str = ""  # 中转请求直链时要带的 Referer（取决于这次的嵌入页，所以不能写死在播放站特性里）
+    quality: Quality | None = None  # 嵌入页里标注的各档画质（vidhide 的 qualityLabels）
 
 
 def expires_of(url: str, default_ttl: int) -> int:
@@ -149,7 +153,9 @@ async def resolve_embed(http: Fetcher, embed_url: str, referer: str, hint: str =
         for js in unpack(html):
             if m := _HLS2_RE.search(js):
                 url = urljoin(embed_url, m.group(1).replace("\\/", "/"))
-                return HostStream(url, expires_of(url, 36 * 3600), host)
+                labels = _QUALITY_LABELS_RE.search(js)
+                quality = from_labels(re.findall(r':\s*"([^"]+)"', labels.group(1)), "embed") if labels else None
+                return HostStream(url, expires_of(url, 36 * 3600), host, quality=quality)
     elif host == "voe":
         if not _VOE_JSON_RE.search(html) and (m := _VOE_JUMP_RE.search(html)):
             html = (await http.fetch(m.group(1), headers={"Referer": referer} if referer else None)).text

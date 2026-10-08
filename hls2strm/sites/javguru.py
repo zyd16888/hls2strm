@@ -21,6 +21,7 @@ from selectolax.lexbor import LexborHTMLParser
 
 from ..codes import code_key
 from ..errors import FetchError, ParseError
+from ..quality import from_labels
 from .base import LineSpec, ListPage, Site, SourceDetail, SourceItem, StreamTraits
 from .hosts import HostStream, resolve_embed
 
@@ -166,6 +167,7 @@ class JavGuruSite(Site):
             tags=[{"slug": slug, "name": n} for n, slug in info.get("tags", []) if n],
             maker=(names("studio") or [""])[0], director=(names("director") or [""])[0],
             series=(names("label") or [""])[0], lines=lines,
+            claimed_height=(q.height if (q := from_labels(names("category"), "claimed")) else 0),
         )
 
     async def lookup(self, sf: SiteFetcher, code: str, uncensored: bool = False,

@@ -6,7 +6,7 @@ import { Chip, Mono, Notice, Panel, Table, Td, Th } from "@/components/ui/data";
 import { Check, Field, Input, Select, Switch, Textarea } from "@/components/ui/form";
 import { rewriteAll } from "@/lib/actions";
 import { api, type LineConfig, type LineSpecMeta, type SchemaProp, type SettingsResponse, type SettingsValues, type SiteConfig } from "@/lib/api";
-import { PLAY_MODES } from "@/lib/labels";
+import { PLAY_MODES, RESOLVE_MODES } from "@/lib/labels";
 import { useMeta, useRun } from "@/lib/queries";
 import { cn } from "@/lib/utils";
 
@@ -19,7 +19,25 @@ const GROUPS: { id: string; title: string; keys: string[] }[] = [
   {
     id: "play",
     title: "播放",
-    keys: ["public_base_url", "play_mode", "proxy_user_agents", "play_token", "hls_margin", "subtitle_priority", "subtitle_fallback", "play_discover", "resolve_timeout", "resolve_token", "resolve_proxy_url"],
+    keys: [
+      "public_base_url",
+      "play_mode",
+      "proxy_user_agents",
+      "play_token",
+      "hls_margin",
+      "subtitle_priority",
+      "subtitle_fallback",
+      "quality_first",
+      "quality_max",
+      "quality_unknown",
+      "prefer_direct",
+      "quality_capture",
+      "play_discover",
+      "resolve_timeout",
+      "resolve_token",
+      "resolve_mode",
+      "resolve_proxy_url",
+    ],
   },
 ];
 
@@ -50,9 +68,15 @@ const LABELS: Record<string, string> = {
   hls_margin: "有效期余量（分钟）",
   subtitle_priority: "字幕偏好",
   subtitle_fallback: "字幕回退",
+  quality_first: "画质优先",
+  quality_max: "画质上限",
+  quality_unknown: "未知画质按",
+  prefer_direct: "直连优先",
+  quality_capture: "顺手探测画质",
   play_discover: "现场找源",
   resolve_timeout: "取地址总时限（秒）",
   resolve_token: "网关解析令牌",
+  resolve_mode: "网关默认给的地址",
   resolve_proxy_url: "公网中转地址",
 };
 const REWRITE_KEYS = ["public_base_url", "play_mode", "play_token", "path_template", "output_dir", "write_nfo"];
@@ -174,7 +198,7 @@ function Control({ k, schema, value, draft, set }: { k: string; schema: SchemaPr
       <Select value={String(value)} onChange={e => set(k, e.target.value)} className="w-full max-w-md">
         {schema.enum.map(o => (
           <option key={o} value={o}>
-            {k === "play_mode" ? PLAY_MODES[o] ?? o : o}
+            {(k === "play_mode" ? PLAY_MODES : k === "resolve_mode" ? RESOLVE_MODES : {})[o] ?? o}
           </option>
         ))}
       </Select>

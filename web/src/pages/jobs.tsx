@@ -14,12 +14,13 @@ import { useJobs, useLibraries, useMeta, useRun, useStatus } from "@/lib/queries
 import { replaceParams, useRoute } from "@/lib/route";
 import { cn } from "@/lib/utils";
 
-type Kind = "list" | "videos" | "backfill" | "probe" | "verify" | "rewrite";
+type Kind = "list" | "videos" | "backfill" | "probe" | "quality" | "verify" | "rewrite";
 
 const KINDS: { value: Kind; label: string }[] = [
   { value: "list", label: "列表地址" },
   { value: "videos", label: "指定影片" },
   { value: "probe", label: "补源" },
+  { value: "quality", label: "画质探测" },
   { value: "backfill", label: "补全详情" },
   { value: "verify", label: "核对输出" },
   { value: "rewrite", label: "重写输出" },
@@ -139,7 +140,7 @@ function NewJob() {
   const [verify, setVerify] = useState({ repair: true, covers: true, details: false, force_external: false });
   const set = (patch: Partial<typeof f>) => setF(prev => ({ ...prev, ...patch }));
   const site = meta.site(f.site);
-  const allLibs = kind === "rewrite" || kind === "probe" || kind === "verify";
+  const allLibs = kind === "rewrite" || kind === "probe" || kind === "verify" || kind === "quality";
 
   const create = async () => {
     const body: Record<string, unknown> = { kind };
@@ -162,6 +163,8 @@ function NewJob() {
     videos: "抓取指定影片的详情并加入所选的库，比批量任务先执行。",
     backfill: "为所有还没有详情的影片排队抓详情，写入它们所在的各个库。",
     probe: "给库里的影片找备用源：按番号到所选站点逐部查找（每部一次请求），找到就挂成这部影片的另一个源，播放时原来的源不能用会自动换过去。某个站没有的影片，在「补源重查间隔」内不再重复查。",
+    quality:
+      "给还不知道画质的源认出分辨率：取播放地址、读一次播放列表（多码率的直接写着各档分辨率，Jable 这种单档的抽几个分片按码率估）。多线路的源每条线路各探一次，mp4 线路认不出、跳过。地址过期的要重新访问源站（详情页、播放页），按站点限速排队，影片多时要跑很久；平时抓详情、播放时已经会顺手探测（只请求 CDN），一般不用跑全库。",
     verify:
       "检查数据库里每条输出在磁盘上还在不在：strm 有没有、内容是不是当前的播放地址，nfo 和封面有没有。勾上「补回」会重新写 strm 和 nfo（不联网），封面先从别的库硬链接，没有再下载。没详情的影片不写 nfo，勾「抓详情」会给它们排队抓（按站点限速，外部整理库不抓）。外部整理库按 strm 内容在收件目录和外部整理目录里找，找到只更新记录的路径；两边都找不到才写回收件目录；外部整理目录不存在或是空的不补（多半是挂载出了问题）。",
     rewrite: "改了对外地址、播放模式、令牌或路径模板以后，用它重写已有的 strm 和 nfo（不联网），路径变了会搬动文件。",
@@ -183,9 +186,9 @@ function NewJob() {
           </Field>
         )}
         {kind !== "backfill" && (
-          <Field label={kind === "probe" ? "给哪个库的影片找" : "输出库"} className="w-44">
+          <Field label={kind === "probe" ? "给哪个库的影片找" : kind === "quality" ? "探测哪个库的影片" : "输出库"} className="w-44">
             <Select value={f.library_id} onChange={e => set({ library_id: Number(e.target.value) })}>
-              {allLibs && <option value={0}>{kind === "probe" ? "全部影片" : "全部库"}</option>}
+              {allLibs && <option value={0}>{kind === "probe" || kind === "quality" ? "全部影片" : "全部库"}</option>}
               {libraries.map(l => (
                 <option key={l.id} value={l.id}>
                   {l.name}

@@ -170,7 +170,7 @@ async def solver_test(body: SolverTestBody, request: Request):
 
 
 class JobCreate(BaseModel):
-    kind: Literal["list", "videos", "backfill", "rewrite", "probe", "verify"]
+    kind: Literal["list", "videos", "backfill", "rewrite", "probe", "verify", "quality"]
     site: str = "jable"
     source: str = ""
     sort: str = ""
@@ -228,6 +228,8 @@ async def create_job(body: JobCreate, request: Request):
         elif body.kind == "verify":
             job_id = await e.create_verify(body.library_id or None, repair=body.repair, covers=body.covers,
                                            force_external=body.force_external, details=bool(body.detail))
+        elif body.kind == "quality":
+            job_id = await e.create_quality(body.library_id or None)
         else:
             job_id = await e.create_rewrite(body.library_id)
     except ValueError as err:

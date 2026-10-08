@@ -215,6 +215,12 @@ interface StreamState {
   cooldown_until: number;
   last_error: string;
   status?: string;
+  /** 最高画质（分辨率的高），不知道为 null */
+  height: number | null;
+  /** 各档画质，从高到低，逗号分隔 */
+  heights: string;
+  /** 画质从哪来：master / embed / estimate / claimed，不知道为空 */
+  quality_src: string;
 }
 
 export interface SourceLine extends StreamState {
@@ -239,7 +245,6 @@ export interface Source extends StreamState {
   subtitle: string;
   status: "active" | "gone" | "disabled";
   direct: boolean;
-  height: number | null;
   line: string;
   lines?: SourceLine[];
   page_url: string;

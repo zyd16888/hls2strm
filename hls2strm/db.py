@@ -20,6 +20,7 @@ from typing import Any
 import aiosqlite
 
 from .codes import code_key
+from .quality import TRUST, Quality, parse_heights
 from .sites import SourceDetail, SourceItem
 
 log = logging.getLogger(__name__)
@@ -299,8 +300,20 @@ async def _migrate_v8(conn: aiosqlite.Connection) -> None:
     await conn.execute("DELETE FROM source_checks WHERE site='supjav' AND found=0")
 
 
+async def _migrate_v9(conn: aiosqlite.Connection) -> None:
+    """画质：源和线路各记各档分辨率（heights，从高到低）、来源、上次探测时间；线路也记最高分辨率。
+    之前中转主播放列表时记下的 height 算作来自主播放列表。"""
+    for table in ("sources", "source_lines"):
+        await conn.execute(f"ALTER TABLE {table} ADD COLUMN heights TEXT NOT NULL DEFAULT ''")
+        await conn.execute(f"ALTER TABLE {table} ADD COLUMN quality_src TEXT NOT NULL DEFAULT ''")
+        await conn.execute(f"ALTER TABLE {table} ADD COLUMN quality_at INTEGER")
+    await conn.execute("ALTER TABLE source_lines ADD COLUMN height INTEGER")
+    await conn.execute(
+        "UPDATE sources SET heights=CAST(height AS TEXT), quality_src='master' WHERE height IS NOT NULL AND height>0")
+
+
 MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
-              _migrate_v8]
+              _migrate_v8, _migrate_v9]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")
@@ -669,6 +682,11 @@ class Database:
                               fail_streak=0, last_ok_at=?, last_error='', updated_at=? WHERE id=?""",
                     (d.stream_url, d.stream_expires, d.subtitle, t, t, t, source_id),
                 )
+            if d.claimed_height:  # 站点标注的画质：只在还没有更可靠的结果时记
+                await self.conn.execute(
+                    "UPDATE sources SET height=?, heights=?, quality_src='claimed' WHERE id=? AND quality_src IN ('', 'claimed')",
+                    (d.claimed_height, str(d.claimed_height), source_id),
+                )
             primary = await self._is_primary(video_id, site, rank)
             async with self.conn.execute("SELECT * FROM videos WHERE id=?", (video_id,)) as cur:
                 work = _video_row(await cur.fetchone())
@@ -714,8 +732,10 @@ class Database:
             out.setdefault(r["source_id"], []).append(dict(r))
         return out
 
-    async def set_line_stream(self, line_id: int, url: str, expires: int | None, host: str, referer: str = "") -> None:
-        """线路取到直链：记下直链（和中转时要带的 Referer），并设成这个源当前在用的线路。"""
+    async def set_line_stream(self, line_id: int, url: str, expires: int | None, host: str, referer: str = "",
+                              *, use: bool = True) -> None:
+        """线路取到直链：记下直链（和中转时要带的 Referer）；use 时设成这个源当前在用的线路
+        （探测画质时不切：正在中转的播放只认当前线路）。"""
         t = now()
         async with self._tx():
             await self.conn.execute(
@@ -723,11 +743,43 @@ class Database:
                           last_ok_at=?, last_error='', updated_at=? WHERE id=?""",
                 (url, expires, host, referer, t, t, line_id),
             )
+            if not use:
+                return
             await self.conn.execute(
                 """UPDATE sources SET stream_url=?, stream_expires=?, line=(SELECT line FROM source_lines WHERE id=?),
                           status='active', fail_streak=0, last_ok_at=?, last_error='', updated_at=?
                    WHERE id=(SELECT source_id FROM source_lines WHERE id=?)""",
                 (url, expires, line_id, t, t, line_id),
+            )
+
+    async def set_quality(self, source_id: int, line_id: int | None, q: Quality | None) -> None:
+        """记下探测到的画质，可信度低的不覆盖高的；q 为 None 表示探测过但没认出来（mp4 等），只记时间、过一阵再试。
+        线路的画质变了，源上跟着记各线路里最好的那份（挑源时用）。"""
+        t = now()
+        table, row_id = ("source_lines", line_id) if line_id else ("sources", source_id)
+        async with self._tx():
+            async with self.conn.execute(f"SELECT quality_src FROM {table} WHERE id=?", (row_id,)) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                return
+            if q is None or not q.heights or TRUST[q.src] < TRUST.get(row["quality_src"], 0):
+                await self.conn.execute(f"UPDATE {table} SET quality_at=? WHERE id=?", (t, row_id))
+                return
+            await self.conn.execute(
+                f"UPDATE {table} SET height=?, heights=?, quality_src=?, quality_at=? WHERE id=?",
+                (q.height, ",".join(map(str, q.heights)), q.src, t, row_id),
+            )
+            if not line_id:
+                return
+            async with self.conn.execute(
+                "SELECT heights, quality_src FROM source_lines WHERE source_id=? AND height>0 ORDER BY height DESC",
+                (source_id,),
+            ) as cur:
+                lines = await cur.fetchall()
+            heights = parse_heights([h for ln in lines for h in parse_heights(ln["heights"])])
+            await self.conn.execute(
+                "UPDATE sources SET height=?, heights=?, quality_src=?, quality_at=? WHERE id=?",
+                (heights[0], ",".join(map(str, heights)), lines[0]["quality_src"], t, source_id),
             )
 
     async def use_line(self, source_id: int, line: dict) -> None:
@@ -823,6 +875,19 @@ class Database:
             if cur is None or rank(r["site"]) < rank(cur[0]):
                 best[r["video_id"]] = (r["site"], r["key"])
         return list(best.values())
+
+    async def sources_needing_quality(self, tried_before: int, library_id: int | None = None) -> list[dict]:
+        """还不知道画质的可用源（源本身或它的某条线路只有站点标注、或者什么都没有），tried_before 之后试过的跳过。"""
+        sql = """SELECT s.id, s.site FROM sources s JOIN videos v ON v.id=s.video_id
+                 WHERE s.status='active' AND v.status='active'
+                   AND ((s.quality_src IN ('', 'claimed') AND (s.quality_at IS NULL OR s.quality_at<?))
+                        OR EXISTS (SELECT 1 FROM source_lines l WHERE l.source_id=s.id
+                                     AND l.quality_src IN ('', 'claimed') AND (l.quality_at IS NULL OR l.quality_at<?)))"""
+        params: list = [tried_before, tried_before]
+        if library_id:
+            sql += " AND EXISTS (SELECT 1 FROM outputs o WHERE o.video_id=v.id AND o.library_id=?)"
+            params.append(library_id)
+        return [dict(r) for r in await self._all(sql + " ORDER BY s.video_id DESC", params)]
 
     async def set_source_check(self, video_id: int, site: str, found: bool) -> None:
         await self._write(

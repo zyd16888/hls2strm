@@ -20,8 +20,23 @@ export const KIND_NAMES: Record<string, string> = {
   probe: "补源",
   verify: "核对输出",
   cover: "补封面",
+  quality: "画质探测",
 };
 export const kindName = (k: string) => KIND_NAMES[k] || k;
+
+const QUALITY_SOURCES: Record<string, string> = { master: "主播放列表", embed: "播放页标注", estimate: "按码率估计", claimed: "站点标注" };
+const qualityName = (h: number) => (h >= 2000 ? "4K" : `${h}p`);
+
+/** 画质徽标的文字和说明：估计的、站点标注的前面加「约」；不知道返回 null */
+export function qualityChip(row: { height: number | null; heights: string; quality_src: string }): { text: string; title: string } | null {
+  if (!row.height) return null;
+  const rough = row.quality_src === "estimate" || row.quality_src === "claimed";
+  const all = (row.heights || String(row.height)).split(",").filter(Boolean).map(Number);
+  return {
+    text: (rough ? "约 " : "") + qualityName(row.height),
+    title: `画质 ${all.map(qualityName).join(" / ")}（${QUALITY_SOURCES[row.quality_src] ?? "来源未知"}）`,
+  };
+}
 
 export const JOB_STATUS: Record<JobStatus, [string, Tone]> = {
   running: ["运行中", "ok"],
@@ -54,6 +69,12 @@ export const PLAY_MODES: Record<string, string> = {
   redirect: "302 跳转（ffmpeg 类客户端自动中转）",
   proxy: "全部中转",
   direct: "直写 CDN 地址（仅调试）",
+};
+
+export const RESOLVE_MODES: Record<string, string> = {
+  auto: "按挑源偏好（能直连给 CDN 地址，要中转给中转地址）",
+  redirect: "只挑能直连的源",
+  proxy: "一律走中转",
 };
 
 export const PROBE_STATUS: Record<string, [string, Tone]> = {

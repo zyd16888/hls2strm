@@ -62,6 +62,7 @@ class SourceDetail:
     series: str = ""
     variants: list[str] = field(default_factory=list)  # 同一部片在本站其他版本的 key（中字、无码流出等）
     lines: list[tuple[str, str]] = field(default_factory=list)  # 多线路站点：[(线路名, 取直链要用的数据)]
+    claimed_height: int = 0  # 站点标注的画质（分类里的 1080p、标题里的 [4K]），不一定准
 
 
 @dataclass

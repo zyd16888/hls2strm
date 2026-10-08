@@ -70,8 +70,8 @@ def create_app(boot: BootConfig | None = None) -> FastAPI:
         metrics = Metrics()
         fetcher = Fetcher(store, metrics)
         writer = OutputWriter(store)
-        resolver = Resolver(db, fetcher, store, metrics)
         engine = Engine(db, fetcher, writer, store, metrics, boot)
+        resolver = engine.resolver
         auth = Auth(boot, await load_secret(db))
         app.state.ctx = Context(boot, auth, db, store, metrics, fetcher, writer, resolver, engine)
         log.info("启动：数据目录 %s，输出目录 %s，对外地址 %s", boot.data_dir, store.output_dir, store.public_base_url)

@@ -114,6 +114,7 @@ def test_server_streams():
     })
     st = asyncio.run(SUPJAV.resolve_line(http, "EVS", servers["EVS"]))
     assert "/master.m3u8?" in st.url and st.expires == 1791427648 + 129600 and st.host == "vidhide"
+    assert (st.quality.heights, st.quality.src) == ([1080, 720, 480], "embed")  # 播放页标注的各档画质
     assert http.calls[0][1] == "https://supjav.com/" and http.calls[1] == (
         "https://evsishere.xyz/embed/kmsebjxu7891", "https://lk1.supremejav.com/")
 

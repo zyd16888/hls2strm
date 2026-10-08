@@ -3,6 +3,7 @@ import io
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
@@ -62,6 +63,11 @@ class FakeFetcher:
         if url.endswith(".m3u8"):
             return b"#EXTM3U\n#EXTINF:3600.0,\na.ts\n#EXTINF:1800.5,\nb.ts\n#EXT-X-ENDLIST\n"
         return jpeg()
+
+    async def fetch(self, url: str, *, method: str = "GET", headers=None, **kw):
+        """站外请求：只用来 HEAD 分片看大小（探测画质），按 files 里登记的内容算，没登记的当 450 MB。"""
+        size = len(self.files[url]) if url in self.files else 450_000_000
+        return SimpleNamespace(status_code=200, headers={"content-length": str(size)}, text="", url=url)
 
 
 class FakeSite:
