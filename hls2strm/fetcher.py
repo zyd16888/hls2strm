@@ -112,6 +112,14 @@ def looks_like_challenge(html: str) -> bool:
     return "<title>Just a moment" in head or "_cf_chl_opt" in head or "<title>请稍候" in head
 
 
+async def close_stream(resp) -> None:
+    """关闭 stream=True 的响应。curl_cffi 的 aclose() 只等传输结束：不先设 quit_now 的话，客户端拖动、断开后
+    会把整个文件继续下完、堆在内存里（mp4 中转时就是几百 MB）。"""
+    if getattr(resp, "quit_now", None) is not None:
+        resp.quit_now.set()
+    await resp.aclose()
+
+
 _REDIRECT_STUB_RE = re.compile(r"location\.(?:replace|assign)\(|location\.href\s*=|http-equiv=[\"']?refresh", re.I)
 
 

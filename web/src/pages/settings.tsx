@@ -39,6 +39,7 @@ const GROUPS: { id: string; title: string; keys: string[] }[] = [
       "resolve_proxy_url",
     ],
   },
+  { id: "health", title: "连通性", keys: ["health_rank", "health_interval", "health_samples", "health_bytes", "health_slow_kbps"] },
 ];
 
 const LABELS: Record<string, string> = {
@@ -55,6 +56,11 @@ const LABELS: Record<string, string> = {
   fetch_detail: "默认抓详情",
   auto_probe_sites: "新片自动补源",
   probe_recheck_days: "补源重查间隔（天）",
+  health_rank: "按连通性挑源",
+  health_interval: "定时检测间隔（分钟）",
+  health_samples: "每个播放站抽几部",
+  health_bytes: "每次下载多少（KB）",
+  health_slow_kbps: "低于多少算慢（kbps）",
   external_restore: "外部整理库补回丢失的 strm",
   output_dir: "输出根目录",
   path_template: "默认路径模板",

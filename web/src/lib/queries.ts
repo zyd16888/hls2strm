@@ -2,7 +2,7 @@
 
 import { keepPreviousData, QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { api, type FacetField, type FacetItem, type Job, type Library, type Meta, type SiteMeta, type Status, type Subscription } from "./api";
+import { api, type FacetField, type FacetItem, type HealthResponse, type Job, type Library, type Meta, type SiteMeta, type Status, type Subscription } from "./api";
 
 export const queryClient = new QueryClient({
   defaultOptions: {
@@ -37,6 +37,14 @@ export function useSubscriptions(poll = false) {
     queryKey: ["subscriptions"],
     queryFn: () => api.get<Subscription[]>("/api/subscriptions"),
     refetchInterval: poll ? POLL : false,
+  });
+}
+
+export function useHealth() {
+  return useQuery({
+    queryKey: ["health"],
+    queryFn: () => api.get<HealthResponse>("/api/health"),
+    refetchInterval: q => (q.state.data?.checking ? 3000 : 30000),
   });
 }
 

@@ -26,9 +26,10 @@ from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from .config import SettingsStore
 from .db import Database, source_cooldown
 from .errors import RelayAborted
-from .fetcher import Blocked, FetchError, Fetcher, NotFound
+from .fetcher import Blocked, FetchError, Fetcher, NotFound, close_stream
 from .observability import Metrics
 from .parser import ParseError, VideoGone
+from .health import HealthTracker, host_key
 from .quality import QualityProber, from_master, label as quality_label, needed as quality_needed
 from .sites.hosts import ts_start
 from .sites import SITES, Site, SourceDetail, StreamTraits, find_by_code, get_site
@@ -67,12 +68,17 @@ class Resolved:
         return replace(t, direct=False) if self.proxy_forced else t
 
     @property
+    def host(self) -> str:
+        """播放站（连通性按它记）。"""
+        return host_key(self.site, self.line)
+
+    @property
     def url(self) -> str:
-        return self.source["stream_url"]
+        return (self.line or self.source)["stream_url"]
 
     @property
     def expires(self) -> int | None:
-        return self.source["stream_expires"]
+        return (self.line or self.source)["stream_expires"]
 
 
 class Resolver:
@@ -84,14 +90,15 @@ class Resolver:
         self.store = store
         self.metrics = metrics
         self.quality = QualityProber(db, fetcher)
+        self.health = HealthTracker(store)
         self._locks: dict[int, asyncio.Lock] = {}
 
     # ---- 挑源 ----
 
     def rank(self, sources: list[dict], *, site: str | None = None, direct_only: bool = False,
              remote: bool = False) -> list[dict]:
-        """可用的源按播放优先顺序排列：字幕偏好 → 不在失败冷却中 →（直连优先时）能 302 的 → 画质 → 站点优先级
-        → 有现成地址。画质优先关掉时，画质排在站点优先级后面。
+        """可用的源按播放优先顺序排列：字幕偏好 → 不在失败冷却中 →（按连通性挑源时）播放站的连通性
+        →（直连优先时）能 302 的 → 画质 → 站点优先级 → 有现成地址。画质优先关掉时，画质排在站点优先级后面。
 
         字幕不回退（subtitle_fallback 关）时，只留首选里现有的那一档字幕。
         remote：播放器是外网客户端（网关），绑了本服务出口 IP 的直链不算能 302。
@@ -117,7 +124,8 @@ class Resolver:
             best = min(tier(x) for x in out)
             out = [x for x in out if tier(x) == best]
         q = self.quality_key
-        return sorted(out, key=lambda x: (tier(x), source_cooldown(x) > t,
+        health = self.health.source_tier if s.health_rank else lambda _: 0
+        return sorted(out, key=lambda x: (tier(x), source_cooldown(x) > t, health(get_site(x["site"])),
                                           s.prefer_direct and not self._can_302(get_site(x["site"]), remote),
                                           q(x["height"]) if s.quality_first else (), s.site_rank(x["site"]),
                                           not self._fresh(x, 60), q(x["height"])))
@@ -164,8 +172,8 @@ class Resolver:
 
     def rank_lines(self, site: Site, lines: list[dict], *, want: str | None = None,
                    direct_only: bool = False, remote: bool = False) -> list[dict]:
-        """一个源的线路按设置排好：启用的、支持的；不在失败冷却中的在前，（直连优先时）能 302 的在前，
-        画质优先时再比画质，最后按设置里的线路顺序。"""
+        """一个源的线路按设置排好：启用的、支持的；不在失败冷却中的在前，（按连通性挑源时）播放站连通性好的在前，
+        （直连优先时）能 302 的在前，画质优先时再比画质，最后按设置里的线路顺序。"""
         s = self.store.current
         cfg = s.site(site.name)
         t = time.time()
@@ -185,7 +193,10 @@ class Resolver:
             tr = site.line_traits(ln["line"], ln["host"])
             return tr.direct and not cfg.line(ln["line"]).proxy and not (remote and tr.ip_bound)
 
-        return sorted(out, key=lambda ln: (source_cooldown(ln) > t, s.prefer_direct and not can_302(ln),
+        def health(ln: dict) -> int:
+            return self.health.tier(host_key(site, ln)) if s.health_rank else 0
+
+        return sorted(out, key=lambda ln: (source_cooldown(ln) > t, health(ln), s.prefer_direct and not can_302(ln),
                                            self.quality_key(ln["height"]) if s.quality_first else (),
                                            cfg.line_rank(ln["line"])))
 
@@ -359,7 +370,12 @@ class Resolver:
                     return Resolved(v, src, site)
             elif self._fresh(src, need):
                 return Resolved(v, src, site)
-            st = await site.fetch_stream(self.fetcher.site(site.name), src["key"])
+            try:
+                st = await site.fetch_stream(self.fetcher.site(site.name), src["key"])
+            except (FetchError, ParseError) as e:
+                self.health.record(site.name, False, error=str(e))
+                raise
+            self.health.record(site.name, True)
             if st.detail is not None:
                 await self.db.upsert_detail(site.name, st.detail, v["slug"], self.store.current.site_rank)
             await self.db.set_stream(src["id"], st.url, st.expires)
@@ -392,15 +408,11 @@ class Resolver:
                         self.metrics.inc("play_cache_hit")
                         return await self._resolved(v, src["id"], site, ln["id"])
                     try:
-                        hs = await site.resolve_line(self.fetcher, ln["line"], ln["link"])
+                        await self._refresh_line(src, site, ln, use=True)
                     except (FetchError, ParseError, NotFound, ValueError, KeyError) as e:
-                        await self.db.line_failed(ln["id"], str(e))
                         errors.append(f"{ln['line']}：{e}")
                         log.info("%s %s 线路 %s 取直链失败：%s", site.label, src["key"], ln["line"], e)
                         continue
-                    await self.db.set_line_stream(ln["id"], hs.url, hs.expires, hs.host, hs.referer)
-                    if hs.quality is not None:
-                        await self.db.set_quality(src["id"], ln["id"], hs.quality)
                     self.metrics.inc("play_refresh")
                     return await self._resolved(v, src["id"], site, ln["id"])
                 if refreshed:
@@ -409,6 +421,30 @@ class Resolver:
                 refreshed = True
                 lines = await self.db.get_lines(src["id"])
         raise FetchError("；".join(errors) or "没有可用的线路（都停用了，或者都不支持）")
+
+    async def _refresh_line(self, src: dict, site: Site, ln: dict, *, use: bool) -> None:
+        """现取这条线路的直链，记下直链、画质和播放站的连通性；失败时线路进冷却。use：设成源当前在用的线路。"""
+        try:
+            hs = await site.resolve_line(self.fetcher, ln["line"], ln["link"])
+        except (FetchError, ParseError, NotFound, ValueError, KeyError) as e:
+            await self.db.line_failed(ln["id"], str(e))
+            if not isinstance(e, NotFound):
+                self.health.record(host_key(site, ln), False, error=str(e))
+            raise
+        self.health.record(host_key(site, {"line": ln["line"], "host": hs.host}), True)
+        await self.db.set_line_stream(ln["id"], hs.url, hs.expires, hs.host, hs.referer, use=use)
+        if hs.quality is not None:
+            await self.db.set_quality(src["id"], ln["id"], hs.quality)
+
+    async def line_stream(self, v: dict, src: dict, ln: dict, need: int = 60) -> Resolved:
+        """指定线路的新鲜地址（探测画质、检测连通性用）：有没过期的现成地址就不访问播放站；
+        不切换源当前在用的线路（正在中转的播放只认当前线路）。"""
+        site = get_site(src["site"])
+        traits = site.line_traits(ln["line"], ln["host"])
+        if not (ln["stream_url"] and (not traits.expires or (ln["stream_expires"] or 0) - time.time() >= need)):
+            await self._refresh_line(src, site, ln, use=False)
+            ln = next(x for x in await self.db.get_lines(src["id"]) if x["id"] == ln["id"])
+        return Resolved(v, src, site, ln, self.store.current.site(site.name).line(ln["line"]).proxy)
 
     async def _refresh_detail(self, v: dict, src: dict, site: Site) -> None:
         d = await site.fetch_detail(self.fetcher.site(site.name), src["key"], priority=True)
@@ -664,16 +700,15 @@ def _upstream(r: Resolved, path: str) -> str | None:
     return r.url.rsplit("/", 1)[0] + "/" + path
 
 
-async def close_stream(resp) -> None:
-    """关闭 stream=True 的响应。curl_cffi 的 aclose() 只等传输结束：不先设 quit_now 的话，客户端拖动、断开后
-    会把整个文件继续下完、堆在内存里（mp4 中转时就是几百 MB）。"""
-    if getattr(resp, "quit_now", None) is not None:
-        resp.quit_now.set()
-    await resp.aclose()
+def _cdn_error(request: Request, r: Resolved, msg: str) -> HTTPException:
+    """中转时 CDN 出错：记进这个播放站的连通性，返回给播放器 502。"""
+    _ctx(request).resolver.health.record(r.host, False, error=msg)
+    return HTTPException(502, msg)
 
 
-def _relay_aborted(r: Resolved, what: str, sent: int, e: Exception) -> RelayAborted:
-    """中转传到一半 CDN 断开：记一行日志，返回的异常抛出去让 uvicorn 断开连接（播放器会重试这一段）。"""
+def _relay_aborted(request: Request, r: Resolved, what: str, sent: int, e: Exception) -> RelayAborted:
+    """中转传到一半 CDN 断开：记一行日志、记进连通性，返回的异常抛出去让 uvicorn 断开连接（播放器会重试这一段）。"""
+    _ctx(request).resolver.health.record(r.host, False, error=f"传到一半断开：{e}")
     line = f" 线路 {r.line['line']}" if r.line else ""
     log.warning("中转 %s：%s%s 的 %s 传到 %d KB 时 CDN 断开：%s", r.video["slug"], r.site.label, line, what,
                 sent // 1024, e)
@@ -694,10 +729,11 @@ async def _proxy_file(request: Request, r: Resolved) -> Response:
         resp = await ctx.fetcher.session.get(r.url, stream=True, headers=headers,
                                              timeout=ctx.store.current.request_timeout)
     except Exception as e:
-        raise HTTPException(502, f"请求直链失败：{e}") from None
+        raise _cdn_error(request, r, f"请求直链失败：{e}") from None
     if resp.status_code not in (200, 206):
         await close_stream(resp)
-        raise HTTPException(502, f"直链返回 HTTP {resp.status_code}")
+        raise _cdn_error(request, r, f"直链返回 HTTP {resp.status_code}")
+    ctx.resolver.health.record(r.host, True)
     out = {k: v for k in ("content-length", "content-range", "accept-ranges")
            if (v := resp.headers.get(k))}
     if request.method == "HEAD":
@@ -712,7 +748,7 @@ async def _proxy_file(request: Request, r: Resolved) -> Response:
                 sent += len(chunk)
                 yield chunk
         except CurlError as e:
-            raise _relay_aborted(r, "视频文件", sent, e) from None
+            raise _relay_aborted(request, r, "视频文件", sent, e) from None
         finally:
             await close_stream(resp)
 
@@ -725,7 +761,8 @@ async def _proxy_playlist(request: Request, r: Resolved, t: str) -> Response:
     try:
         raw = await ctx.fetcher.get_bytes(r.url, headers=r.traits.headers)
     except (FetchError, NotFound) as e:
-        raise HTTPException(502, f"获取播放列表失败：{e}") from None
+        raise _cdn_error(request, r, f"获取播放列表失败：{e}") from None
+    ctx.resolver.health.record(r.host, True)
     q = f"?t={quote(t)}" if t else ""
     root = r.url.rsplit("/", 1)[0] + "/"
     body = raw.decode("utf-8", "replace")
@@ -761,7 +798,7 @@ async def hls_file(source_id: int, path: str, request: Request, t: str = ""):
             resp = await ctx.fetcher.session.get(url, stream=True, timeout=ctx.store.current.request_timeout,
                                                  headers=headers_up)
         except Exception as e:
-            raise HTTPException(502, f"CDN 请求失败：{e}") from None
+            raise _cdn_error(request, r, f"CDN 请求失败：{e}") from None
         if resp.status_code in (403, 410) and attempt == 0 and not path.startswith("_x/"):
             await close_stream(resp)
             ctx.metrics.inc("play_token_expired")
@@ -772,7 +809,8 @@ async def hls_file(source_id: int, path: str, request: Request, t: str = ""):
             continue
         if resp.status_code != 200:
             await close_stream(resp)
-            raise HTTPException(502, f"CDN 返回 HTTP {resp.status_code}")
+            raise _cdn_error(request, r, f"CDN 返回 HTTP {resp.status_code}")
+        ctx.resolver.health.record(r.host, True)
         cors = dict(CORS_HEADERS) if request.headers.get("origin") else {}
         if path.endswith(".m3u8"):
             body = b"".join([chunk async for chunk in resp.aiter_content()])
@@ -800,7 +838,7 @@ async def hls_file(source_id: int, path: str, request: Request, t: str = ""):
                 if strip and head:
                     yield head[max(ts_start(head), 0):]
             except CurlError as e:
-                raise _relay_aborted(r, path, sent, e) from None
+                raise _relay_aborted(request, r, path, sent, e) from None
             finally:
                 await close_stream(resp)
 

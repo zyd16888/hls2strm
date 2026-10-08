@@ -24,6 +24,7 @@ from .config import Settings
 from .db import DEFAULT_LIBRARY_ID, FACET_FIELDS, VIDEO_SORTS, VideoQuery, source_cooldown
 from .engine import snapshot_path
 from .fetcher import Blocked, FetchError, NotFound, ping_solver
+from .health import host_key
 from .observability import get_level, ring, set_level
 from .parser import ParseError, VideoGone
 from .rules import describe_rule
@@ -132,6 +133,22 @@ async def fetcher_reset(request: Request, site: str | None = None):
     c.fetcher.reset_cooldowns(site)
     c.engine.clear_blocked(site)
     return {"ok": True}
+
+
+@router.get("/health")
+async def health_list(request: Request):
+    """各播放站的连通性；checking：正在检测；next_at：下次定时检测的时间（关了为 0）。"""
+    c = _ctx(request)
+    e = c.engine
+    interval = c.store.current.health_interval * 60
+    return {"hosts": c.resolver.health.view(), "checking": e._health_task is not None and not e._health_task.done(),
+            "next_at": int(e._health_at + interval) if interval else 0}
+
+
+@router.post("/health/check")
+async def health_check(request: Request):
+    """立即在后台检测一轮（不等结果，结果看 GET /api/health）。"""
+    return {"started": _ctx(request).engine.start_health_check()}
 
 
 @router.post("/fetcher/test")
@@ -290,7 +307,7 @@ def _line_view(c, site, ln: dict) -> dict:
     return {**ln, "host_label": HOST_LABELS.get(ln["host"] or (spec.host if spec else ""), ln["host"]),
             "enabled": cfg.enabled, "supported": spec is None or spec.supported,
             "direct": t.direct and not cfg.proxy, "ip_bound": t.ip_bound, "expires_stream": t.expires,
-            "cooldown_until": source_cooldown(ln)}
+            "cooldown_until": source_cooldown(ln), "health": c.resolver.health.tier(host_key(site, ln))}
 
 
 def _source_view(c, src: dict, lines: list[dict] | None = None) -> dict:
@@ -300,6 +317,7 @@ def _source_view(c, src: dict, lines: list[dict] | None = None) -> dict:
     out["direct"] = bool(site and site.stream.direct)
     out["expires_stream"] = bool(site and site.stream.expires)
     out["cooldown_until"] = source_cooldown(src)
+    out["health"] = c.resolver.health.source_tier(site) if site else 0
     if site and site.multi_line:
         cfg = c.store.current.site(site.name)
         out["lines"] = sorted((_line_view(c, site, ln) for ln in lines or []),

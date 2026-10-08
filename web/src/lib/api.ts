@@ -221,6 +221,32 @@ interface StreamState {
   heights: string;
   /** 画质从哪来：master / embed / estimate / claimed，不知道为空 */
   quality_src: string;
+  /** 播放站的连通性：0 正常（或不知道）/ 1 慢 / 2 不稳 / 3 不通 */
+  health: number;
+}
+
+export interface HostHealth {
+  key: string;
+  label: string;
+  tier: number;
+  tier_name: string;
+  /** 成功率的指数平均，0–1 */
+  score: number;
+  kbps: number;
+  ttfb_ms: number;
+  ok: number;
+  fail: number;
+  last_ok_at: number;
+  last_fail_at: number;
+  last_error: string;
+  checked_at: number;
+}
+
+export interface HealthResponse {
+  hosts: HostHealth[];
+  checking: boolean;
+  /** 下次定时检测的时间，关了为 0 */
+  next_at: number;
 }
 
 export interface SourceLine extends StreamState {

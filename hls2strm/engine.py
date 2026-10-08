@@ -31,9 +31,10 @@ from .db import DEFAULT_LIBRARY_ID, Database
 from .fetcher import Blocked, FetchError, Fetcher, NotFound
 from .observability import Metrics
 from .parser import ParseError, VideoGone, m3u8_duration
-from .play import Resolved, Resolver
+from .health import host_key, host_label, measure
+from .play import Resolver
 from .quality import RETRY_AFTER as QUALITY_RETRY_AFTER, SOURCE_NAMES as QUALITY_SOURCES, Quality
-from .quality import label as quality_label, needed as quality_needed
+from .quality import label as quality_label, needed as quality_needed, parse_heights
 from .sites.hosts import MP4_HOSTS
 from .rules import describe_rule, match_rule, normalize_rule
 from .sites import SITES, Site, SourceDetail, SourceItem, find_by_code, get_site
@@ -90,11 +91,15 @@ class Engine:
         self.missing: dict[int, int] = {}  # 库 id -> 有记录但磁盘上找不到的 strm 数（启动时、核对后统计）
         self._missing_task: asyncio.Task | None = None
         self._progress_at: dict[int, float] = {}  # 任务 id -> 上次在日志里报进度的时间
+        self._health_task: asyncio.Task | None = None
+        self._health_at = 0.0  # 上次定时检测连通性的时间
 
     # ---- 生命周期 ----
 
     async def start(self) -> None:
         await self.reload_libraries()
+        self.resolver.health.load(await self.db.load_health())
+        self._health_at = time.time()  # 刚启动不马上检测，等一个间隔
         n = await self.db.reset_running_tasks()
         if n:
             log.info("上次退出时有 %d 个子任务未完成，已放回队列", n)
@@ -114,9 +119,12 @@ class Engine:
             tasks.append(self._scheduler)
         if self._missing_task and not self._missing_task.done():
             tasks.append(self._missing_task)
+        if self._health_task and not self._health_task.done():
+            tasks.append(self._health_task)
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await self._save_health()
 
     def _worker_count(self) -> int:
         """worker 总数 = 各启用站点的并发之和；各站点实际并发在领任务时再限制。"""
@@ -1150,25 +1158,85 @@ class Engine:
             if (ln["host"] or (spec.host if spec else "")) in MP4_HOSTS:
                 await self.db.set_quality(src["id"], ln["id"], None)  # mp4 直链读不出画质，不白取地址
                 continue
-            traits = site.line_traits(ln["line"], ln["host"])
-            if not (ln["stream_url"] and (not traits.expires or (ln["stream_expires"] or 0) - time.time() >= 60)):
-                try:
-                    hs = await site.resolve_line(self.fetcher, ln["line"], ln["link"])
-                except (FetchError, ParseError, NotFound, ValueError, KeyError) as e:
-                    await self.db.line_failed(ln["id"], str(e))
-                    await self.db.set_quality(src["id"], ln["id"], None)
-                    found.append(f"{ln['line']} 取直链失败")
-                    continue
-                await self.db.set_line_stream(ln["id"], hs.url, hs.expires, hs.host, hs.referer, use=False)
-                if hs.quality is not None:
-                    await self.db.set_quality(src["id"], ln["id"], hs.quality)
-                    found.append(f"{ln['line']} {_quality_text(hs.quality)}")
-                    continue
-                ln = next(x for x in await self.db.get_lines(src["id"]) if x["id"] == ln["id"])
-            r = Resolved(v, src, site, ln)
-            q = await probe(src["id"], ln["id"], ln["stream_url"], r.traits.headers)
+            try:
+                r = await self.resolver.line_stream(v, src, ln)
+            except (FetchError, ParseError, NotFound, ValueError, KeyError):
+                await self.db.set_quality(src["id"], ln["id"], None)
+                found.append(f"{ln['line']} 取直链失败")
+                continue
+            if quality_needed(r.line):  # 播放页标了各档画质的（VidHide），取直链时已经记下
+                q = await probe(src["id"], ln["id"], r.url, r.traits.headers)
+            else:
+                q = Quality(parse_heights(r.line["heights"]), r.line["quality_src"])
             found.append(f"{ln['line']} {_quality_text(q)}")
         log.info("画质探测 %s %s：%s", site.label, src["key"], "，".join(found) or "没有要探测的线路")
+
+    # ---- 播放连通性 ----
+
+    def start_health_check(self) -> bool:
+        """后台检测一轮各播放站的连通性；已经在检测返回 False。"""
+        if self._health_task is not None and not self._health_task.done():
+            return False
+        self._health_at = time.time()
+        self._health_task = asyncio.create_task(self.check_health(), name="health-check")
+        return True
+
+    async def check_health(self) -> None:
+        """每个启用的播放站抽几部最近播过的片：取地址（有没过期的现成地址就不访问源站）、下载一个分片的开头测速。
+        站点拦截中的跳过（那是源站的事，不算 CDN 的账）；片子下架了换下一部。"""
+        s = self.store.current
+        health = self.resolver.health
+        t0 = time.monotonic()
+        results = []
+        for key, samples in (await self._health_targets(s.health_samples)).items():
+            done = 0
+            for src in samples:
+                if done >= s.health_samples:
+                    break
+                v = await self.db.get_video_by_id(src["video_id"])
+                try:
+                    r = (await self.resolver.line_stream(v, src, src["line_row"]) if src.get("line_row")
+                         else await self.resolver._ensure(v, src, 60))
+                except (NotFound, VideoGone):
+                    continue
+                except Blocked:
+                    break
+                except (FetchError, ParseError, ValueError, KeyError):
+                    done += 1
+                    health.touch(key)  # 取地址失败在取地址时已经记进连通性了
+                    results.append(f"{host_label(key)} 取地址失败")
+                    continue
+                done += 1
+                try:
+                    ttfb, kbps = await measure(self.fetcher, r.url, r.traits.headers, s.health_bytes * 1024)
+                except (FetchError, NotFound) as e:
+                    health.record(key, False, error=str(e), checked=True)
+                    results.append(f"{host_label(key)} 不通（{e}）")
+                    continue
+                health.record(key, True, ttfb_ms=ttfb, kbps=kbps, checked=True)
+                results.append(f"{host_label(key)} {kbps / 1000:.1f} Mbps、首字节 {ttfb:.0f} ms")
+        await self._save_health()
+        log.info("连通性检测（%.0fs）：%s", time.monotonic() - t0, "；".join(results) or "没有可检测的播放站（还没有播过的片）")
+
+    async def _health_targets(self, samples: int) -> dict[str, list[dict]]:
+        """各播放站的检测样本：单线路站点按站点，多线路站点按启用的每条线路（同一个播放站的合在一起）。"""
+        s = self.store.current
+        out: dict[str, list[dict]] = {}
+        for name, site in SITES.items():
+            if not s.site(name).enabled:
+                continue
+            if not site.multi_line:
+                out.setdefault(host_key(site), []).extend(await self.db.health_samples(name, None, samples * 3))
+                continue
+            for line, spec in site.line_specs.items():
+                if s.site(name).line(line).enabled and spec.supported:
+                    out.setdefault(host_key(site, None, line), []).extend(
+                        await self.db.health_samples(name, line, samples * 3))
+        return {k: v for k, v in out.items() if v}
+
+    async def _save_health(self) -> None:
+        if self.resolver.health.dirty:
+            await self.db.save_health(self.resolver.health.dump())
 
     async def create_rewrite(self, library_id: int | None = None) -> int:
         name = f"重写输出：{self._library(library_id)['name']}" if library_id else "重写全部输出"
@@ -1319,6 +1387,13 @@ class Engine:
                 await self._run_due_subscriptions()
             except Exception:
                 log.exception("订阅调度出错")
+            interval = self.store.current.health_interval * 60
+            if interval and not self.paused and time.time() - self._health_at >= interval:
+                self.start_health_check()
+            try:
+                await self._save_health()
+            except Exception:
+                log.exception("保存连通性出错")
             if self.paused or not (self._settle_wanted or time.time() - self._settled_at > SETTLE_INTERVAL):
                 continue
             try:

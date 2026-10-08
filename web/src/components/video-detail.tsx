@@ -200,6 +200,7 @@ function SourceRow({ v, src }: { v: Video; src: Source }) {
         {lines ? <Chip>{lines.length ? `${lines.length} 条线路` : "线路待取（播放或刷新时）"}</Chip> : <Chip>{src.direct ? "302" : "中转"}</Chip>}
         {src.subtitle && <Chip tone="info">{SUBTITLES[src.subtitle] ?? src.subtitle}</Chip>}
         <QualityChip row={src} />
+        <HealthChip tier={src.health} />
         {!lines && <Chip tone={state.tone}>{state.text}</Chip>}
         {lines && src.status !== "active" && <Chip tone={state.tone}>{state.text}</Chip>}
         <div className="ml-auto flex items-center gap-1">
@@ -241,6 +242,17 @@ function QualityChip({ row }: { row: Source | SourceLine }) {
   ) : null;
 }
 
+const HEALTH_CHIPS: Record<number, [string, "warn" | "err"]> = { 1: ["播放站慢", "warn"], 2: ["播放站不稳", "warn"], 3: ["播放站不通", "err"] };
+
+function HealthChip({ tier }: { tier: number }) {
+  const c = HEALTH_CHIPS[tier];
+  return c ? (
+    <Chip tone={c[1]} title="本服务测到的播放站连通性，挑源时排到后面（概览页「播放连通性」里看详情）">
+      {c[0]}
+    </Chip>
+  ) : null;
+}
+
 function LineRow({ v, src, ln }: { v: Video; src: Source; ln: SourceLine }) {
   const state = streamState(ln);
   const usable = src.status === "active" && ln.enabled && ln.supported;
@@ -250,6 +262,7 @@ function LineRow({ v, src, ln }: { v: Video; src: Source; ln: SourceLine }) {
       <span className="text-muted">{ln.host_label}</span>
       <Chip>{ln.direct ? (ln.ip_bound ? "302·绑 IP" : "302") : "中转"}</Chip>
       <QualityChip row={ln} />
+      <HealthChip tier={ln.health} />
       <Chip tone={ln.enabled ? state.tone : "neutral"}>{ln.enabled ? state.text : "已停用"}</Chip>
       {src.line === ln.line && <span className="text-xs text-accent">当前在用</span>}
       <div className="ml-auto flex items-center gap-1">

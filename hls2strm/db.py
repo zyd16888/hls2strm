@@ -312,8 +312,14 @@ async def _migrate_v9(conn: aiosqlite.Connection) -> None:
         "UPDATE sources SET heights=CAST(height AS TEXT), quality_src='master' WHERE height IS NOT NULL AND height>0")
 
 
+async def _migrate_v10(conn: aiosqlite.Connection) -> None:
+    """各播放站的连通性（成功率、速度、最近的错误），重启后接着用。"""
+    await conn.execute(
+        "CREATE TABLE stream_health (key TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at INTEGER NOT NULL)")
+
+
 MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
-              _migrate_v8, _migrate_v9]
+              _migrate_v8, _migrate_v9, _migrate_v10]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")
@@ -875,6 +881,38 @@ class Database:
             if cur is None or rank(r["site"]) < rank(cur[0]):
                 best[r["video_id"]] = (r["site"], r["key"])
         return list(best.values())
+
+    async def load_health(self) -> list[dict]:
+        return [json.loads(r["data"]) for r in await self._all("SELECT data FROM stream_health")]
+
+    async def save_health(self, rows: list[dict]) -> None:
+        t = now()
+        await self._write_many(
+            "INSERT INTO stream_health(key, data, updated_at) VALUES(?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET data=excluded.data, updated_at=excluded.updated_at",
+            [(r["key"], json.dumps(r, ensure_ascii=False), t) for r in rows],
+        )
+
+    async def health_samples(self, site: str, line: str | None, limit: int) -> list[dict]:
+        """检测连通性用的样本：这个站（这条线路）最近播放成功过的可用源，没播过的按新到旧补上。
+        指定了线路时每行的 line_row 是那条线路。"""
+        if line is None:
+            rows = await self._all(
+                """SELECT s.* FROM sources s JOIN videos v ON v.id=s.video_id
+                   WHERE s.site=? AND s.status='active' AND v.status='active'
+                   ORDER BY s.last_ok_at IS NULL, s.last_ok_at DESC, s.id DESC LIMIT ?""", (site, limit))
+            return [dict(r) for r in rows]
+        rows = await self._all(
+            """SELECT s.id AS sid, l.id AS lid FROM source_lines l JOIN sources s ON s.id=l.source_id
+                 JOIN videos v ON v.id=s.video_id
+               WHERE s.site=? AND l.line=? AND s.status='active' AND v.status='active'
+               ORDER BY l.last_ok_at IS NULL, l.last_ok_at DESC, l.id DESC LIMIT ?""", (site, line, limit))
+        out = []
+        for r in rows:
+            src = await self.get_source(r["sid"])
+            ln = next(x for x in await self.get_lines(r["sid"]) if x["id"] == r["lid"])
+            out.append({**src, "line_row": ln})
+        return out
 
     async def sources_needing_quality(self, tried_before: int, library_id: int | None = None) -> list[dict]:
         """还不知道画质的可用源（源本身或它的某条线路只有站点标注、或者什么都没有），tried_before 之后试过的跳过。"""

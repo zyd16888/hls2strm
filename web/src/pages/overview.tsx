@@ -1,16 +1,16 @@
-import { RotateCcw, Wifi } from "lucide-react";
+import { Activity, RotateCcw, Wifi } from "lucide-react";
 import { useState } from "react";
 import { ErrorText } from "@/components/common";
 import { LogLines } from "@/components/log-lines";
 import { siteSignal } from "@/components/site-signals";
 import { Button } from "@/components/ui/button";
-import { Chip, Dot, EmptyRow, KV, Mono, Notice, Panel, Table, Td, Th } from "@/components/ui/data";
+import { Chip, Dot, EmptyRow, KV, Mono, Notice, Panel, Table, Td, Th, type Tone } from "@/components/ui/data";
 import { rewriteAll, runSubscription, verifyLibrary } from "@/lib/actions";
 import { api, type Status, type Subscription } from "@/lib/api";
 import { fmtDur, fmtNum, fmtTime, pct } from "@/lib/format";
 import { kindName, PLAY_MODES } from "@/lib/labels";
 import { useLogs } from "@/lib/logs";
-import { useMeta, useRun, useStatus } from "@/lib/queries";
+import { useHealth, useMeta, useRun, useStatus } from "@/lib/queries";
 import { navigate } from "@/lib/route";
 import { cn } from "@/lib/utils";
 
@@ -114,6 +114,8 @@ export default function Overview() {
 
         <Channels s={s} />
       </div>
+
+      <PlaybackHealth />
 
       <div className="grid gap-4 xl:grid-cols-2">
         <Panel
@@ -280,6 +282,77 @@ interface TestResult {
   blocked?: boolean;
   ms?: number;
   error?: string;
+}
+
+const HEALTH_TONES: Tone[] = ["ok", "warn", "warn", "err"];
+
+function PlaybackHealth() {
+  const run = useRun();
+  const { data } = useHealth();
+  const hosts = data?.hosts ?? [];
+  return (
+    <Panel
+      title="播放连通性"
+      actions={
+        <>
+          <span className="text-[13px] text-muted">
+            {data?.checking ? "检测中…" : data?.next_at ? `下次定时检测 ${fmtTime(data.next_at)}` : "定时检测已关"}
+          </span>
+          <Button
+            size="sm"
+            disabled={data?.checking}
+            onClick={() => run(() => api.post("/api/health/check"), { success: "开始检测，结果稍后刷新", invalidate: [["health"]] })}
+          >
+            <Activity />
+            立即检测
+          </Button>
+        </>
+      }
+    >
+      <Table>
+        <thead>
+          <tr>
+            <Th>播放站</Th>
+            <Th>状态</Th>
+            <Th className="text-right">成功率</Th>
+            <Th className="text-right">速度</Th>
+            <Th className="text-right">首字节</Th>
+            <Th className="text-right">成功 / 失败</Th>
+            <Th>上次检测</Th>
+          </tr>
+        </thead>
+        <tbody>
+          {hosts.map(h => {
+            const known = h.ok + h.fail > 0;
+            return (
+              <tr key={h.key}>
+                <Td className="font-medium">{h.label}</Td>
+                <Td>
+                  <Chip tone={known ? HEALTH_TONES[h.tier] : "neutral"}>{known ? h.tier_name : "没有数据"}</Chip>
+                  {h.last_error && (
+                    <div className="max-w-[280px] truncate text-xs text-muted" title={h.last_error}>
+                      {h.last_error}
+                    </div>
+                  )}
+                </Td>
+                <Td className="text-right">{known ? pct(h.score, 1) : "-"}</Td>
+                <Td className="text-right">{h.kbps ? `${(h.kbps / 1000).toFixed(1)} Mbps` : "-"}</Td>
+                <Td className="text-right">{h.ttfb_ms ? `${Math.round(h.ttfb_ms)} ms` : "-"}</Td>
+                <Td className="text-right">
+                  {fmtNum(h.ok)} / {fmtNum(h.fail)}
+                </Td>
+                <Td className="whitespace-nowrap text-[13px] text-muted">{h.checked_at ? fmtTime(h.checked_at) : "-"}</Td>
+              </tr>
+            );
+          })}
+          {hosts.length === 0 && <EmptyRow cols={7}>还没有数据。播放过影片、或者检测一次之后，这里会列出各播放站能不能播、快不快。</EmptyRow>}
+        </tbody>
+      </Table>
+      <p className="mt-3 text-[13px] text-muted">
+        测的是本服务到各播放站 CDN 的网络：中转时完全准，302 给外网客户端时只能参考。开着「按连通性挑源」时，不通、不稳、慢的播放站排到后面。
+      </p>
+    </Panel>
+  );
 }
 
 function Channels({ s }: { s: Status }) {

@@ -189,6 +189,19 @@ class Settings(BaseModel):
         True,
         description="顺手探测画质：抓详情、播放拿到播放地址时读一次播放列表认出分辨率；只请求 CDN，不多访问源站",
     )
+    health_rank: bool = Field(
+        True,
+        description="按播放连通性挑源：本服务测到不通、不稳、慢的播放站排到后面，同一档里再比画质、站点优先顺序。"
+                    "测的是本服务到 CDN 的网络，302 给外网客户端时只能参考",
+    )
+    health_interval: int = Field(
+        60, ge=0, le=1440,
+        description="定时检测播放连通性的间隔（分钟），0 关闭。每轮每个播放站抽几部最近播过的片，"
+                    "有没过期的现成地址就不访问源站，下载一个分片的开头一段测速",
+    )
+    health_samples: int = Field(1, ge=1, le=5, description="每轮每个播放站抽几部片检测（每部最多访问一次源站）")
+    health_bytes: int = Field(512, ge=64, le=8192, description="每次检测下载多少（KB）来测速")
+    health_slow_kbps: int = Field(1500, ge=0, le=100000, description="检测速度低于它（kbps）算慢；0 不按速度分档")
     resolve_mode: Literal["auto", "redirect", "proxy"] = Field(
         "auto",
         description="网关 resolve 默认给什么地址（网关请求里带 mode 时以它为准）：auto 按上面的偏好挑源，"
