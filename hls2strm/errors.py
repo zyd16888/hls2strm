@@ -23,3 +23,7 @@ class ParseError(Exception):
 
 class VideoGone(ParseError):
     """影片已下架：站点返回 200 但只是兜底页，没有播放器。"""
+
+
+class RelayAborted(Exception):
+    """中转传到一半上游断开：已经记过一行日志，抛出去只为让 uvicorn 断开连接（播放器会重试），不用再打 traceback。"""

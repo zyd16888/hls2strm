@@ -45,6 +45,10 @@ MAX_RETRY_DELAY = 7200
 MAX_SNAPSHOTS = 200
 DEFAULT_STOP_AFTER_KNOWN = 48
 PROBE_TIMEOUT = 90  # 「查找其他源」每个站最多等多久（秒）：要过 CF 的站走解题服务，几十秒很常见
+PROGRESS_INTERVAL = 30  # 长任务每隔多少秒在日志里报一次进度
+TASK_STATUS_NAMES = {"done": "完成", "failed": "失败", "gone": "下架", "cancelled": "取消", "running": "进行中",
+                     "pending": "待处理"}
+PROBE_STATUS_NAMES = {"found": "找到", "none": "没有", "failed": "失败", "timeout": "超时"}
 DEFAULT_MAX_PAGES = 20
 SETTLE_INTERVAL = 600
 
@@ -80,6 +84,7 @@ class Engine:
         self._settled_at = 0.0
         self.missing: dict[int, int] = {}  # 库 id -> 有记录但磁盘上找不到的 strm 数（启动时、核对后统计）
         self._missing_task: asyncio.Task | None = None
+        self._progress_at: dict[int, float] = {}  # 任务 id -> 上次在日志里报进度的时间
 
     # ---- 生命周期 ----
 
@@ -199,6 +204,11 @@ class Engine:
             if job is None or job["status"] != "running":
                 await self.db.finish_task(tid, "pending", refund_attempt=True)
                 return
+            if job["started_at"] is None and await self.db.mark_job_started(job["id"]):
+                waited = time.time() - job["created_at"]
+                log.info("任务 #%d「%s」开始执行%s", job["id"], job["name"],
+                         f"（排队了 {_fmt_secs(waited)}）" if waited >= 10 else "")
+            log.debug("子任务 #%d %s %s 开始（第 %d 次）", tid, task["kind"], task["target"], task["attempts"])
             handler = {"list": self._do_list, "detail": self._do_detail, "probe": self._do_probe,
                        "rewrite": self._do_rewrite, "verify": self._do_verify, "cover": self._do_cover,
                        "purge": self._do_purge, "reclassify": self._do_reclassify,
@@ -207,6 +217,7 @@ class Engine:
                        "locate": self.strm.do_locate}[task["kind"]]
             await handler(job, task)
             await self.db.finish_task(tid, "done", duration_ms=int((time.monotonic() - t0) * 1000))
+            log.debug("子任务 #%d %s %s 完成（%.1fs）", tid, task["kind"], task["target"], time.monotonic() - t0)
             self.metrics.inc(f"task_{task['kind']}_done")
             finished = True
         except asyncio.CancelledError:
@@ -271,16 +282,32 @@ class Engine:
         if job is None or job["status"] != "running":
             return
         if await self.db.open_task_count(job_id):
+            await self._log_progress(job)
             return
         counts = await self.db.task_counts(job_id)
-        await self.db.update_job(job_id, status="done", finished_at=int(time.time()))
+        finished = int(time.time())
+        await self.db.update_job(job_id, status="done", finished_at=finished)
+        self._progress_at.pop(job_id, None)
         self._settle_wanted = True
         p = job["params"]
         if p.get("subscription_id") and not p.get("incremental"):
             await self.db.update_subscription(p["subscription_id"], initialized=1)
             log.info("订阅 #%d 首轮全量完成，之后按周期增量", p["subscription_id"])
-        log.info("任务 #%d「%s」完成：%s", job_id, job["name"],
-                 "，".join(f"{k} {v}" for k, v in sorted(counts.items())))
+        log.info("任务 #%d「%s」完成，用时 %s：%s", job_id, job["name"],
+                 _fmt_secs(finished - (job["started_at"] or job["created_at"])), _counts_text(counts))
+
+    async def _log_progress(self, job: dict) -> None:
+        """长任务每 PROGRESS_INTERVAL 秒报一次进度（子任务数会随翻页增加，剩余时间只是估计）。"""
+        t = time.time()
+        start = job["started_at"] or job["created_at"]
+        if t - self._progress_at.get(job["id"], start) < PROGRESS_INTERVAL:
+            return
+        self._progress_at[job["id"]] = t
+        counts = await self.db.task_counts(job["id"])
+        total = sum(counts.values())
+        closed = total - counts.get("pending", 0) - counts.get("running", 0)
+        eta = f"，预计还要 {_fmt_secs((t - start) / closed * (total - closed))}" if closed else ""
+        log.info("任务 #%d「%s」进度 %d/%d：%s%s", job["id"], job["name"], closed, total, _counts_text(counts), eta)
 
     # ---- 输出 ----
 
@@ -442,15 +469,20 @@ class Engine:
             return 0
         if any(s["site"] == site.name for s in await self.db.get_sources(video_id)):
             return 0
-        return await self._attach_found(v, site, await self._lookup(site, v))
+        notes: list[str] = []
+        t0 = time.monotonic()
+        found = await self._lookup(site, v, notes)
+        return await self._attach_found(v, site, found, "补源", _lookup_text(notes, t0))
 
-    async def _attach_found(self, v: dict, site: Site, found: list[SourceItem | SourceDetail]) -> int:
-        """把按番号找到的结果挂成作品的源（同一部片的中字版也一起加），重写输出。返回新加的源数。"""
+    async def _attach_found(self, v: dict, site: Site, found: list[SourceItem | SourceDetail], how: str,
+                            detail: str) -> int:
+        """把按番号找到的结果挂成作品的源（同一部片的中字版也一起加），重写输出。返回新加的源数。
+        how、detail：日志里的「补源」「查找其他源」和查找过程。"""
         video_id = v["id"]
         sf = self.fetcher.site(site.name)
         if not found:
             await self.db.set_source_check(video_id, site.name, False)
-            log.info("补源 %s：%s 上没有", v["slug"], site.label)
+            log.info("%s %s：%s 上没有%s", how, v["slug"], site.label, detail)
             return 0
         added = []
         variants: list[str] = []
@@ -475,17 +507,19 @@ class Engine:
         v = await self.db.get_video_by_id(video_id)
         await self._output_all(v, cover=True)
         await self.apply_rules(v)
-        log.info("补源 %s：在 %s 找到 %s", v["slug"], site.label, "、".join(added))
+        log.info("%s %s：在 %s 找到 %s%s", how, v["slug"], site.label, "、".join(added), detail)
         return len(added)
 
-    async def _lookup(self, site: Site, v: dict, priority: bool = False) -> list[SourceItem | SourceDetail]:
-        return await find_by_code(site, self.fetcher.site(site.name), v["code"], bool(v["uncensored"]), priority)
+    async def _lookup(self, site: Site, v: dict, notes: list[str],
+                      priority: bool = False) -> list[SourceItem | SourceDetail]:
+        return await find_by_code(site, self.fetcher.site(site.name), v["code"], bool(v["uncensored"]), priority,
+                                  notes)
 
     async def probe_video(self, slug: str) -> tuple[dict, list[dict]]:
         """影片库里点「查找其他源」：到每个启用、还没有源的站点找一次（不管之前查过没有）。
 
-        各站并行查、不排限速队列，每站最多 PROBE_TIMEOUT 秒（要过 CF 的站会走解题服务，慢）；查到的再逐个挂上。
-        返回 (作品, 每个站的结果)。结果 status：found / none / failed / timeout。
+        各站并行查、不排限速队列，每站最多 PROBE_TIMEOUT 秒（要过 CF 的站会走解题服务，慢）；哪个站查完就挂上、记日志，
+        挂源逐个来（同一部片的输出不会同时写）。返回 (作品, 每个站的结果)。结果 status：found / none / failed / timeout。
         """
         v = await self.db.get_video(slug)
         if v is None:
@@ -494,32 +528,41 @@ class Engine:
         have = {s["site"] for s in await self.db.get_sources(v["id"])}
         sites = [SITES[n] for n in self.store.current.site_priority
                  if n not in have and cfg[n].enabled and SITES[n].can_lookup]
+        if not sites:
+            log.info("查找其他源 %s：启用的站点都已经有源，或者不支持按番号找", v["slug"])
+            return v, []
+        log.info("查找其他源 %s（番号 %s）：查 %s", v["slug"], v["code"], "、".join(s.label for s in sites))
+        attach = asyncio.Lock()
+        t_all = time.monotonic()
 
-        async def one(site: Site):
-            return await asyncio.wait_for(self._lookup(site, v, priority=True), PROBE_TIMEOUT)
-
-        results = []
-        for site, found in zip(sites, await asyncio.gather(*(one(s) for s in sites), return_exceptions=True)):
+        async def one(site: Site) -> dict:
             r = {"site": site.name, "label": site.label}
-            if isinstance(found, TimeoutError):
+            notes: list[str] = []
+            t0 = time.monotonic()
+            try:
+                found = await asyncio.wait_for(self._lookup(site, v, notes, priority=True), PROBE_TIMEOUT)
+                async with attach:
+                    n = await self._attach_found(v, site, found, "查找其他源", _lookup_text(notes, t0))
+            except TimeoutError:
                 r |= {"status": "timeout", "error": f"超过 {PROBE_TIMEOUT} 秒没查完"}
-            elif isinstance(found, (NotFound, VideoGone)):
+                log.info("查找其他源 %s：%s 超过 %d 秒没查完", v["slug"], site.label, PROBE_TIMEOUT)
+            except (NotFound, VideoGone) as e:
                 await self.db.set_source_check(v["id"], site.name, False)
                 r |= {"status": "none", "found": 0}
-            elif isinstance(found, (Blocked, FetchError, ParseError)):
-                r |= {"status": "failed", "error": str(found)[:200]}
-            elif isinstance(found, BaseException):
-                raise found
+                log.info("查找其他源 %s：%s 上没有%s", v["slug"], site.label, _lookup_text([*notes, f"{e} 不存在"], t0))
+            except (Blocked, FetchError, ParseError) as e:
+                r |= {"status": "failed", "error": str(e)[:200]}
+                log.info("查找其他源 %s：%s 失败（%.1fs）：%s", v["slug"], site.label, time.monotonic() - t0, e)
             else:
-                try:
-                    n = await self._attach_found(v, site, found)
-                except (Blocked, FetchError, ParseError) as e:
-                    r |= {"status": "failed", "error": str(e)[:200]}
-                else:
-                    r |= {"status": "found" if n else "none", "found": n}
-            if r.get("error"):
-                log.info("查找其他源 %s：%s %s", slug, site.label, r["error"])
-            results.append(r)
+                r |= {"status": "found" if n else "none", "found": n}
+            return r
+
+        results = await asyncio.gather(*(one(s) for s in sites), return_exceptions=True)
+        for r in results:
+            if isinstance(r, BaseException):
+                raise r
+        log.info("查找其他源 %s 查完（%.1fs）：%s", v["slug"], time.monotonic() - t_all,
+                 "，".join(f"{r['label']} {PROBE_STATUS_NAMES[r['status']]}" for r in results))
         return await self.db.get_video_by_id(v["id"]), results
 
     async def create_probe(self, site: str, library_id: int | None = None) -> int:
@@ -1152,6 +1195,26 @@ async def playlist_duration(fetcher: Fetcher, url: str, headers: dict | None = N
             return None
         text = (await fetcher.get_bytes(urljoin(url, sub), headers=headers)).decode("utf-8", "replace")
     return m3u8_duration(text)
+
+
+def _fmt_secs(s: float) -> str:
+    """'45 秒' / '3 分 12 秒' / '2 小时 5 分'。"""
+    s = int(s)
+    if s < 60:
+        return f"{s} 秒"
+    if s < 3600:
+        return f"{s // 60} 分 {s % 60} 秒"
+    return f"{s // 3600} 小时 {s % 3600 // 60} 分"
+
+
+def _counts_text(counts: dict) -> str:
+    """子任务各状态的个数：'完成 120，失败 3，待处理 375'。"""
+    return "，".join(f"{name} {counts[k]}" for k, name in TASK_STATUS_NAMES.items() if counts.get(k)) or "没有子任务"
+
+
+def _lookup_text(notes: list[str], t0: float) -> str:
+    """按番号查找的过程，接在日志后面：'（1.2s；/videos/x/ 不存在）'。"""
+    return "（" + "；".join([f"{time.monotonic() - t0:.1f}s", *notes]) + "）"
 
 
 def _restore_text(c: Counter) -> str:

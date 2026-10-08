@@ -19,11 +19,13 @@ import time
 from dataclasses import dataclass, replace
 from urllib.parse import quote, urljoin
 
+from curl_cffi import CurlError
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import RedirectResponse, Response, StreamingResponse
 
 from .config import SettingsStore
 from .db import Database, source_cooldown
+from .errors import RelayAborted
 from .fetcher import Blocked, FetchError, Fetcher, NotFound
 from .observability import Metrics
 from .parser import ParseError, VideoGone
@@ -587,6 +589,14 @@ async def close_stream(resp) -> None:
     await resp.aclose()
 
 
+def _relay_aborted(r: Resolved, what: str, sent: int, e: Exception) -> RelayAborted:
+    """中转传到一半 CDN 断开：记一行日志，返回的异常抛出去让 uvicorn 断开连接（播放器会重试这一段）。"""
+    line = f" 线路 {r.line['line']}" if r.line else ""
+    log.warning("中转 %s：%s%s 的 %s 传到 %d KB 时 CDN 断开：%s", r.video["slug"], r.site.label, line, what,
+                sent // 1024, e)
+    return RelayAborted(str(e))
+
+
 def _is_hls(url: str) -> bool:
     return url.split("?", 1)[0].lower().endswith(".m3u8")
 
@@ -613,9 +623,13 @@ async def _proxy_file(request: Request, r: Resolved) -> Response:
                         media_type=resp.headers.get("content-type") or "video/mp4")
 
     async def body():
+        sent = 0
         try:
             async for chunk in resp.aiter_content():
+                sent += len(chunk)
                 yield chunk
+        except CurlError as e:
+            raise _relay_aborted(r, "视频文件", sent, e) from None
         finally:
             await close_stream(resp)
 
@@ -688,10 +702,12 @@ async def hls_file(source_id: int, path: str, request: Request, t: str = ""):
 
         strip = r.traits.fake_header
 
-        async def stream(resp=resp):
+        async def stream(resp=resp, r=r):
+            sent = 0
             try:
                 head = b""
                 async for chunk in resp.aiter_content():
+                    sent += len(chunk)
                     if strip and head is not None:
                         head += chunk  # 攒够一段再找 TS 起点，剥掉前面的假文件头
                         if len(head) < 8192 + 188 * 5:
@@ -700,6 +716,8 @@ async def hls_file(source_id: int, path: str, request: Request, t: str = ""):
                     yield chunk
                 if strip and head:
                     yield head[max(ts_start(head), 0):]
+            except CurlError as e:
+                raise _relay_aborted(r, path, sent, e) from None
             finally:
                 await close_stream(resp)
 

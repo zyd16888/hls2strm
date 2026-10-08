@@ -97,7 +97,7 @@ class Site:
     label = ""
     default_domains: list[str] = []
     default_enabled = True
-    lookup_verified = False  # lookup 返回的结果已经按番号核对过（搜索结果），不用再抓详情确认
+    lookup_verified = False  # lookup 返回的是搜索结果（带番号），按列表项核对就行，不用再抓详情确认
     line_specs: dict[str, LineSpec] = {}  # 多线路站点的已知线路（按默认优先顺序）；单线路站点为空
     stream = StreamTraits()
     sorts: dict[str, str] = {}
@@ -154,8 +154,8 @@ class Site:
 
     async def lookup(self, sf: SiteFetcher, code: str, uncensored: bool = False,
                      priority: bool = False) -> list[SourceItem]:
-        """按番号找本站的影片。默认直接拼 key（还没确认存在，调用方抓详情核对）；要搜索的站点覆盖它。
-        priority：不排限速队列（用户手动查、播放时现场找）。"""
+        """按番号找本站的影片，返回候选（由 find_by_code 核对）。默认直接拼 key（还没确认存在，要抓详情核对）；
+        要搜索的站点覆盖它，原样返回搜索结果。priority：不排限速队列（用户手动查、播放时现场找）。"""
         key = self.key_for(code, uncensored=uncensored)
         return [SourceItem(key=key, code=code, title="", uncensored=uncensored)] if key else []
 

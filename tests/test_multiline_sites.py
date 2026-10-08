@@ -1,7 +1,7 @@
 import asyncio
 import json
 
-from hls2strm.sites import SITES
+from hls2strm.sites import SITES, find_by_code
 from hls2strm.sites.hosts import detect, resolve_embed
 from hls2strm.sites.javguru import parse_title
 
@@ -34,7 +34,7 @@ def test_javguru_pages():
     assert GURU.key_from_url("https://jav.guru/134963/ssis-001-after/") == "134963"
 
     sf = FakeSiteFetcher({"/?s=SSIS-001": fixture("javguru_search.html")}, FakeHttp({}))
-    assert [x.key for x in asyncio.run(GURU.lookup(sf, "SSIS-001"))] == ["134963"]
+    assert [x.key for x in asyncio.run(find_by_code(GURU, sf, "SSIS-001"))] == ["134963"]
 
 
 def test_javguru_line_to_embed():

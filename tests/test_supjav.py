@@ -3,7 +3,7 @@ import json
 import time
 
 from hls2strm.fetcher import FetchError, Page
-from hls2strm.sites import SITES
+from hls2strm.sites import SITES, find_by_code
 from hls2strm.sites.supjav import GATEWAY, parse_title
 
 from .conftest import fixture
@@ -77,9 +77,11 @@ def test_titles_lists_and_sources():
 
 def test_lookup_by_code():
     sf = FakeSiteFetcher({"/zh/?s=SSIS-001": fixture("supjav_search.html")}, FakeHttp({}))
-    found = asyncio.run(SUPJAV.lookup(sf, "SSIS-001"))
+    notes = []
+    found = asyncio.run(find_by_code(SUPJAV, sf, "SSIS-001", notes=notes))
     assert [x.key for x in found] == ["443625"]  # 搜索结果里还有 [无码破解] 版，属于另一部作品
-    found = asyncio.run(SUPJAV.lookup(sf, "ssis-001", uncensored=True))
+    assert notes == ["按番号 SSIS-001 搜到 2 条，不是这部的：SSIS-001（无码流出）"]
+    found = asyncio.run(find_by_code(SUPJAV, sf, "ssis-001", uncensored=True))
     assert [x.key for x in found] == ["458958"]
 
 

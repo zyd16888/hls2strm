@@ -278,21 +278,28 @@ class Fetcher:
     async def fetch(self, url: str, *, headers: dict | None = None, allow_redirects: bool = True,
                     method: str = "GET", json: dict | None = None, data: dict | None = None):
         """站外请求（网关、播放站等），返回原始响应；网络错误转成 FetchError。"""
+        t0 = time.monotonic()
         try:
-            return await self.session.request(method, url, headers=headers or None, json=json, data=data,
+            resp = await self.session.request(method, url, headers=headers or None, json=json, data=data,
                                               allow_redirects=allow_redirects,
                                               timeout=self.store.current.request_timeout)
         except Exception as e:
+            log.debug("%s %s 失败（%.1fs）：%s", method, url, time.monotonic() - t0, e)
             raise FetchError(f"{urlsplit(url).hostname}: {e}") from e
+        log.debug("%s %s → HTTP %d（%.1fs）", method, url, resp.status_code, time.monotonic() - t0)
+        return resp
 
     async def get_bytes(self, url: str, *, referer: str | None = None, headers: dict | None = None) -> bytes:
         headers = dict(headers or {})
         if referer:
             headers["Referer"] = referer
+        t0 = time.monotonic()
         try:
             resp = await self.session.get(url, timeout=self.store.current.request_timeout, headers=headers or None)
         except Exception as e:
+            log.debug("GET %s 失败（%.1fs）：%s", url, time.monotonic() - t0, e)
             raise FetchError(f"{urlsplit(url).hostname}: {e}") from e
+        log.debug("GET %s → HTTP %d（%.1fs）", url, resp.status_code, time.monotonic() - t0)
         if resp.status_code == 404:
             raise NotFound(url)
         if resp.status_code != 200:
@@ -385,6 +392,7 @@ class SiteFetcher:
                 await self.limiter.acquire()
             url = dom.base + path
             headers = {"User-Agent": dom.user_agent} if dom.user_agent else None
+            t0 = time.monotonic()
             try:
                 resp = await self.session.get(
                     url, timeout=s.request_timeout, headers=headers, cookies=dom.cookies or None
@@ -395,10 +403,12 @@ class SiteFetcher:
                 self.metrics.inc("fetch_error")
                 self.limiter.slow_down()
                 errors.append(f"{dom.host}: {e}")
-                log.info("请求失败 %s：%s", url, e)
+                log.info("请求失败 %s（%.1fs）：%s", url, time.monotonic() - t0, e)
                 continue
             self.metrics.request()
             status = resp.status_code
+            log.debug("%s %s → HTTP %d（%.1fs%s）", self.site.label, url, status, time.monotonic() - t0,
+                      "，插队" if priority else "")
             mitigated = (resp.headers.get("cf-mitigated") or "").lower()
             if "challenge" in mitigated or status in (403, 429, 503) or looks_like_challenge(resp.text):
                 self._mark_blocked(dom, f"HTTP {status}" + (" challenge" if mitigated else ""))
@@ -426,7 +436,20 @@ class SiteFetcher:
         page = await self._solve(path)
         if page is not None:
             return page
-        raise Blocked(f"{self.site.label} 的域名都被拦截", self.blocked_for())
+        raise Blocked(f"{self.site.label} 的域名都被拦截（{self._blocked_reason()}）", self.blocked_for())
+
+    def _blocked_reason(self) -> str:
+        """域名都不能用时说明为什么：各域名还要冷却多久，解题服务有没有试。"""
+        now = time.time()
+        cooling = "、".join(f"{d.host} 冷却 {int(d.cooldown_until - now)}s" for d in self.domains
+                            if d.cooldown_until > now) or "没有可用域名"
+        if not self.parent.store.current.solver_url:
+            solver = "没配置解题服务"
+        elif not self.cfg.solver:
+            solver = "本站没开解题服务"
+        else:
+            solver = "解题服务也没通过"
+        return f"{cooling}；{solver}"
 
     async def _solve(self, path: str) -> Page | None:
         s = self.parent.store.current
@@ -436,6 +459,7 @@ class SiteFetcher:
             dom = self.domains[0]
             url = dom.base + path
             log.info("%s 的域名全部被拦，调用解题服务：%s", self.site.label, url)
+            t0 = time.monotonic()
             try:
                 result = await call_solver(s.solver_url, url, s.proxy, s.solver_timeout)
             except Exception as e:
@@ -454,7 +478,8 @@ class SiteFetcher:
             dom.block_streak = 0
             dom.last_status = "解题成功，已注入 cookie"
             self.metrics.inc("solver_ok")
-            log.info("解题成功，%s 恢复使用（cookie %d 个）", dom.host, len(result.cookies))
+            log.info("解题成功（%.0fs），%s 恢复使用（cookie %d 个）", time.monotonic() - t0, dom.host,
+                     len(result.cookies))
             return Page(result.html, result.url, dom.base, via="solver")
 
     async def try_solver(self, solver_url: str) -> dict:

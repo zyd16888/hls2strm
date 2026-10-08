@@ -106,7 +106,7 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 | `HLS2STRM_UI_USER` / `HLS2STRM_UI_PASSWORD` | `admin` / 空 | Web 控制台的 Basic 认证；密码为空则不认证（启动日志会提示） |
 | `HLS2STRM_OUTPUT_DIR` | `数据目录/strm` | strm 输出目录（设置页可覆盖） |
 | `HLS2STRM_PUBLIC_BASE_URL` | `http://127.0.0.1:端口` | 写进 strm 的服务地址（设置页可覆盖） |
-| `HLS2STRM_LOG_LEVEL` | `INFO` | 日志级别 |
+| `HLS2STRM_LOG_LEVEL` | `INFO` | 日志级别；「日志」页也能现场切换（DEBUG 记下每个请求），不保存 |
 
 其余设置都在 Web「设置」页修改，保存在数据库里。
 
@@ -309,6 +309,7 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 | GET / PUT | `/api/settings` | 读取或修改设置（PUT 只需要传改动的字段） |
 | POST | `/api/engine/pause\|resume`、`/api/fetcher/test\|reset?site=` | 引擎和抓取通道控制（不带 site 是全部站点） |
 | GET | `/api/logs/stream` | 实时日志（SSE） |
+| GET / PUT | `/api/logs/level` | 查看、现场切换日志级别（`{"level": "DEBUG"}`，不保存） |
 | GET/HEAD | `/play/{slug}.m3u8` | strm 指向的播放入口（`?proxy=1` 强制中转，`?src=站点` 只用这个站点的源，再加 `&line=线路` 只用这条线路） |
 
 ## 开发

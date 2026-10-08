@@ -174,8 +174,7 @@ class JavGuruSite(Site):
         if not ck:
             return []
         page = await sf.get_page(f"/?s={quote(code.strip().upper())}", priority=priority)
-        return [it for it in self.parse_list(page.html).items
-                if code_key(it.code) == ck and it.uncensored == uncensored]
+        return self.parse_list(page.html).items  # find_by_code 按番号核对
 
     async def resolve_line(self, http: Fetcher, name: str, link: str) -> HostStream:
         """线路数据 https://jav.guru/searcho/?{L}d={HEX}… → /searcho/?{L}r={HEX 倒过来}，302 到嵌入页。"""

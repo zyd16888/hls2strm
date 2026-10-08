@@ -1183,6 +1183,11 @@ class Database:
     async def get_job(self, job_id: int) -> dict | None:
         return _job_row(await self._one("SELECT * FROM jobs WHERE id=?", (job_id,)))
 
+    async def mark_job_started(self, job_id: int) -> bool:
+        """记下任务开始执行的时间；已经记过返回 False。"""
+        cur = await self._write("UPDATE jobs SET started_at=? WHERE id=? AND started_at IS NULL", (now(), job_id))
+        return cur.rowcount > 0
+
     async def update_job(self, job_id: int, **fields) -> None:
         if "state" in fields:
             fields["state"] = json.dumps(fields["state"], ensure_ascii=False)

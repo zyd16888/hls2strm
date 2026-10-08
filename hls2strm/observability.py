@@ -11,6 +11,8 @@ from collections import Counter, deque
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from .errors import RelayAborted
+
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 
 
@@ -68,6 +70,15 @@ class RingHandler(logging.Handler):
 ring = RingHandler()
 
 
+class UvicornFilter(logging.Filter):
+    """uvicorn 的服务器日志（启动、监听、异常）都记在 uvicorn.error 下，不是错误，显示成 uvicorn；
+    中转断流（RelayAborted）已经记过一行，丢掉 uvicorn 那条带 traceback 的。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.name = "uvicorn"
+        return not (record.exc_info and isinstance(record.exc_info[1], RelayAborted))
+
+
 def setup_logging(data_dir: Path, level: str = "INFO") -> None:
     log_dir = data_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -82,9 +93,21 @@ def setup_logging(data_dir: Path, level: str = "INFO") -> None:
     root.setLevel(logging.WARNING)
     for h in (stdout, file, ring):
         root.addHandler(h)
-    logging.getLogger("hls2strm").setLevel(level)
+    set_level(level)
     for name in ("uvicorn", "uvicorn.error"):
         logging.getLogger(name).setLevel(logging.INFO)
+    uv = logging.getLogger("uvicorn.error")
+    if not any(isinstance(f, UvicornFilter) for f in uv.filters):
+        uv.addFilter(UvicornFilter())
+
+
+def set_level(level: str) -> None:
+    """本服务的日志级别，运行中也能改（不保存，重启后回到 HLS2STRM_LOG_LEVEL）。"""
+    logging.getLogger("hls2strm").setLevel(level.upper())
+
+
+def get_level() -> str:
+    return logging.getLevelName(logging.getLogger("hls2strm").getEffectiveLevel())
 
 
 class Metrics:

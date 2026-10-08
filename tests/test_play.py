@@ -1,9 +1,14 @@
 import logging
+import sys
 
+import pytest
+from curl_cffi.requests.exceptions import IncompleteRead
 from fastapi.testclient import TestClient
 
 from hls2strm.app import create_app
 from hls2strm.config import BootConfig
+from hls2strm.errors import RelayAborted
+from hls2strm.observability import UvicornFilter, ring
 
 from .conftest import FakeFetcher
 from .test_engine import model_fixture
@@ -55,7 +60,60 @@ def test_play_and_resolve(tmp_path):
             # 解题服务检测：没填地址、地址格式不对都直接提示
             assert c.post("/api/solver/test", json={}).status_code == 400
             assert c.post("/api/solver/test", json={"url": "byparr:8191"}).status_code == 400
+
+            # 中转传到一半 CDN 断开：记一行 WARNING，抛 RelayAborted 让服务器断开连接
+            fake.session = BrokenSession()
+            with pytest.raises(RelayAborted):
+                c.get(f"/hls/{src_id}/a.ts", headers={"User-Agent": "Lavf/61"})
+            assert any(r["level"] == "WARNING" and r["msg"].startswith("中转 ipzz-983：Jable 的 a.ts 传到 1 KB 时 CDN 断开")
+                       for r in ring.records)
+
+            # 日志级别现场切换，不认的级别拒绝
+            assert c.get("/api/logs/level").json() == {"level": "INFO", "default": "INFO"}
+            assert c.put("/api/logs/level", json={"level": "DEBUG"}).json()["level"] == "DEBUG"
+            assert logging.getLogger("hls2strm.fetcher").isEnabledFor(logging.DEBUG)
+            assert c.put("/api/logs/level", json={"level": "TRACE"}).status_code == 422
+            assert c.put("/api/logs/level", json={"level": "INFO"}).json()["level"] == "INFO"
     finally:
         for h in logging.getLogger().handlers:
             h.close()
         logging.getLogger().handlers.clear()
+
+
+class BrokenSession:
+    """CDN 传了 1 KB 就断开。"""
+
+    async def get(self, url, **kw):
+        return BrokenResp()
+
+
+class BrokenResp:
+    status_code = 200
+    headers: dict = {}
+    quit_now = None
+
+    async def aiter_content(self):
+        yield b"x" * 1024
+        raise IncompleteRead("curl: (18) end of response with 1000 bytes missing")
+
+    async def aclose(self):
+        pass
+
+
+def test_uvicorn_log_filter():
+    """uvicorn.error 不是错误，显示成 uvicorn；中转断流已经记过一行，丢掉 uvicorn 带 traceback 的那条。"""
+    f = UvicornFilter()
+    rec = logging.LogRecord("uvicorn.error", logging.INFO, "", 0, "Started server process", None, None)
+    assert f.filter(rec) and rec.name == "uvicorn"
+    try:
+        raise RelayAborted("curl: (18)")
+    except RelayAborted:
+        rec = logging.LogRecord("uvicorn.error", logging.ERROR, "", 0, "Exception in ASGI application", None,
+                                sys.exc_info())
+    assert not f.filter(rec)
+    try:
+        raise ValueError("bug")
+    except ValueError:
+        rec = logging.LogRecord("uvicorn.error", logging.ERROR, "", 0, "Exception in ASGI application", None,
+                                sys.exc_info())
+    assert f.filter(rec)  # 别的异常照常打

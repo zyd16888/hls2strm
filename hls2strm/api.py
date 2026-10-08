@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import secrets
@@ -22,11 +23,12 @@ from .config import Settings
 from .db import DEFAULT_LIBRARY_ID, source_cooldown
 from .engine import snapshot_path
 from .fetcher import Blocked, FetchError, NotFound, ping_solver
-from .observability import ring
+from .observability import get_level, ring, set_level
 from .parser import ParseError, VideoGone
 from .rules import describe_rule
 from .sites import SITES, get_site
 
+log = logging.getLogger(__name__)
 _basic = HTTPBasic(auto_error=False)
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
 
@@ -661,6 +663,23 @@ async def meta():
 @router.get("/logs")
 async def logs(after: int = 0, limit: int = 500):
     return ring.since(after, min(limit, 2000))
+
+
+class LogLevel(BaseModel):
+    level: Literal["DEBUG", "INFO", "WARNING"]
+
+
+@router.get("/logs/level")
+async def log_level(request: Request):
+    return {"level": get_level(), "default": _ctx(request).boot.log_level}
+
+
+@router.put("/logs/level")
+async def set_log_level(body: LogLevel, request: Request):
+    """现场切换日志级别（DEBUG 会记下每个请求），不保存，重启后回到 HLS2STRM_LOG_LEVEL。"""
+    set_level(body.level)
+    log.warning("日志级别改为 %s（重启后回到 %s）", body.level, _ctx(request).boot.log_level)
+    return {"level": get_level(), "default": _ctx(request).boot.log_level}
 
 
 @router.get("/logs/stream")

@@ -1,8 +1,10 @@
 import asyncio
+import logging
 import time
 
 import pytest
 
+from hls2strm import engine as engine_mod
 from hls2strm.engine import Engine
 from hls2strm.fetcher import Blocked, FetchError
 from hls2strm.observability import Metrics
@@ -35,7 +37,10 @@ def model_fixture():
     return html, ids
 
 
-def test_list_job_writes_strm_nfo_and_covers(make_store, boot):
+def test_list_job_writes_strm_nfo_and_covers(make_store, boot, caplog, monkeypatch):
+    caplog.set_level(logging.INFO, logger="hls2strm")
+    monkeypatch.setattr(engine_mod, "PROGRESS_INTERVAL", 0)
+
     async def run():
         db, store = await make_store()
         html, ids = model_fixture()
@@ -58,6 +63,10 @@ def test_list_job_writes_strm_nfo_and_covers(make_store, boot):
             assert (d / f"{slug.upper()}-poster.jpg").exists()
         # 列表请求走异步块接口
         assert fetcher.calls[0].startswith("/models/abc/?mode=async&function=get_block")
+        msgs = [r.getMessage() for r in caplog.records if r.name == "hls2strm.engine"]
+        assert any(m.startswith(f"任务 #{job_id}「") and m.endswith("开始执行") for m in msgs)
+        assert any(f"」进度 " in m and "完成 " in m for m in msgs)
+        assert any(m.startswith(f"任务 #{job_id}「") and "完成，用时 " in m and m.endswith("：完成 25") for m in msgs)
         await db.close()
 
     asyncio.run(run())

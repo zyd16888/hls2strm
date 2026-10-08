@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 from hls2strm.engine import Engine
 from hls2strm.fetcher import NotFound
@@ -140,9 +141,11 @@ def test_probe_failover_and_discover(make_store, boot):
     asyncio.run(run())
 
 
-def test_probe_video_reports_each_site(make_store, boot):
-    """「查找其他源」：各站并行查，结果按站点返回（找到 / 没有 / 失败），一个站失败不影响别的站。"""
+def test_probe_video_reports_each_site(make_store, boot, caplog):
+    """「查找其他源」：各站并行查，结果按站点返回（找到 / 没有 / 失败），一个站失败不影响别的站；每站的过程都记日志。"""
     from hls2strm.fetcher import FetchError
+
+    caplog.set_level(logging.INFO, logger="hls2strm")
 
     async def run():
         db, store = await make_store()
@@ -160,6 +163,12 @@ def test_probe_video_reports_each_site(make_store, boot):
         assert by_site["javmost"]["status"] == "none"
         assert "supjav" not in by_site  # 默认没启用
         assert {s["site"] for s in await db.get_sources(v["id"])} == {"jable", "missav"}
+        msgs = [r.getMessage() for r in caplog.records if r.name == "hls2strm.engine"]
+        assert any(m.startswith("查找其他源 ipzz-983（番号 IPZZ-983）：查 ") for m in msgs)
+        assert any(m.startswith("查找其他源 ipzz-983：在 MissAV 找到 ipzz-983") for m in msgs)
+        assert any(m.startswith("查找其他源 ipzz-983：JavGuru 失败（") and m.endswith("连接超时") for m in msgs)
+        assert any(m.startswith("查找其他源 ipzz-983：JAVMost 上没有（") and m.endswith(" 不存在）") for m in msgs)
+        assert any(m.startswith("查找其他源 ipzz-983 查完（") and "JavGuru 失败" in m for m in msgs)
         await db.close()
 
     asyncio.run(run())
