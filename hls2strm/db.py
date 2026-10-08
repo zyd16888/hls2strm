@@ -425,8 +425,9 @@ class Database:
             return await cur.fetchone()
 
     async def _all(self, sql: str, params: Iterable[Any] = ()) -> list[aiosqlite.Row]:
-        async with self.conn.execute(sql, tuple(params)) as cur:
-            return list(await cur.fetchall())
+        # 执行和取结果放在同一次线程调用里：分两步的话，中间别的协程在同一连接上改了表（比如 worker 领子任务），
+        # 读到一半的 GROUP BY 会把挪了位置的行数两次
+        return list(await self.conn.execute_fetchall(sql, tuple(params)))
 
     async def _update(self, table: str, row_id: int, fields: dict) -> None:
         if fields:
