@@ -124,7 +124,7 @@ async def solver_test(body: SolverTestBody, request: Request):
 
 
 class JobCreate(BaseModel):
-    kind: Literal["list", "videos", "backfill", "rewrite"]
+    kind: Literal["list", "videos", "backfill", "rewrite", "probe"]
     site: str = "jable"
     source: str = ""
     sort: str = ""
@@ -174,6 +174,8 @@ async def create_job(body: JobCreate, request: Request):
             job_id = await e.create_videos(_parse_videos(_ctx(request), body.urls, body.site), library_id=lib_id)
         elif body.kind == "backfill":
             job_id = await e.create_backfill()
+        elif body.kind == "probe":
+            job_id = await e.create_probe(body.site, body.library_id or None)
         else:
             job_id = await e.create_rewrite(body.library_id)
     except ValueError as err:
@@ -275,6 +277,23 @@ async def refresh_video(slug: str, request: Request):
         v = await c.engine.refresh_video(slug.lower())
     except (NotFound, VideoGone):
         raise HTTPException(404, "站点上已不存在该影片") from None
+    except Blocked as err:
+        raise HTTPException(503, str(err)) from None
+    except (FetchError, ParseError) as err:
+        raise HTTPException(502, str(err)) from None
+    view = _video_view(c, v, await c.db.get_sources(v["id"]))
+    view["outputs"] = await c.db.get_outputs(v["id"])
+    return view
+
+
+@router.post("/videos/{slug}/probe")
+async def probe_video(slug: str, request: Request):
+    """到每个启用、还没有这部影片源的站点按番号找一次。"""
+    c = _ctx(request)
+    try:
+        v = await c.engine.probe_video(slug.lower())
+    except NotFound:
+        raise HTTPException(404, "影片不存在") from None
     except Blocked as err:
         raise HTTPException(503, str(err)) from None
     except (FetchError, ParseError) as err:

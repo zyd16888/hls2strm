@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from .base import ListPage, Site, SourceDetail, SourceItem, Stream, StreamTraits
 from .jable import JableSite
+from .missav import MissAVSite
 
-SITES: dict[str, Site] = {s.name: s for s in (JableSite(),)}
+SITES: dict[str, Site] = {s.name: s for s in (JableSite(), MissAVSite())}
 
 
 def get_site(name: str) -> Site:

@@ -33,6 +33,8 @@ class FakeFetcher:
         self.detail_html = fixture("detail.html")
         self.calls: list[str] = []
         self.fail: dict[str, Exception] = {}
+        self.pages: dict[str, dict[str, str]] = {}  # 其他站点：站点 -> {路径: 页面}
+        self.files: dict[str, bytes] = {}  # get_bytes 按地址返回的内容
 
     async def get_page(self, path: str, *, priority: bool = False) -> Page:
         self.calls.append(path)
@@ -50,14 +52,33 @@ class FakeFetcher:
             return Page(html, "https://fs1.app" + path, "https://fs1.app")
         return Page(self.list_html, "https://fs1.app" + path, "https://fs1.app")
 
-    def site(self, name: str) -> "FakeFetcher":
-        """各站点的抓取通道都由它应答。"""
-        return self
+    def site(self, name: str):
+        """Jable 的抓取通道就是它自己；其他站点只认 pages 里登记过的页面，没登记的 404。"""
+        return self if name == "jable" else FakeSite(self, name)
 
     async def get_bytes(self, url: str, *, referer=None, headers=None) -> bytes:
+        if url in self.files:
+            return self.files[url]
         if url.endswith(".m3u8"):
             return b"#EXTM3U\n#EXTINF:3600.0,\na.ts\n#EXTINF:1800.5,\nb.ts\n#EXT-X-ENDLIST\n"
         return jpeg()
+
+
+class FakeSite:
+    def __init__(self, parent: FakeFetcher, name: str) -> None:
+        self.parent = parent
+        self.name = name
+
+    async def get_page(self, path: str, *, priority: bool = False) -> Page:
+        tag = f"{self.name}:{path}"
+        self.parent.calls.append(tag)
+        for key, exc in self.parent.fail.items():
+            if key in tag:
+                raise exc
+        html = self.parent.pages.get(self.name, {}).get(path)
+        if html is None:
+            raise NotFound(path)
+        return Page(html, "https://" + self.name + path, "https://" + self.name)
 
 
 @pytest.fixture

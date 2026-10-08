@@ -425,10 +425,11 @@ class Database:
     # ---- 作品与源 ----
 
     async def _attach(self, site: str, key: str, code: str, uncensored: bool, slug: str, site_vid: str,
-                      title: str, subtitle: str) -> tuple[int, int, bool]:
+                      title: str, subtitle: str, video_id: int | None = None) -> tuple[int, int, bool]:
         """在事务里调用：找到或新建这个源和它所属的作品，返回 (作品 id, 源 id, 是否新作品)。
 
-        已有的源直接用；新源按番号匹配键 + 是否无码流出找作品，找不到就新建（slug 撞了加序号）。
+        已有的源直接用；新源挂到指定的作品（video_id，补源时用），没指定就按番号匹配键 + 是否无码流出找作品，
+        找不到就新建（slug 撞了加序号）。
         """
         t = now()
         async with self.conn.execute("SELECT id, video_id FROM sources WHERE site=? AND key=?", (site, key)) as cur:
@@ -443,8 +444,8 @@ class Database:
             )
             return src["video_id"], src["id"], False
         ck = code_key(code)
-        work = None
-        if ck:
+        work = {"id": video_id} if video_id else None
+        if ck and work is None:
             async with self.conn.execute(
                 "SELECT id FROM videos WHERE code_key=? AND uncensored=? ORDER BY status='active' DESC, id LIMIT 1",
                 (ck, int(uncensored)),
@@ -507,12 +508,13 @@ class Database:
             await self._update_work(video_id, _merge(work, new, primary), it.code if primary else "")
         return video_id, created
 
-    async def upsert_detail(self, site: str, d: SourceDetail, slug: str, rank: Callable[[str], int]) -> int:
-        """详情页数据入库：更新这个源（播放地址等）并合并作品元数据，返回作品 id。"""
+    async def upsert_detail(self, site: str, d: SourceDetail, slug: str, rank: Callable[[str], int],
+                            video_id: int | None = None) -> int:
+        """详情页数据入库：更新这个源（播放地址等）并合并作品元数据，返回作品 id。video_id 见 _attach。"""
         t = now()
         async with self._tx():
             video_id, source_id, _ = await self._attach(site, d.key, d.code, d.uncensored, slug, d.site_vid,
-                                                        d.title, d.subtitle)
+                                                        d.title, d.subtitle, video_id)
             await self.conn.execute(
                 """UPDATE sources SET stream_url=?, stream_expires=?, subtitle=?, detail_at=?, status='active',
                           fail_streak=0, last_ok_at=?, last_error='', updated_at=? WHERE id=?""",
@@ -606,6 +608,28 @@ class Database:
             if cur is None or rank(r["site"]) < rank(cur[0]):
                 best[r["video_id"]] = (r["site"], r["key"])
         return list(best.values())
+
+    async def set_source_check(self, video_id: int, site: str, found: bool) -> None:
+        await self._write(
+            "INSERT INTO source_checks(video_id, site, found, checked_at) VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(video_id, site) DO UPDATE SET found=excluded.found, checked_at=excluded.checked_at",
+            (video_id, site, int(found), now()),
+        )
+
+    async def get_source_check(self, video_id: int, site: str) -> dict | None:
+        row = await self._one("SELECT * FROM source_checks WHERE video_id=? AND site=?", (video_id, site))
+        return dict(row) if row else None
+
+    async def works_to_probe(self, site: str, checked_before: int, library_id: int | None = None) -> list[int]:
+        """在这个站还没有源、且 checked_before 之后没查过的作品（下架的也算：别的站可能还有）。"""
+        sql = """SELECT v.id FROM videos v
+                 WHERE NOT EXISTS (SELECT 1 FROM sources s WHERE s.video_id=v.id AND s.site=?)
+                   AND NOT EXISTS (SELECT 1 FROM source_checks c WHERE c.video_id=v.id AND c.site=? AND c.checked_at>=?)"""
+        params: list = [site, site, checked_before]
+        if library_id:
+            sql += " AND EXISTS (SELECT 1 FROM outputs o WHERE o.video_id=v.id AND o.library_id=?)"
+            params.append(library_id)
+        return [r["id"] for r in await self._all(sql + " ORDER BY v.id DESC", params)]
 
     async def cdn_video_map(self, site: str = "jable") -> dict[int, str]:
         """站内数字 id -> 作品 slug（strm 扫描时把 CDN 直链认回作品）。"""

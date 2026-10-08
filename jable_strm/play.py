@@ -21,6 +21,7 @@ from urllib.parse import quote, urljoin
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import RedirectResponse, Response, StreamingResponse
 
+from .codes import code_key
 from .config import SettingsStore
 from .db import Database, source_cooldown
 from .fetcher import Blocked, FetchError, Fetcher, NotFound
@@ -119,12 +120,14 @@ class Resolver:
             v = await self.discover(slug.lower())
         sources = await self.db.get_sources(v["id"])
         ranked = self.rank(sources, site=site, direct_only=direct_only)
+        timeout = self.store.current.resolve_timeout
+        deadline = time.monotonic() + timeout
         if not ranked:
+            if not site and (r := await self._discover_for(v, deadline, direct_only=direct_only)):
+                return r
             if direct_only and self.rank(sources, site=site):
                 raise NoDirectSource(slug)
             raise NotFound(f"{slug} 没有可用的源")
-        timeout = self.store.current.resolve_timeout
-        deadline = time.monotonic() + timeout
         errors: list[str] = []
         blocked: Blocked | None = None
         gone = 0
@@ -156,11 +159,56 @@ class Resolver:
                 self.metrics.inc("play_failover")
                 log.info("%s 前 %d 个源不可用，改用 %s", slug, i, label)
             return r
+        if not site and (r := await self._discover_for(v, deadline, direct_only=direct_only)):
+            return r
         if gone == len(ranked):
             raise NotFound(f"{slug} 的源都已下架")
         if blocked is not None and len(errors) == 1:
             raise blocked
         raise FetchError("；".join(errors))
+
+    async def _discover_for(self, v: dict, deadline: float, *, direct_only: bool = False) -> Resolved | None:
+        """现场找源：已知的源都不能用时，按番号到还没有源的站点各找一次，找到就加成源并用它。
+
+        最近查过、没有这部片的站点跳过（probe_recheck_days）；字幕不回退时，找到的源字幕不合偏好也不用。
+        """
+        s = self.store.current
+        if not s.play_discover or not v.get("code_key"):
+            return None
+        have = {src["site"] for src in await self.db.get_sources(v["id"])}
+        cutoff = time.time() - s.probe_recheck_days * 86400
+        for name in s.site_priority:
+            site = SITES[name]
+            if name in have or not s.site(name).enabled or (direct_only and not site.stream.direct):
+                continue
+            check = await self.db.get_source_check(v["id"], name)
+            if check and not check["found"] and check["checked_at"] > cutoff:
+                continue
+            key = site.key_for(v["code"], uncensored=bool(v["uncensored"]))
+            left = deadline - time.monotonic()
+            if not key or left <= 0:
+                continue
+            try:
+                d = await asyncio.wait_for(site.fetch_detail(self.fetcher.site(name), key, priority=True), left)
+            except (NotFound, VideoGone):
+                await self.db.set_source_check(v["id"], name, False)
+                continue
+            except (Blocked, FetchError, ParseError, TimeoutError) as e:
+                log.info("现场找源 %s：%s 失败：%s", v["slug"], site.label, e)
+                continue
+            if code_key(d.code) != v["code_key"] or d.uncensored != bool(v["uncensored"]) or not d.stream_url:
+                await self.db.set_source_check(v["id"], name, False)
+                continue
+            await self.db.upsert_detail(name, d, v["slug"], s.site_rank, video_id=v["id"])
+            await self.db.set_source_check(v["id"], name, True)
+            self.metrics.inc("play_discovered")
+            src = await self.db.find_source(name, d.key)
+            if not self.rank([*(await self.db.get_sources(v["id"]))], site=name):
+                log.info("现场找源 %s：在 %s 找到了，但字幕不合偏好（字幕不回退），不用", v["slug"], site.label)
+                continue
+            log.info("现场找源 %s：已知的源都不能用，在 %s 找到 %s", v["slug"], site.label, d.key)
+            return Resolved(await self.db.get_video_by_id(v["id"]) or v, src, site)
+        return None
 
     async def discover(self, slug: str) -> dict:
         """库里没有的影片（比如别的工具生成的 strm）：把 slug 当番号，按站点优先顺序到各站找，找到就入库。"""
@@ -169,7 +217,7 @@ class Resolver:
         for name in s.site_priority:
             site = SITES[name]
             key = site.key_for(slug)
-            if not key or not s.site(name).enabled:
+            if not key or not s.site(name).enabled or (name != "jable" and not s.play_discover):
                 continue
             try:
                 d = await site.fetch_detail(self.fetcher.site(name), key, priority=True)
@@ -426,9 +474,12 @@ async def _proxy_playlist(request: Request, r: Resolved, t: str) -> Response:
         raise HTTPException(502, f"获取播放列表失败：{e}") from None
     q = f"?t={quote(t)}" if t else ""
     root = r.url.rsplit("/", 1)[0] + "/"
+    body = raw.decode("utf-8", "replace")
+    heights = [int(h) for h in re.findall(r"RESOLUTION=\d+x(\d+)", body)]
+    if heights and max(heights) != r.source["height"]:
+        await ctx.db.update_source(r.source["id"], height=max(heights))  # 多码率的源记下最高分辨率，挑源时用
     # /play/{slug}.m3u8 回到 /hls/{源 id}/：相对地址解析，不依赖对外地址的写法
-    text = rewrite_playlist(raw.decode("utf-8", "replace"), r.url, root, f"../hls/{r.source['id']}/", q,
-                            r.site.stream.disguised_segments)
+    text = rewrite_playlist(body, r.url, root, f"../hls/{r.source['id']}/", q, r.site.stream.disguised_segments)
     return Response(text, media_type="application/vnd.apple.mpegurl")
 
 

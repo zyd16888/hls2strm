@@ -189,20 +189,21 @@
             <option value="list">列表地址</option>
             <option value="videos">指定影片</option>
             <option value="backfill">补全缺失详情</option>
+            <option value="probe">补源（找备用源）</option>
             <option value="rewrite">重写输出</option>
           </select>
         </label>
-        <template x-if="['list', 'videos'].includes(form.kind)">
-          <label class="field"><span>站点</span>
+        <template x-if="['list', 'videos', 'probe'].includes(form.kind)">
+          <label class="field"><span x-text="form.kind === 'probe' ? '到哪个站点找' : '站点'"></span>
             <select x-model="form.site" @change="form.sort = siteMeta(form.site).default_sort || ''">
               <template x-for="[k, m] in Object.entries(meta.sites || {})" :key="k"><option :value="k" x-text="m.label" :selected="k === form.site"></option></template>
             </select>
           </label>
         </template>
-        <template x-if="['list', 'videos', 'rewrite'].includes(form.kind)">
-          <label class="field"><span>输出库</span>
+        <template x-if="['list', 'videos', 'rewrite', 'probe'].includes(form.kind)">
+          <label class="field"><span x-text="form.kind === 'probe' ? '给哪个库的影片找' : '输出库'"></span>
             <select x-model.number="form.library_id">
-              <option value="0" x-show="form.kind === 'rewrite'">全部库</option>
+              <option value="0" x-show="['rewrite', 'probe'].includes(form.kind)" x-text="form.kind === 'probe' ? '全部影片' : '全部库'"></option>
               <template x-for="l in libraries" :key="l.id"><option :value="l.id" x-text="l.name" :selected="l.id === form.library_id"></option></template>
             </select>
           </label>
@@ -776,6 +777,7 @@
         <span style="margin-left:auto;display:flex;gap:6px">
           <button class="sm" @click="playVideo(detail)">试播</button>
           <button class="sm" @click="refreshVideo(detail)" :disabled="detail._busy">刷新（重新抓详情和地址）</button>
+          <button class="sm" @click="probeVideo(detail)" :disabled="detail._busy">查找其他源</button>
           <button class="sm" @click="detail = null">关闭</button>
         </span>
       </h3>

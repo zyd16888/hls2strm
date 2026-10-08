@@ -3,7 +3,7 @@
 const KIND_NAMES = {
   list: "列表页", detail: "详情页", rewrite: "重写输出", purge: "删除库", reclassify: "重新归库",
   scan: "扫描", adopt: "纳管", prefix: "改前缀", revert: "回滚", locate: "同步位置",
-  crawl: "列表抓取", incremental: "增量", videos: "指定影片",
+  crawl: "列表抓取", incremental: "增量", videos: "指定影片", probe: "补源",
 };
 const JOB_STATUS = { running: "运行中", paused: "已暂停", done: "已完成", cancelled: "已取消" };
 const TASK_STATUS = { pending: "待处理", running: "运行中", done: "完成", failed: "失败", gone: "下架", cancelled: "已取消" };
@@ -14,10 +14,10 @@ const SETTING_GROUPS = [
   { title: "站点", keys: ["sites", "site_priority"] },
   { title: "抓取", keys: ["proxy", "impersonate", "request_timeout", "domain_cooldown", "solver_url", "solver_timeout"] },
   { title: "重试", keys: ["max_attempts", "retry_base_delay"] },
-  { title: "任务", keys: ["fetch_detail"] },
+  { title: "任务", keys: ["fetch_detail", "auto_probe_sites", "probe_recheck_days"] },
   { title: "输出", keys: ["output_dir", "path_template", "write_nfo", "download_cover", "poster_crop"] },
   { title: "播放", keys: ["public_base_url", "play_mode", "proxy_user_agents", "play_token", "hls_margin", "subtitle_priority",
-                         "subtitle_fallback", "resolve_timeout", "resolve_token", "resolve_proxy_url"] },
+                         "subtitle_fallback", "play_discover", "resolve_timeout", "resolve_token", "resolve_proxy_url"] },
 ];
 const SETTING_LABELS = {
   sites: "站点", site_priority: "站点优先顺序", proxy: "抓取代理", impersonate: "浏览器指纹",
@@ -27,7 +27,8 @@ const SETTING_LABELS = {
   download_cover: "下载封面", poster_crop: "裁剪 poster", public_base_url: "对外地址", play_mode: "播放模式",
   proxy_user_agents: "中转 UA 片段", play_token: "播放令牌", hls_margin: "有效期余量（分钟）",
   resolve_token: "网关解析令牌", subtitle_priority: "字幕偏好", subtitle_fallback: "字幕回退",
-  resolve_timeout: "取地址总时限（秒）", resolve_proxy_url: "公网中转地址",
+  resolve_timeout: "取地址总时限（秒）", resolve_proxy_url: "公网中转地址", play_discover: "现场找源",
+  auto_probe_sites: "新片自动补源", probe_recheck_days: "补源重查间隔（天）",
 };
 const SUBTITLES = { zh: "中文字幕", en: "英文字幕", "": "无字幕" };
 const REWRITE_KEYS = ["public_base_url", "play_mode", "play_token", "path_template", "output_dir", "write_nfo"];
@@ -192,6 +193,7 @@ function app() {
         list: `一次性抓取某个列表并输出到所选的库。${this.siteMeta(this.form.site).hint || ""}。同一番号已经在库里（别的站抓过）的，只给它加一个源。需要定时更新请用「输出库与订阅」里的订阅。`,
         videos: "抓取指定影片的详情并加入所选的库，优先级高于批量任务。",
         backfill: "为所有还没有详情的影片排队抓详情，写入它们所在的各个库。",
+        probe: "给库里的影片找备用源：按番号到所选站点逐部查找（每部一次请求），找到就挂成这部影片的另一个源，播放时原来的源不能用会自动换过去。某个站没有的影片，按「补源重查间隔」内不再重复查。",
         rewrite: "修改对外地址、播放模式、令牌或路径模板后，用它重写已有的 strm / nfo（不联网），路径变了会搬动文件。",
       }[this.form.kind];
     },
@@ -200,7 +202,8 @@ function app() {
       const body = { kind: f.kind };
       if (f.kind === "list") Object.assign(body, { site: f.site, source: f.source, sort: f.sort, start_page: f.start_page || 1, end_page: f.end_page || 0, detail: f.detail });
       if (f.kind === "videos") Object.assign(body, { site: f.site, urls: f.urls });
-      if (["list", "videos", "rewrite"].includes(f.kind) && f.library_id) body.library_id = f.library_id;
+      if (f.kind === "probe") body.site = f.site;
+      if (["list", "videos", "rewrite", "probe"].includes(f.kind) && f.library_id) body.library_id = f.library_id;
       const r = await this.post("/api/jobs", body);
       this.notify(`已创建任务 #${r.id}`);
       this.loadJobs();
@@ -264,6 +267,19 @@ function app() {
       } finally { v._busy = false; }
     },
     openDetail(v) { this.detail = v; },
+    async probeVideo(v) {
+      this.notify(`正在到其他站点找 ${v.slug} …`);
+      v._busy = true;
+      try {
+        const nv = await this.post(`/api/videos/${v.slug}/probe`);
+        const before = (v.sources || []).length;
+        Object.assign(v, nv);
+        const row = this.videos.items.find(x => x.slug === v.slug);
+        if (row && row !== v) Object.assign(row, nv);
+        const n = (nv.sources || []).length - before;
+        this.notify(n > 0 ? `找到 ${n} 个新的源` : "其他站点上没有找到");
+      } finally { v._busy = false; }
+    },
     srcState(src) {
       const now = Date.now() / 1000;
       if (src.status === "gone") return { text: "已下架", cls: "err" };

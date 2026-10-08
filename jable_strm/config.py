@@ -108,6 +108,11 @@ class Settings(BaseModel):
     retry_base_delay: int = Field(30, ge=1, le=3600, description="首次重试等待（秒），之后每次 ×4，上限 2 小时")
     # 任务
     fetch_detail: bool = Field(True, description="新建列表任务和订阅时，默认是否抓详情页（女优、标签、上市日期、封面）")
+    auto_probe_sites: list[str] = Field(
+        default_factory=list,
+        description="新片自动补源：列表任务、订阅收进新影片时，到这些站点按番号找备用源（填站点名，如 missav）；留空不自动找",
+    )
+    probe_recheck_days: int = Field(30, ge=1, le=3650, description="补源时某个站没有这部影片，多少天内不再去查")
     # 输出
     output_dir: str = Field(
         "", description="输出根目录，各输出库的相对目录都在它下面；留空使用 JABLE_OUTPUT_DIR 或 数据目录/strm"
@@ -142,6 +147,9 @@ class Settings(BaseModel):
         True, description="首选字幕的源都不能用时，是否用其他字幕的源顶上（比如中字源失效时播无字幕版）"
     )
     resolve_timeout: int = Field(20, ge=5, le=120, description="一次播放请求挑源、取地址的总时限（秒），超时不再试后面的源")
+    play_discover: bool = Field(
+        True, description="现场找源：影片已知的源都不能用（或库里没有这部影片）时，按番号到其他启用的站点找一次"
+    )
     resolve_proxy_url: str = Field(
         "", description="网关 resolve 用：作品只有要中转的源（如 MissAV）时返回这个地址下的中转链接，须能从公网访问；留空返回 409"
     )

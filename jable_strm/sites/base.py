@@ -57,6 +57,7 @@ class SourceDetail:
     maker: str = ""
     director: str = ""
     series: str = ""
+    variants: list[str] = field(default_factory=list)  # 同一部片在本站其他版本的 key（中字、无码流出等）
 
 
 @dataclass
@@ -106,6 +107,10 @@ class Site:
     def key_for(self, code: str, subtitle: str = "", uncensored: bool = False) -> str | None:
         """按番号直接构造站内 key（补源用）；站点不支持返回 None。"""
         return None
+
+    def variant_of(self, key: str) -> tuple[str, bool]:
+        """从站内 key 看出的 (字幕, 是否无码流出)；看不出返回 ('', False)。"""
+        return "", False
 
     async def fetch_detail(self, sf: SiteFetcher, key: str, *, priority: bool = False) -> SourceDetail:
         page = await sf.get_page(self.detail_path(key), priority=priority)

@@ -2,13 +2,15 @@
 
 job 种类：
   crawl        翻某个列表来源，输出到指定输出库（订阅的首轮全量也是它）
+  probe        补源：按番号到某个站点找库里影片的备用源
   incremental  从第 1 页往后翻，连续遇到库里已有的影片就停（订阅的定时增量）
   videos       抓指定影片的详情（手动添加、补全缺失详情）
   rewrite      按当前设置重写输出（可限定某个库），路径变化时搬动文件
   purge        删除输出库及其文件
   locate       外部整理库：找回被外部工具（mdcng 等）移走、改名的 strm，更新记录的路径
   reclassify   重新归库：规则库重新求值，并按来源库、排除库归并（只在本地，不联网）
-子任务种类：list（目标=页码）、detail（目标=站内 key）、rewrite（目标=all）、purge / locate（目标=库 id）
+子任务种类：list（目标=页码）、detail（目标=站内 key）、probe（目标=站点:作品 id）、rewrite（目标=all）、
+          purge / locate（目标=库 id）
 list、detail 子任务带站点（tasks.site）：某个站被拦截时只暂停这个站的子任务，每个站的并发也各自限制。
 """
 
@@ -21,7 +23,7 @@ from collections import Counter
 from pathlib import Path
 from urllib.parse import urljoin
 
-from .codes import work_slug
+from .codes import code_key, work_slug
 from .config import BootConfig, SettingsStore, check_path_template
 from .db import DEFAULT_LIBRARY_ID, Database
 from .fetcher import Blocked, FetchError, Fetcher, NotFound
@@ -189,7 +191,8 @@ class Engine:
             if job is None or job["status"] != "running":
                 await self.db.finish_task(tid, "pending", refund_attempt=True)
                 return
-            handler = {"list": self._do_list, "detail": self._do_detail, "rewrite": self._do_rewrite,
+            handler = {"list": self._do_list, "detail": self._do_detail, "probe": self._do_probe,
+                       "rewrite": self._do_rewrite,
                        "purge": self._do_purge, "reclassify": self._do_reclassify,
                        "scan": self.strm.do_scan, "adopt": self.strm.do_adopt,
                        "prefix": self.strm.do_prefix, "revert": self.strm.do_revert,
@@ -346,8 +349,12 @@ class Engine:
         added_count = 0
         detail_keys = []
         state = (await self.db.get_job(job["id"]))["state"]
+        probe_sites = [n for n in self.store.current.auto_probe_sites
+                       if n in SITES and n != site.name and SITES[n].key_for("ABC-001")]
         for it in lp.items:
-            v, _ = await self.upsert_item(site, it)
+            v, created = await self.upsert_item(site, it)
+            for n in probe_sites if created else ():
+                await self.db.add_tasks(job["id"], "probe", [f"{n}:{v['id']}"], PRIORITY_DETAIL, n)
             if await self.db.in_libraries(v["id"], lib["excludes"]):
                 # 已分到排除库：本库不收，但算作已知，增量照常停
                 state["known_streak"] = state.get("known_streak", 0) + 1
@@ -403,6 +410,79 @@ class Engine:
         log.info("详情 %s %s：%s，女优 %s，%d 个标签", site.label, key, v["release_date"] or "无日期",
                  "、".join(m["name"] for m in v["models"]) or "无", len(v["tags"]))
         return await self.db.get_video_by_id(v["id"])
+
+    async def _do_probe(self, job: dict, task: dict) -> None:
+        site, _, vid = task["target"].partition(":")
+        await self.probe_work(int(vid), site)
+
+    async def probe_work(self, video_id: int, site_name: str) -> int:
+        """补源：按番号到这个站找这部作品，找到就加成源（同一部片的中字版也一起加）。返回新加的源数。
+
+        站点上的页面番号对不上（被纠正到别的片），或者是不是无码流出对不上，都当作没有。
+        """
+        v = await self.db.get_video_by_id(video_id)
+        site = get_site(site_name)
+        if v is None:
+            return 0
+        if any(s["site"] == site.name for s in await self.db.get_sources(video_id)):
+            return 0
+        key = site.key_for(v["code"], uncensored=bool(v["uncensored"]))
+        sf = self.fetcher.site(site.name)
+        try:
+            d = await site.fetch_detail(sf, key) if key else None
+        except (NotFound, VideoGone):
+            d = None
+        if d is None or code_key(d.code) != v["code_key"] or d.uncensored != bool(v["uncensored"]):
+            await self.db.set_source_check(video_id, site.name, False)
+            log.info("补源 %s：%s 上没有", v["slug"], site.label)
+            return 0
+        await self.db.upsert_detail(site.name, d, v["slug"], self._rank, video_id=video_id)
+        added = [d.key]
+        for alt in d.variants:  # 同一部片的中字版：多一个更好的源
+            if alt == d.key or site.variant_of(alt) != ("zh", bool(v["uncensored"])):
+                continue
+            try:
+                ad = await site.fetch_detail(sf, alt)
+            except (NotFound, VideoGone):
+                continue
+            await self.db.upsert_detail(site.name, ad, v["slug"], self._rank, video_id=video_id)
+            added.append(ad.key)
+        await self.db.set_source_check(video_id, site.name, True)
+        self.metrics.inc("probe_found")
+        v = await self.db.get_video_by_id(video_id)
+        await self._output_all(v, cover=True)
+        await self.apply_rules(v)
+        log.info("补源 %s：在 %s 找到 %s", v["slug"], site.label, "、".join(added))
+        return len(added)
+
+    async def probe_video(self, slug: str) -> dict:
+        """影片库里点「查找其他源」：到每个启用、还没有源的站点找一次（不管之前查过没有）。"""
+        v = await self.db.get_video(slug)
+        if v is None:
+            raise NotFound(slug)
+        cfg = self.store.current.sites
+        have = {s["site"] for s in await self.db.get_sources(v["id"])}
+        for name in self.store.current.site_priority:
+            if name not in have and cfg[name].enabled and SITES[name].key_for(v["code"] or v["slug"]):
+                await self.probe_work(v["id"], name)
+        return await self.db.get_video_by_id(v["id"])
+
+    async def create_probe(self, site: str, library_id: int | None = None) -> int:
+        """补源任务：库里（或某个库里）在这个站还没有源、最近没查过的影片，逐部按番号去找。"""
+        st = get_site(site)
+        if not st.key_for("ABC-001"):
+            raise ValueError(f"{st.label} 不支持按番号查找，不能补源")
+        lib_name = self._library(library_id)["name"] if library_id else "全部影片"
+        cutoff = int(time.time()) - self.store.current.probe_recheck_days * 86400
+        ids = await self.db.works_to_probe(st.name, cutoff, library_id)
+        if not ids:
+            raise ValueError(f"{lib_name}在 {st.label} 上都有源了，或者最近查过")
+        name = f"补源：{lib_name} → {st.label}（{len(ids)} 部）"
+        job_id = await self.db.create_job("probe", name, {"site": st.name, "library_id": library_id, "count": len(ids)})
+        await self.db.add_tasks(job_id, "probe", [f"{st.name}:{i}" for i in ids], PRIORITY_DETAIL, st.name)
+        log.info("新建任务 #%d「%s」", job_id, name)
+        self.notify()
+        return job_id
 
     async def refresh_video(self, slug: str) -> dict:
         """重抓作品每个可用源的详情；全部失败才报错（都下架时抛 NotFound）。"""
