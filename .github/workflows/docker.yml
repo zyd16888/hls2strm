@@ -2,6 +2,7 @@ name: 构建镜像
 
 # 推送到默认分支：测试通过后构建 nightly（标签 nightly 和 nightly-<短 sha>）
 # 推送 v* tag：测试通过后构建 tag 同名版本，并更新 latest
+# 手动运行（workflow_dispatch）选其他分支：构建分支同名标签（/ 换成 -）和 dev-<短 sha>，不动 nightly、latest
 # PR：只跑测试
 on:
   push:
@@ -48,8 +49,13 @@ jobs:
           echo "image=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-          else
+            echo "main=false" >> "$GITHUB_OUTPUT"
+          elif [ "${GITHUB_REF_NAME}" = "main" ] || [ "${GITHUB_REF_NAME}" = "master" ]; then
             echo "version=nightly-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "main=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME//\//-}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "main=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: 生成标签
@@ -58,8 +64,10 @@ jobs:
         with:
           images: ${{ steps.ver.outputs.image }}
           tags: |
-            type=raw,value=nightly,enable=${{ github.ref_type == 'branch' }}
-            type=sha,prefix=nightly-,format=short,enable=${{ github.ref_type == 'branch' }}
+            type=raw,value=nightly,enable=${{ steps.ver.outputs.main == 'true' }}
+            type=sha,prefix=nightly-,format=short,enable=${{ steps.ver.outputs.main == 'true' }}
+            type=ref,event=branch,enable=${{ github.ref_type == 'branch' && steps.ver.outputs.main != 'true' }}
+            type=sha,prefix=dev-,format=short,enable=${{ github.ref_type == 'branch' && steps.ver.outputs.main != 'true' }}
             type=ref,event=tag
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
 
