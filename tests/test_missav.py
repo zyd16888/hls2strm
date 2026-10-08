@@ -138,3 +138,28 @@ def test_probe_failover_and_discover(make_store, boot):
         await db.close()
 
     asyncio.run(run())
+
+
+def test_probe_video_reports_each_site(make_store, boot):
+    """「查找其他源」：各站并行查，结果按站点返回（找到 / 没有 / 失败），一个站失败不影响别的站。"""
+    from hls2strm.fetcher import FetchError
+
+    async def run():
+        db, store = await make_store()
+        html, ids = model_fixture()
+        ids["ipzz-983"] = 62384
+        fetcher = FakeFetcher(html, ids)
+        _setup(fetcher, {"ipzz-983": "missav_detail.html"})
+        fetcher.fail = {"javguru:": FetchError("连接超时")}  # JavGuru 不通；JAVMost 没有这部（404）
+        engine = Engine(db, fetcher, OutputWriter(store), store, Metrics(), boot)
+        await engine.fetch_detail("jable", "ipzz-983")
+        v, results = await engine.probe_video("ipzz-983")
+        by_site = {r["site"]: r for r in results}
+        assert by_site["missav"]["status"] == "found" and by_site["missav"]["found"] == 1
+        assert by_site["javguru"]["status"] == "failed" and "连接超时" in by_site["javguru"]["error"]
+        assert by_site["javmost"]["status"] == "none"
+        assert "supjav" not in by_site  # 默认没启用
+        assert {s["site"] for s in await db.get_sources(v["id"])} == {"jable", "missav"}
+        await db.close()
+
+    asyncio.run(run())

@@ -815,8 +815,11 @@
         <span class="chip err" x-show="detail.status === 'gone'">已下架</span>
         <span style="margin-left:auto;display:flex;gap:6px">
           <button class="sm" @click="playVideo(detail)">试播</button>
-          <button class="sm" @click="refreshVideo(detail)" :disabled="detail._busy">刷新（重新抓详情和地址）</button>
-          <button class="sm" @click="probeVideo(detail)" :disabled="detail._busy">查找其他源</button>
+          <button class="sm" @click="refreshVideo(detail)" :disabled="!!detail._busy"
+                  x-text="detail._busy === 'refresh' ? '刷新中…' : '刷新（重新抓详情和地址）'"></button>
+          <button class="sm" @click="probeVideo(detail)" :disabled="!!detail._busy"
+                  :title="detail._busy === 'probe' ? '各站并行查，要过 CF 的站会走解题服务，最长约一分半' : ''"
+                  x-text="detail._busy === 'probe' ? '查找中…' : '查找其他源'"></button>
           <button class="sm" @click="detail = null">关闭</button>
         </span>
       </h3>

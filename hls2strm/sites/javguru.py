@@ -168,11 +168,12 @@ class JavGuruSite(Site):
             series=(names("label") or [""])[0], lines=lines,
         )
 
-    async def lookup(self, sf: SiteFetcher, code: str, uncensored: bool = False) -> list[SourceItem]:
+    async def lookup(self, sf: SiteFetcher, code: str, uncensored: bool = False,
+                     priority: bool = False) -> list[SourceItem]:
         ck = code_key(code)
         if not ck:
             return []
-        page = await sf.get_page(f"/?s={quote(code.strip().upper())}")
+        page = await sf.get_page(f"/?s={quote(code.strip().upper())}", priority=priority)
         return [it for it in self.parse_list(page.html).items
                 if code_key(it.code) == ck and it.uncensored == uncensored]
 

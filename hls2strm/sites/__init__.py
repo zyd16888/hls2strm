@@ -21,19 +21,20 @@ def get_site(name: str) -> Site:
     return site
 
 
-async def find_by_code(site: Site, sf, code: str, uncensored: bool = False) -> list[SourceItem | SourceDetail]:
+async def find_by_code(site: Site, sf, code: str, uncensored: bool = False,
+                       priority: bool = False) -> list[SourceItem | SourceDetail]:
     """按番号在站点上找影片，结果都核对过番号和是否无码流出。
 
     搜索类站点（lookup_verified）返回列表项；拼地址类站点抓详情核对后返回详情（站点可能把写错的番号纠正到别的片）。
     """
     ck = code_key(code)
     out: list[SourceItem | SourceDetail] = []
-    for item in await site.lookup(sf, code, uncensored):
+    for item in await site.lookup(sf, code, uncensored, priority=priority):
         if site.lookup_verified:
             out.append(item)
             continue
         try:
-            d = await site.fetch_detail(sf, item.key, priority=True)
+            d = await site.fetch_detail(sf, item.key, priority=priority)
         except (NotFound, VideoGone):
             continue
         if code_key(d.code) == ck and d.uncensored == uncensored:

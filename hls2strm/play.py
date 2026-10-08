@@ -239,7 +239,7 @@ class Resolver:
                 break
             try:
                 found = await asyncio.wait_for(
-                    find_by_code(site, self.fetcher.site(name), v["code"], bool(v["uncensored"])), left)
+                    find_by_code(site, self.fetcher.site(name), v["code"], bool(v["uncensored"]), priority=True), left)
             except (Blocked, FetchError, ParseError, TimeoutError) as e:
                 log.info("现场找源 %s：%s 失败：%s", v["slug"], site.label, e)
                 continue
@@ -275,7 +275,7 @@ class Resolver:
             if not site.can_lookup or not s.site(name).enabled or (name != "jable" and not s.play_discover):
                 continue
             try:
-                found = await find_by_code(site, self.fetcher.site(name), slug)
+                found = await find_by_code(site, self.fetcher.site(name), slug, priority=True)
             except (Blocked, FetchError, ParseError) as e:
                 errors.append(e)
                 log.info("在 %s 找 %s 失败：%s", site.label, slug, e)

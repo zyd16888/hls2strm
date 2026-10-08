@@ -44,6 +44,7 @@ PRIORITY_DETAIL = 0
 MAX_RETRY_DELAY = 7200
 MAX_SNAPSHOTS = 200
 DEFAULT_STOP_AFTER_KNOWN = 48
+PROBE_TIMEOUT = 90  # 「查找其他源」每个站最多等多久（秒）：要过 CF 的站走解题服务，几十秒很常见
 DEFAULT_MAX_PAGES = 20
 SETTLE_INTERVAL = 600
 
@@ -441,8 +442,12 @@ class Engine:
             return 0
         if any(s["site"] == site.name for s in await self.db.get_sources(video_id)):
             return 0
+        return await self._attach_found(v, site, await self._lookup(site, v))
+
+    async def _attach_found(self, v: dict, site: Site, found: list[SourceItem | SourceDetail]) -> int:
+        """把按番号找到的结果挂成作品的源（同一部片的中字版也一起加），重写输出。返回新加的源数。"""
+        video_id = v["id"]
         sf = self.fetcher.site(site.name)
-        found = await self._lookup(site, v)
         if not found:
             await self.db.set_source_check(video_id, site.name, False)
             log.info("补源 %s：%s 上没有", v["slug"], site.label)
@@ -473,23 +478,49 @@ class Engine:
         log.info("补源 %s：在 %s 找到 %s", v["slug"], site.label, "、".join(added))
         return len(added)
 
-    async def _lookup(self, site: Site, v: dict) -> list[SourceItem | SourceDetail]:
-        return await find_by_code(site, self.fetcher.site(site.name), v["code"], bool(v["uncensored"]))
+    async def _lookup(self, site: Site, v: dict, priority: bool = False) -> list[SourceItem | SourceDetail]:
+        return await find_by_code(site, self.fetcher.site(site.name), v["code"], bool(v["uncensored"]), priority)
 
-    async def probe_video(self, slug: str) -> dict:
-        """影片库里点「查找其他源」：到每个启用、还没有源的站点找一次（不管之前查过没有）。"""
+    async def probe_video(self, slug: str) -> tuple[dict, list[dict]]:
+        """影片库里点「查找其他源」：到每个启用、还没有源的站点找一次（不管之前查过没有）。
+
+        各站并行查、不排限速队列，每站最多 PROBE_TIMEOUT 秒（要过 CF 的站会走解题服务，慢）；查到的再逐个挂上。
+        返回 (作品, 每个站的结果)。结果 status：found / none / failed / timeout。
+        """
         v = await self.db.get_video(slug)
         if v is None:
             raise NotFound(slug)
         cfg = self.store.current.sites
         have = {s["site"] for s in await self.db.get_sources(v["id"])}
-        for name in self.store.current.site_priority:
-            if name not in have and cfg[name].enabled and SITES[name].can_lookup:
+        sites = [SITES[n] for n in self.store.current.site_priority
+                 if n not in have and cfg[n].enabled and SITES[n].can_lookup]
+
+        async def one(site: Site):
+            return await asyncio.wait_for(self._lookup(site, v, priority=True), PROBE_TIMEOUT)
+
+        results = []
+        for site, found in zip(sites, await asyncio.gather(*(one(s) for s in sites), return_exceptions=True)):
+            r = {"site": site.name, "label": site.label}
+            if isinstance(found, TimeoutError):
+                r |= {"status": "timeout", "error": f"超过 {PROBE_TIMEOUT} 秒没查完"}
+            elif isinstance(found, (NotFound, VideoGone)):
+                await self.db.set_source_check(v["id"], site.name, False)
+                r |= {"status": "none", "found": 0}
+            elif isinstance(found, (Blocked, FetchError, ParseError)):
+                r |= {"status": "failed", "error": str(found)[:200]}
+            elif isinstance(found, BaseException):
+                raise found
+            else:
                 try:
-                    await self.probe_work(v["id"], name)
-                except (Blocked, FetchError, ParseError) as e:  # 一个站不通不影响去别的站找
-                    log.info("查找其他源 %s：%s 失败：%s", slug, SITES[name].label, e)
-        return await self.db.get_video_by_id(v["id"])
+                    n = await self._attach_found(v, site, found)
+                except (Blocked, FetchError, ParseError) as e:
+                    r |= {"status": "failed", "error": str(e)[:200]}
+                else:
+                    r |= {"status": "found" if n else "none", "found": n}
+            if r.get("error"):
+                log.info("查找其他源 %s：%s %s", slug, site.label, r["error"])
+            results.append(r)
+        return await self.db.get_video_by_id(v["id"]), results
 
     async def create_probe(self, site: str, library_id: int | None = None) -> int:
         """补源任务：库里（或某个库里）在这个站还没有源、最近没查过的影片，逐部按番号去找。"""

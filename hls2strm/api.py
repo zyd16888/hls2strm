@@ -322,14 +322,12 @@ async def probe_video(slug: str, request: Request):
     """到每个启用、还没有这部影片源的站点按番号找一次。"""
     c = _ctx(request)
     try:
-        v = await c.engine.probe_video(slug.lower())
+        v, results = await c.engine.probe_video(slug.lower())
     except NotFound:
         raise HTTPException(404, "影片不存在") from None
-    except Blocked as err:
-        raise HTTPException(503, str(err)) from None
-    except (FetchError, ParseError) as err:
-        raise HTTPException(502, str(err)) from None
-    return await _full_view(c, v)
+    view = await _full_view(c, v)
+    view["probe"] = results
+    return view
 
 
 # ---- 输出库 ----

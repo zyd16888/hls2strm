@@ -268,7 +268,7 @@ function app() {
     },
     async refreshVideo(v) {
       this.notify(`正在刷新 ${v.slug} …`);
-      v._busy = true;
+      v._busy = "refresh";
       try {
         const nv = await this.post(`/api/videos/${v.slug}/refresh`);
         Object.assign(v, nv);
@@ -281,15 +281,18 @@ function app() {
     openDetail(v) { this.detail = v; },
     async probeVideo(v) {
       this.notify(`正在到其他站点找 ${v.slug} …`);
-      v._busy = true;
+      v._busy = "probe";
       try {
         const nv = await this.post(`/api/videos/${v.slug}/probe`);
-        const before = (v.sources || []).length;
+        const results = nv.probe || [];
+        delete nv.probe;
         Object.assign(v, nv);
         const row = this.videos.items.find(x => x.slug === v.slug);
         if (row && row !== v) Object.assign(row, nv);
-        const n = (nv.sources || []).length - before;
-        this.notify(n > 0 ? `找到 ${n} 个新的源` : "其他站点上没有找到");
+        if (!results.length) { this.notify("所有启用的站点上都已经有这部影片的源了"); return; }
+        const text = { found: "找到", none: "没有", failed: "失败", timeout: "超时" };
+        this.notify(results.map(r => `${r.label}：${text[r.status] || r.status}` + (r.error ? `（${r.error}）` : "")).join("；"),
+                    results.some(r => r.status === "failed" || r.status === "timeout"));
       } finally { v._busy = false; }
     },
     srcState(src) {

@@ -174,13 +174,14 @@ class SupJavSite(Site):
             tags=tags, maker=maker, lines=[(n, link) for n, link in servers if n and link],
         )
 
-    async def lookup(self, sf: SiteFetcher, code: str, uncensored: bool = False) -> list[SourceItem]:
+    async def lookup(self, sf: SiteFetcher, code: str, uncensored: bool = False,
+                     priority: bool = False) -> list[SourceItem]:
         """站内搜索番号（FC2 只搜数字），按番号匹配键和是否无码破解核对搜索结果。"""
         ck = code_key(code)
         if not ck:
             return []
         query = ck.split("-", 1)[1] if ck.startswith("FC2PPV-") else code.strip().upper()
-        page = await sf.get_page(f"/zh/?s={quote(query)}")
+        page = await sf.get_page(f"/zh/?s={quote(query)}", priority=priority)
         return [it for it in self.parse_list(page.html).items
                 if code_key(it.code) == ck and it.uncensored == uncensored]
 

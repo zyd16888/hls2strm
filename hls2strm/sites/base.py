@@ -152,8 +152,10 @@ class Site:
         """能不能按番号找到本站的影片（补源、现场找源用）。"""
         return type(self).lookup is not Site.lookup or bool(self.key_for("ABC-001"))
 
-    async def lookup(self, sf: SiteFetcher, code: str, uncensored: bool = False) -> list[SourceItem]:
-        """按番号找本站的影片。默认直接拼 key（还没确认存在，调用方抓详情核对）；要搜索的站点覆盖它。"""
+    async def lookup(self, sf: SiteFetcher, code: str, uncensored: bool = False,
+                     priority: bool = False) -> list[SourceItem]:
+        """按番号找本站的影片。默认直接拼 key（还没确认存在，调用方抓详情核对）；要搜索的站点覆盖它。
+        priority：不排限速队列（用户手动查、播放时现场找）。"""
         key = self.key_for(code, uncensored=uncensored)
         return [SourceItem(key=key, code=code, title="", uncensored=uncensored)] if key else []
 
