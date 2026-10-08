@@ -11,7 +11,7 @@ class JableSite(Site):
     name = "jable"
     label = "Jable"
     default_domains = ["https://fs1.app", "https://jable.tv"]
-    stream = StreamTraits(direct=True, expires=True)
+    stream = StreamTraits(direct=True, expires=True, ua_block=True)
     sorts = sources.SORTS
     presets = sources.PRESETS
     default_sort = "post_date"

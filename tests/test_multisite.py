@@ -105,3 +105,20 @@ def test_sources_merge_by_code(make_store):
         await db.close()
 
     asyncio.run(run())
+
+
+def test_close_stream_aborts_transfer():
+    """curl_cffi 的 aclose() 只等传输结束；关之前要先设 quit_now，不然会把整个文件下完。"""
+    from jable_strm.play import close_stream
+
+    class Resp:
+        def __init__(self):
+            self.quit_now = asyncio.Event()
+            self.closed_after_quit = None
+
+        async def aclose(self):
+            self.closed_after_quit = self.quit_now.is_set()
+
+    r = Resp()
+    asyncio.run(close_stream(r))
+    assert r.closed_after_quit is True

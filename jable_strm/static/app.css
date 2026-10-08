@@ -228,4 +228,4 @@ input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); }
 
 /* 设置页：按站点编辑 */
 .site-edit { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 10px; background: var(--panel-2); }
-.site-edit textarea { min-height: 64px; }
+.site-edit textarea { min-height: 80px; }

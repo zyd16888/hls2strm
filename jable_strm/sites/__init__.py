@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from ..codes import code_key
+from ..errors import NotFound, VideoGone
 from .base import ListPage, Site, SourceDetail, SourceItem, Stream, StreamTraits
 from .jable import JableSite
 from .missav import MissAVSite
+from .supjav import SupJavSite
 
-SITES: dict[str, Site] = {s.name: s for s in (JableSite(), MissAVSite())}
+SITES: dict[str, Site] = {s.name: s for s in (JableSite(), MissAVSite(), SupJavSite())}
 
 
 def get_site(name: str) -> Site:
@@ -16,4 +19,25 @@ def get_site(name: str) -> Site:
     return site
 
 
-__all__ = ["SITES", "ListPage", "Site", "SourceDetail", "SourceItem", "Stream", "StreamTraits", "get_site"]
+async def find_by_code(site: Site, sf, code: str, uncensored: bool = False) -> list[SourceItem | SourceDetail]:
+    """按番号在站点上找影片，结果都核对过番号和是否无码流出。
+
+    搜索类站点（lookup_verified）返回列表项；拼地址类站点抓详情核对后返回详情（站点可能把写错的番号纠正到别的片）。
+    """
+    ck = code_key(code)
+    out: list[SourceItem | SourceDetail] = []
+    for item in await site.lookup(sf, code, uncensored):
+        if site.lookup_verified:
+            out.append(item)
+            continue
+        try:
+            d = await site.fetch_detail(sf, item.key, priority=True)
+        except (NotFound, VideoGone):
+            continue
+        if code_key(d.code) == ck and d.uncensored == uncensored:
+            out.append(d)
+    return out
+
+
+__all__ = ["SITES", "ListPage", "Site", "SourceDetail", "SourceItem", "Stream", "StreamTraits", "find_by_code",
+           "get_site"]

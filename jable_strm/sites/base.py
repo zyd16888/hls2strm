@@ -58,6 +58,7 @@ class SourceDetail:
     director: str = ""
     series: str = ""
     variants: list[str] = field(default_factory=list)  # 同一部片在本站其他版本的 key（中字、无码流出等）
+    extra: dict = field(default_factory=dict)  # 站点私有数据（比如 SupJav 的播放线路）
 
 
 @dataclass
@@ -66,6 +67,8 @@ class StreamTraits:
     expires: bool = True  # 地址会过期，要按剩余有效期换新
     headers: dict[str, str] = field(default_factory=dict)  # 中转时请求 CDN 要带的头
     disguised_segments: bool = False  # 分片伪装成图片（video0.jpeg），中转时改名 .ts
+    ip_bound: bool = False  # 直链绑了取地址时的出口 IP：和本服务同一出口的播放器能 302，网关（外网客户端）不行
+    ua_block: bool = False  # CDN 拒绝 ffmpeg 默认 UA（Lavf）等，这类客户端改走中转（设置里的「中转 UA 片段」）
 
 
 @dataclass
@@ -79,6 +82,8 @@ class Site:
     name = ""
     label = ""
     default_domains: list[str] = []
+    default_enabled = True
+    lookup_verified = False  # lookup 返回的结果已经按番号核对过（搜索结果），不用再抓详情确认
     stream = StreamTraits()
     sorts: dict[str, str] = {}
     presets: list[dict] = []
@@ -111,6 +116,16 @@ class Site:
     def variant_of(self, key: str) -> tuple[str, bool]:
         """从站内 key 看出的 (字幕, 是否无码流出)；看不出返回 ('', False)。"""
         return "", False
+
+    @property
+    def can_lookup(self) -> bool:
+        """能不能按番号找到本站的影片（补源、现场找源用）。"""
+        return type(self).lookup is not Site.lookup or bool(self.key_for("ABC-001"))
+
+    async def lookup(self, sf: SiteFetcher, code: str, uncensored: bool = False) -> list[SourceItem]:
+        """按番号找本站的影片。默认直接拼 key（还没确认存在，调用方抓详情核对）；要搜索的站点覆盖它。"""
+        key = self.key_for(code, uncensored=uncensored)
+        return [SourceItem(key=key, code=code, title="", uncensored=uncensored)] if key else []
 
     async def fetch_detail(self, sf: SiteFetcher, key: str, *, priority: bool = False) -> SourceDetail:
         page = await sf.get_page(self.detail_path(key), priority=priority)

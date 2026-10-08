@@ -81,7 +81,8 @@ class SiteConfig(BaseModel):
 
 
 def default_sites() -> dict[str, SiteConfig]:
-    return {name: SiteConfig(domains=list(site.default_domains)) for name, site in SITES.items()}
+    return {name: SiteConfig(enabled=site.default_enabled, domains=list(site.default_domains))
+            for name, site in SITES.items()}
 
 
 class Settings(BaseModel):
@@ -158,7 +159,7 @@ class Settings(BaseModel):
     def _fill_sites(self) -> Settings:
         """补齐新加的站点；域名留空用站点默认；优先顺序去掉未知站点、补上漏掉的。"""
         for name, site in SITES.items():
-            cfg = self.sites.get(name) or SiteConfig()
+            cfg = self.sites.get(name) or SiteConfig(enabled=site.default_enabled)
             if not cfg.domains:
                 cfg.domains = list(site.default_domains)
             self.sites[name] = cfg

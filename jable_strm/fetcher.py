@@ -18,6 +18,7 @@ from urllib.parse import urlsplit, urlunsplit
 from curl_cffi.requests import AsyncSession
 
 from .config import Settings, SettingsStore, SiteConfig
+from .errors import Blocked, FetchError, NotFound  # noqa: F401  其他模块仍从这里导入
 from .observability import Metrics
 from .sites import SITES, Site
 
@@ -26,20 +27,6 @@ log = logging.getLogger(__name__)
 MAX_COOLDOWN = 3600
 
 
-class FetchError(Exception):
-    """可重试的失败：网络错误、超时、5xx 等。"""
-
-
-class NotFound(Exception):
-    """页面不存在（404），不再重试。"""
-
-
-class Blocked(Exception):
-    """所有渠道都被拦截。"""
-
-    def __init__(self, message: str, retry_after: float) -> None:
-        super().__init__(message)
-        self.retry_after = max(5.0, retry_after)
 
 
 @dataclass
@@ -287,6 +274,16 @@ class Fetcher:
         return out
 
     # ---- 站外请求：CDN、封面、播放器页 ----
+
+    async def fetch(self, url: str, *, headers: dict | None = None, allow_redirects: bool = True,
+                    method: str = "GET", json: dict | None = None):
+        """站外请求（网关、播放站等），返回原始响应；网络错误转成 FetchError。"""
+        try:
+            return await self.session.request(method, url, headers=headers or None, json=json,
+                                              allow_redirects=allow_redirects,
+                                              timeout=self.store.current.request_timeout)
+        except Exception as e:
+            raise FetchError(f"{urlsplit(url).hostname}: {e}") from e
 
     async def get_bytes(self, url: str, *, referer: str | None = None, headers: dict | None = None) -> bytes:
         headers = dict(headers or {})

@@ -10,7 +10,6 @@ import secrets
 import sqlite3
 import time
 from typing import Literal
-
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -611,7 +610,8 @@ async def put_settings(patch: dict, request: Request):
 @router.get("/meta")
 async def meta():
     return {"sites": {name: {"label": s.label, "presets": s.presets, "sorts": s.sorts, "default_sort": s.default_sort,
-                             "hint": s.source_hint, "direct": s.stream.direct}
+                             "hint": s.source_hint, "direct": s.stream.direct,
+                             "ip_bound": s.stream.ip_bound}
                       for name, s in SITES.items()}}
 
 

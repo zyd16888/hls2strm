@@ -715,7 +715,7 @@
                     <div class="site-edit">
                       <div class="toolbar" style="margin:0 0 6px">
                         <b x-text="siteMeta(name).label || name"></b>
-                        <span class="chip" x-text="siteMeta(name).direct ? '可以 302' : '必须中转'"></span>
+                        <span class="chip" x-text="siteMeta(name).direct ? (siteMeta(name).ip_bound ? '302（直链绑出口 IP，网关不用它）' : '可以 302') : '必须中转'"></span>
                         <label class="small"><input type="checkbox" x-model="draft.sites[name].enabled"> 启用</label>
                         <label class="small"><input type="checkbox" x-model="draft.sites[name].solver"> 被拦时用解题服务</label>
                       </div>
@@ -740,7 +740,7 @@
                         x-text="solverResultText()"></span>
                 </div>
               </template>
-              <div class="desc" x-text="settings.schema[k].description"></div>
+              <div class="desc" x-text="settings.schema?.[k]?.description"></div>
             </div>
           </div>
         </template>

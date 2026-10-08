@@ -23,14 +23,14 @@ from collections import Counter
 from pathlib import Path
 from urllib.parse import urljoin
 
-from .codes import code_key, work_slug
+from .codes import work_slug
 from .config import BootConfig, SettingsStore, check_path_template
 from .db import DEFAULT_LIBRARY_ID, Database
 from .fetcher import Blocked, FetchError, Fetcher, NotFound
 from .observability import Metrics
 from .parser import ParseError, VideoGone, m3u8_duration
 from .rules import describe_rule, match_rule, normalize_rule
-from .sites import SITES, Site, SourceDetail, SourceItem, get_site
+from .sites import SITES, Site, SourceDetail, SourceItem, find_by_code, get_site
 from .strm_manage import StrmManager
 from .writer import OutputWriter
 
@@ -350,7 +350,7 @@ class Engine:
         detail_keys = []
         state = (await self.db.get_job(job["id"]))["state"]
         probe_sites = [n for n in self.store.current.auto_probe_sites
-                       if n in SITES and n != site.name and SITES[n].key_for("ABC-001")]
+                       if n in SITES and n != site.name and SITES[n].can_lookup]
         for it in lp.items:
             v, created = await self.upsert_item(site, it)
             for n in probe_sites if created else ():
@@ -426,20 +426,23 @@ class Engine:
             return 0
         if any(s["site"] == site.name for s in await self.db.get_sources(video_id)):
             return 0
-        key = site.key_for(v["code"], uncensored=bool(v["uncensored"]))
         sf = self.fetcher.site(site.name)
-        try:
-            d = await site.fetch_detail(sf, key) if key else None
-        except (NotFound, VideoGone):
-            d = None
-        if d is None or code_key(d.code) != v["code_key"] or d.uncensored != bool(v["uncensored"]):
+        found = await self._lookup(site, v)
+        if not found:
             await self.db.set_source_check(video_id, site.name, False)
             log.info("补源 %s：%s 上没有", v["slug"], site.label)
             return 0
-        await self.db.upsert_detail(site.name, d, v["slug"], self._rank, video_id=video_id)
-        added = [d.key]
-        for alt in d.variants:  # 同一部片的中字版：多一个更好的源
-            if alt == d.key or site.variant_of(alt) != ("zh", bool(v["uncensored"])):
+        added = []
+        variants: list[str] = []
+        for item in found:
+            if isinstance(item, SourceDetail):
+                await self.db.upsert_detail(site.name, item, v["slug"], self._rank, video_id=video_id)
+                variants += item.variants
+            else:
+                await self.db.upsert_item(site.name, item, v["slug"], self._rank, video_id=video_id)
+            added.append(item.key)
+        for alt in variants:  # 同一部片的中字版：多一个更好的源
+            if alt in added or site.variant_of(alt) != ("zh", bool(v["uncensored"])):
                 continue
             try:
                 ad = await site.fetch_detail(sf, alt)
@@ -455,6 +458,9 @@ class Engine:
         log.info("补源 %s：在 %s 找到 %s", v["slug"], site.label, "、".join(added))
         return len(added)
 
+    async def _lookup(self, site: Site, v: dict) -> list[SourceItem | SourceDetail]:
+        return await find_by_code(site, self.fetcher.site(site.name), v["code"], bool(v["uncensored"]))
+
     async def probe_video(self, slug: str) -> dict:
         """影片库里点「查找其他源」：到每个启用、还没有源的站点找一次（不管之前查过没有）。"""
         v = await self.db.get_video(slug)
@@ -463,14 +469,14 @@ class Engine:
         cfg = self.store.current.sites
         have = {s["site"] for s in await self.db.get_sources(v["id"])}
         for name in self.store.current.site_priority:
-            if name not in have and cfg[name].enabled and SITES[name].key_for(v["code"] or v["slug"]):
+            if name not in have and cfg[name].enabled and SITES[name].can_lookup:
                 await self.probe_work(v["id"], name)
         return await self.db.get_video_by_id(v["id"])
 
     async def create_probe(self, site: str, library_id: int | None = None) -> int:
         """补源任务：库里（或某个库里）在这个站还没有源、最近没查过的影片，逐部按番号去找。"""
         st = get_site(site)
-        if not st.key_for("ABC-001"):
+        if not st.can_lookup:
             raise ValueError(f"{st.label} 不支持按番号查找，不能补源")
         lib_name = self._library(library_id)["name"] if library_id else "全部影片"
         cutoff = int(time.time()) - self.store.current.probe_recheck_days * 86400

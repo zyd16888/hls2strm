@@ -58,8 +58,14 @@ def test_rewrite_nested_playlists():
     assert lines[0] == "../1280x720/video0.jpeg.ts"  # 伪装成图片的分片改名 .ts
     assert lines[1].startswith("../_x/")  # 不在源目录下的地址：签名后中转
     signed = lines[1][3:]
+    assert signed.endswith(".ts")  # 带扩展名，新版 ffmpeg 才肯收
     assert _decode_x(signed) == "https://other.cdn/x/seg1.ts?sig=1"
-    assert _decode_x(signed[:-2] + "AA") is None  # 篡改后签名不对
+    assert _decode_x(signed[:-5] + "AA.ts") is None  # 篡改后签名不对
+    # 带查询串的子清单：加 .m3u8
+    out = rewrite_playlist("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nindex-v1.m3u8?t=x&s=1\n", PLAYLIST, root, "../hls/7/",
+                           "", False)
+    ref = [ln for ln in out.splitlines() if ln and not ln.startswith("#")][0]
+    assert ref.startswith("../hls/7/_x/") and ref.endswith(".m3u8") and _decode_x(ref[9:]) == root + "index-v1.m3u8?t=x&s=1"
 
     r = Resolved({}, {"stream_url": PLAYLIST, "stream_expires": None, "id": 7}, MISSAV)
     assert _upstream(r, "1280x720/video0.jpeg.ts") == root + "1280x720/video0.jpeg"

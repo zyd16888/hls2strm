@@ -1,8 +1,9 @@
 # jable-strm
 
-抓取 Jable 的影片列表和详情，生成 Emby / Jellyfin 可以直接播放的 `.strm`（附带 nfo 和封面），带 Web 控制台。
+抓取 Jable、MissAV、SupJav 的影片列表和详情，生成 Emby / Jellyfin 可以直接播放的 `.strm`（附带 nfo 和封面），带 Web 控制台。
 
-- **不用浏览器**：curl_cffi 模拟浏览器指纹，多个域名自动轮换（默认先走镜像 `fs1.app`，被拦再换 `jable.tv`）；可选接入 Byparr / FlareSolverr 兜底
+- **多站点、多源择优**：同一番号在不同站点的影片并成一部作品、一个 strm；播放时按字幕偏好、站点优先级挑源，挑中的源不能用自动换下一个，都不行时现场按番号去别的站找
+- **不用浏览器**：curl_cffi 模拟浏览器指纹，每个站点多个域名自动轮换（Jable 默认先走镜像 `fs1.app`，MissAV 走 `missav123.com` 等镜像）；可选接入 Byparr / FlareSolverr 兜底（SupJav 必须要）
 - **可观测**：Web 仪表盘显示各域名状态、队列、速率、失败原因和实时日志
 - **可中断、可重试**：所有任务都存在 SQLite，进程被杀也能从断点续跑；失败按指数退避自动重试，也可以在页面上手动重试
 - **可配置**：代理、限速、并发、重试策略、输出路径模板、播放模式等都在网页上改，改完即时生效
@@ -25,6 +26,18 @@ Emby/Jellyfin ──►│ /play  ──► 缓存的播放地址够用？ ─�
 2. 播放地址**不绑 IP**，可以 302 让播放器直连 CDN。
 3. CDN **拒绝 User-Agent 含 `Lavf`（ffmpeg 默认 UA）或 `python-requests` 的请求**。Emby/Jellyfin 服务端用 ffmpeg 探测和转封装，所以这类请求会自动改由本服务中转；其余客户端照常 302。中转时分片遇到 403 会自动换新地址重试，看到一半地址过期也不会断。
 4. 列表页使用 KVS 的异步块接口（`?mode=async&function=get_block…`），每页 24 部。最新更新约 1641 页，约 3.9 万部。
+
+## 支持的站点
+
+| 站点 | 抓取 | 播放地址 | 播放 |
+|---|---|---|---|
+| Jable | 镜像 `fs1.app` 直接抓，主站 `jable.tv` 备用 | 带签名，约 3 小时过期，不绑 IP | 302；ffmpeg 类客户端（UA 含 Lavf）中转 |
+| MissAV | 主域首页、列表被 CF 挑战，镜像 `missav123.com`、`missav.live` 直接抓 | `surrit.com/{uuid}/playlist.m3u8`，不过期 | **只能中转**：CDN 要 missav 的 Referer 和浏览器 TLS 指纹；分片 `video0.jpeg` 实际是 TS，中转时改名 `.ts` |
+| SupJav（默认不启用） | 整站在 CF 挑战后面，**要配解题服务**：解一次拿到 cookie，之后 curl_cffi 带同一个 UA 就能抓 | 线路 EVS / FST / VOE（HLS，4–36 小时过期）、ST（mp4，约 19 小时） | 302；直链绑出口 IP，网关 resolve 不用它 |
+
+- 作品 = 番号（+ 是否无码流出）。Jable 的 `ssis-001`、MissAV 的 `ssis-001-chinese-subtitle`、SupJav 的 `[中文字幕]SSIS-001` 是同一部作品的三个源；中字、英字是源的属性，无码流出 / 无码破解版算另一部作品（slug 加 `-u`）。
+- 番号匹配时统一写法：`fc2ppv-1066192`、`FC2-PPV-1066192` 是同一部；`ssis00001` 和 `SSIS-001` 是同一部。
+- 作品的元数据以优先级最高的站点为准，其他站只补空字段（比如 Jable 没有发行商、导演，MissAV 有）。
 
 ## 快速开始
 
@@ -70,7 +83,7 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
 
 ## 使用流程
 
-1. 在「设置」里确认**对外地址**（Emby/Jellyfin 能访问到的本服务地址）、**输出根目录**和**代理**。
+1. 在「设置」里确认**对外地址**（Emby/Jellyfin 能访问到的本服务地址）、**输出根目录**和**代理**；「站点」一栏里按需启用站点、调整域名和限速（SupJav 先配好解题服务再启用）。
 2. 在「输出库与订阅」里，对默认订阅「全站：最新更新」点「首轮全量」。流程是先翻完全部列表页、马上写 strm（每秒 1 次请求约 30 分钟），再逐部补详情、写 nfo、下载封面（约 11 小时）。中途可以暂停、取消或重启，都能续跑。
 3. 在 Emby/Jellyfin 里给每个输出库各建一个「电影」媒体库，比如 `{输出根目录}/全部`、`{输出根目录}/中文字幕`。
 4. 首轮全量完成后，订阅会按周期（默认 60 分钟）自动增量：从第 1 页往后翻，连续遇到 48 部已在该库里的影片就停。
@@ -117,10 +130,26 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
    - 同一部影片如果在多个库里，每个库各有一份独立的 strm，mdcng 会分别刮削。
    - 要避免重复刮削，就用排除库让各库互斥，见上面"来源库、排除库"一条。例如"全部"只当总目录，不让 mdcng 监控；交给 mdcng 的是"中文字幕""无码""其他"这三个互不重叠的库。
 
+### 多源择优和补源
+
+- **挑源顺序**：字幕偏好（默认 中字 > 无字幕 > 英字）→ 不在失败冷却中 → 站点优先顺序（默认 Jable > MissAV > SupJav）→ 已有未过期地址 → 分辨率。
+  - 字幕不回退（关掉「字幕回退」）时，只用首选字幕那一档的源，比如中字源都不能用时不拿无字幕版顶上。
+  - 某个源取地址失败（下架、被拦、超时、解析失败）就换下一个，一次播放请求最多 20 秒（「取地址总时限」）。下架的源标为下架；其他失败进入冷却（5 分钟起，连续失败翻倍，最长 6 小时）。
+- **现场找源**：已知的源都不能用、或者库里没有这部影片（比如别的工具生成的 strm）时，按番号到其他启用的站点找一次，找到就加成源再播。某个站最近查过没有的，「补源重查间隔」（默认 30 天）内不再查。
+- **补源任务**：「任务 → 补源」，选站点和输出库，逐部按番号去找备用源（每部一次请求；MissAV 页面上有中字版的话一并加上）。现有约 3.9 万部按每秒 1 次大约 11 小时。
+- **新片自动补源**：设置里「新片自动补源」填站点名（如 `missav`），列表任务、订阅收进新影片时顺手去这些站点找。
+- 影片库的详情里按播放顺序列出所有源，可以试播指定的源，也可以点「查找其他源」立即找一次。
+- 中转：MissAV 的视频流量全部经过本服务（720p 每路约 2–3 Mbps）。
+
 ### 其他任务类型（「任务」页）
 
-- **列表地址**：一次性抓取分类 `/categories/x/`、标签 `/tags/x/`、女优 `/models/x/`、搜索 `/search/关键词/`、热门 `/hot/`，可以指定排序、页码范围和输出库
-- **指定影片**：粘贴影片网址或 slug（每行一个），加入所选的输出库
+- **列表地址**：先选站点，再填列表地址，可以指定排序、页码范围和输出库。
+  - Jable：分类 `/categories/x/`、标签 `/tags/x/`、女优 `/models/x/`、搜索 `/search/关键词/`、热门 `/hot/`
+  - MissAV：`/cn/new`、`/cn/release`、`/cn/chinese-subtitle`、`/cn/uncensored-leak`、搜索 `/cn/search/关键词`、女优 `/cn/actresses/名字`、类型 `/cn/genres/名称`；每页 12 部，最多 2000 页
+  - SupJav：`/zh/category/chinese-subtitles`、女优 `/zh/category/cast/xxx`、标签 `/zh/tag/xxx`、搜索 `/zh/search/关键词`
+  - 直接粘贴站点网址也行；同一番号已经在库里（别的站抓过）的只加一个源
+- **指定影片**：粘贴影片网址（按域名认站点）或站内 key（用所选站点），每行一个，加入所选的输出库
+- **补源**：见上一节
 - **补全缺失详情**：给所有缺详情的影片排队
 - **重写输出**：改了对外地址、播放模式、令牌或路径模板后执行（不联网），可以只重写某个库
 
@@ -141,7 +170,7 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
 
 | 模式 | 行为 |
 |---|---|
-| `redirect`（默认） | 302 到 CDN；UA 命中「中转 UA 片段」（默认 `Lavf`、`python-requests`）的客户端改走中转 |
+| `redirect`（默认） | 302 到 CDN；Jable 源遇到 UA 命中「中转 UA 片段」（默认 `Lavf`、`python-requests`）的客户端改走中转；MissAV 源一律中转 |
 | `proxy` | 全部经本服务中转，视频流量都经过本机 |
 | `direct` | strm 直接写 CDN 地址，约 3 小时后失效，只用于调试 |
 
@@ -149,12 +178,18 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
 
 浏览器跨域请求（带 `Origin` 头，比如网页播放器直接读 strm 地址）也会走中转，`/play` 和 `/hls` 会返回 CORS 头，因为 CDN 本身不返回 CORS 头。
 
+中转支持多层播放列表（master → 子清单 → 分片），按站点带上请求头。源目录以外、或者带查询串的地址会签名后放进 `/hls/{源 id}/_x/…`，并带上 `.ts` / `.m3u8` 扩展名（新版 ffmpeg 只收白名单扩展名的分片）。mp4 直链（SupJav 的 ST 线路）中转时原样转发 Range。
+
+`/play/{slug}.m3u8?src=missav` 只用某个站点的源（试播、排查用）。
+
 ### 给网关用的 resolve 接口
 
 `GET /api/resolve/{slug}.m3u8`，用 `Authorization: Bearer <resolve_token>` 认证（也可以用 `?token=`）。在设置里填了「网关解析令牌」之后才开放。
 
 - 正常情况：返回 200 和 `{"slug", "url", "expires_at", "ttl", "duration"}`。
 - 不按客户端区分，一律返回 CDN 地址。网关传过来的 `ua`、`origin`、`fetch_mode` 只写进日志，方便排查。这样做的原因是：网关回退时会反代 Emby，Emby 再 302 到 strm 里的内网地址，外部客户端访问不到。
+- 只挑能让客户端直连的源（目前是 Jable）：MissAV 要中转，SupJav 的直链绑本服务的出口 IP，都不给网关。
+- 作品只有这类源时：设了「公网中转地址」就返回该地址下的中转链接（`{公网中转地址}/play/{slug}.m3u8?proxy=1`，需要本服务能从公网访问），没设返回 409。
 - 影片不存在：404；站点拦截中：503。
 
 路径的最后一段就是影片，所以网关的 objectKey 可以原样传，比如 `/api/resolve/play/ipzz-983.m3u8`。
@@ -192,13 +227,14 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
 
 ## 被拦截了怎么办
 
-- 某个域名被拦截时，它会进入冷却（默认 5 分钟，连续被拦就翻倍，最长 1 小时），限速减半，并切换到下一个域名。
-- 所有域名都被拦截时，引擎暂停，到冷却结束再自动重试；概览页会显示倒计时。也可以点「测试连通性」或「重置冷却」立即重试。
+- 每个站点各管各的：某个域名被拦截时，它会进入冷却（默认 5 分钟，连续被拦就翻倍，最长 1 小时），这个站的限速减半，并切换到它的下一个域名。
+- 某个站点所有域名都被拦截时，只暂停这个站点的子任务，到冷却结束再自动重试；其他站点照常抓取。概览页会显示哪个站被拦、还要等多久。也可以点「测试连通性」或「重置冷却」立即重试。
 - 如果一直被拦：
-  - 在「设置 → 站点域名」里加入新的镜像域名，或者换一个代理。
+  - 在「设置 → 站点」里给这个站点加入新的镜像域名，或者换一个代理。
   - 也可以启用 Byparr，并在「设置 → 解题服务地址」填 `http://byparr:8191`。
   - 填好地址后，可以点输入框下面的「测试连通」，看能不能连上，同时会识别出 Byparr 或 FlareSolverr 的版本；不需要先保存。
-  - 也可以点「试解一次」，让解题服务实际打开一次首选域名（会走当前代理），看能不能通过挑战。
+  - 也可以选一个站点点「试解一次」，让解题服务实际打开一次它的首选域名（会走当前代理），看能不能通过挑战。
+  - 解题成功后拿到的 cookie 和 User-Agent 会注入这个站点的抓取通道，之后用 curl_cffi 继续抓；SupJav 必须这样（cookie 绑 UA，两者要一起用）。
 
 ## API
 
@@ -206,21 +242,22 @@ JABLE_DATA_DIR=./data JABLE_UI_PASSWORD=xxx python -m jable_strm
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/status` | 引擎、域名、队列、计数、最近失败 |
-| POST | `/api/jobs` | 新建任务：`{"kind": "list\|videos\|backfill\|rewrite", "library_id": 1, ...}` |
+| GET | `/api/status` | 引擎、各站点的域名和拦截状态、队列、计数、最近失败 |
+| POST | `/api/jobs` | 新建任务：`{"kind": "list\|videos\|backfill\|rewrite\|probe", "site": "jable", "library_id": 1, ...}` |
 | GET | `/api/jobs`、`/api/jobs/{id}/tasks?status=failed` | 任务列表、子任务列表 |
 | POST | `/api/jobs/{id}/pause\|resume\|cancel\|retry` | 控制任务 |
-| GET | `/api/videos?q=&filter=no_detail&library_id=&page=` | 影片库（每部影片带所在的库和 strm 路径） |
+| GET | `/api/videos?q=&filter=no_detail&library_id=&page=` | 影片库（每部影片带各个源、所在的库和 strm 路径） |
 | GET / POST / PUT / DELETE | `/api/libraries`、`/api/libraries/{id}` | 输出库；DELETE 可带 `?delete_files=true` |
 | POST | `/api/libraries/{id}/locate` | 外部整理库：同步位置 |
 | GET / POST / PUT / DELETE | `/api/subscriptions`、`/api/subscriptions/{id}` | 订阅 |
 | POST | `/api/subscriptions/{id}/run?mode=auto\|full\|incremental` | 立即运行订阅 |
 | POST | `/api/subscriptions/{id}/initialized` | 标记首轮已完成（不跑首轮全量，直接定时增量） |
-| POST | `/api/videos/{slug}/refresh` | 立即重抓详情 |
+| POST | `/api/videos/{slug}/refresh` | 立即重抓每个源的详情 |
+| POST | `/api/videos/{slug}/probe` | 到还没有源的站点按番号找一次 |
 | GET / PUT | `/api/settings` | 读取或修改设置（PUT 只需要传改动的字段） |
-| POST | `/api/engine/pause\|resume`、`/api/fetcher/test\|reset` | 引擎和抓取通道控制 |
+| POST | `/api/engine/pause\|resume`、`/api/fetcher/test\|reset?site=` | 引擎和抓取通道控制（不带 site 是全部站点） |
 | GET | `/api/logs/stream` | 实时日志（SSE） |
-| GET/HEAD | `/play/{slug}.m3u8` | strm 指向的播放入口（`?proxy=1` 强制中转） |
+| GET/HEAD | `/play/{slug}.m3u8` | strm 指向的播放入口（`?proxy=1` 强制中转，`?src=站点` 只用这个站点的源） |
 
 ## 开发
 
@@ -233,11 +270,13 @@ pytest
 
 | 模块 | 职责 |
 |---|---|
-| `fetcher.py` | 分层抓取：多域名轮换、冷却、自适应限速、拦截判定、Byparr/FlareSolverr |
-| `parser.py`、`sources.py` | 列表页和详情页解析、列表地址规范化、分页 URL 构造 |
+| `fetcher.py` | 分层抓取：每个站点一条通道（多域名轮换、冷却、自适应限速、拦截判定、Byparr/FlareSolverr），共用一个会话 |
+| `sites/` | 站点适配器：`jable.py`、`missav.py`、`supjav.py`，各自负责列表/详情地址、解析、按番号查找、取播放地址 |
+| `codes.py` | 番号规范化和跨站匹配键 |
+| `parser.py`、`sources.py` | Jable 的列表页和详情页解析、列表地址规范化、分页 URL 构造 |
 | `engine.py` | 持久化队列、worker、重试策略、暂停/恢复、定时增量 |
 | `writer.py` | strm、nfo、封面输出 |
-| `play.py` | 播放地址缓存与换新、302 和中转 |
+| `play.py` | 挑源与故障切换、现场找源、播放地址缓存与换新、302 和中转 |
 | `db.py`、`config.py`、`observability.py` | 存储、设置、日志与指标 |
 | `api.py`、`static/` | Web 控制台 |
 

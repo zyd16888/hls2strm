@@ -21,19 +21,20 @@ from urllib.parse import quote, urljoin
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import RedirectResponse, Response, StreamingResponse
 
-from .codes import code_key
 from .config import SettingsStore
 from .db import Database, source_cooldown
 from .fetcher import Blocked, FetchError, Fetcher, NotFound
 from .observability import Metrics
 from .parser import ParseError, VideoGone
-from .sites import SITES, Site, get_site
+from .sites import SITES, Site, SourceDetail, find_by_code, get_site
 
 log = logging.getLogger(__name__)
 
 DEFAULT_DURATION = 2 * 3600
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
-HLS_PATH_RE = re.compile(r"^(?:_x/[0-9a-f]{16}/[A-Za-z0-9_-]+|[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+){0,5})$")
+HLS_PATH_RE = re.compile(
+    r"^(?:_x/[0-9a-f]{16}/[A-Za-z0-9_-]+(?:\.[a-z0-9]{1,5})?|[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+){0,5})$")
+_EXT_RE = re.compile(r"\.([a-z0-9]{1,5})$")
 DISGUISE_EXTS = (".jpeg", ".jpg", ".png", ".gif", ".webp", ".html", ".txt", ".js", ".css")
 SUBTITLE_CODES = {"zh": "zh", "none": "", "en": "en"}
 _SIGN_KEY = secrets.token_bytes(16)  # _x/ 地址的签名密钥，进程重启后旧地址失效（播放器会重新请求 /play）
@@ -85,7 +86,7 @@ class Resolver:
                 continue
             if site and src["site"] != site:
                 continue
-            if direct_only and not st.stream.direct:
+            if direct_only and (not st.stream.direct or st.stream.ip_bound):
                 continue
             out.append(src)
 
@@ -179,35 +180,43 @@ class Resolver:
         cutoff = time.time() - s.probe_recheck_days * 86400
         for name in s.site_priority:
             site = SITES[name]
-            if name in have or not s.site(name).enabled or (direct_only and not site.stream.direct):
+            if name in have or not s.site(name).enabled or not site.can_lookup:
+                continue
+            if direct_only and (not site.stream.direct or site.stream.ip_bound):
                 continue
             check = await self.db.get_source_check(v["id"], name)
             if check and not check["found"] and check["checked_at"] > cutoff:
                 continue
-            key = site.key_for(v["code"], uncensored=bool(v["uncensored"]))
             left = deadline - time.monotonic()
-            if not key or left <= 0:
-                continue
+            if left <= 0:
+                break
             try:
-                d = await asyncio.wait_for(site.fetch_detail(self.fetcher.site(name), key, priority=True), left)
-            except (NotFound, VideoGone):
-                await self.db.set_source_check(v["id"], name, False)
-                continue
+                found = await asyncio.wait_for(
+                    find_by_code(site, self.fetcher.site(name), v["code"], bool(v["uncensored"])), left)
             except (Blocked, FetchError, ParseError, TimeoutError) as e:
                 log.info("现场找源 %s：%s 失败：%s", v["slug"], site.label, e)
                 continue
-            if code_key(d.code) != v["code_key"] or d.uncensored != bool(v["uncensored"]) or not d.stream_url:
-                await self.db.set_source_check(v["id"], name, False)
+            await self.db.set_source_check(v["id"], name, bool(found))
+            for item in found:
+                if isinstance(item, SourceDetail):
+                    await self.db.upsert_detail(name, item, v["slug"], s.site_rank, video_id=v["id"])
+                else:
+                    await self.db.upsert_item(name, item, v["slug"], s.site_rank, video_id=v["id"])
+            if not found:
                 continue
-            await self.db.upsert_detail(name, d, v["slug"], s.site_rank, video_id=v["id"])
-            await self.db.set_source_check(v["id"], name, True)
             self.metrics.inc("play_discovered")
-            src = await self.db.find_source(name, d.key)
-            if not self.rank([*(await self.db.get_sources(v["id"]))], site=name):
+            v = await self.db.get_video_by_id(v["id"]) or v
+            usable = self.rank(await self.db.get_sources(v["id"]), site=name)
+            if not usable:
                 log.info("现场找源 %s：在 %s 找到了，但字幕不合偏好（字幕不回退），不用", v["slug"], site.label)
                 continue
-            log.info("现场找源 %s：已知的源都不能用，在 %s 找到 %s", v["slug"], site.label, d.key)
-            return Resolved(await self.db.get_video_by_id(v["id"]) or v, src, site)
+            log.info("现场找源 %s：已知的源都不能用，在 %s 找到 %s", v["slug"], site.label,
+                     "、".join(x.key for x in found))
+            left = deadline - time.monotonic()
+            try:
+                return await asyncio.wait_for(self._ensure(v, usable[0], self._need(v, None)), max(left, 1))
+            except (NotFound, VideoGone, Blocked, FetchError, ParseError, TimeoutError) as e:
+                log.info("现场找源 %s：%s 的源取地址失败：%s", v["slug"], site.label, e)
         return None
 
     async def discover(self, slug: str) -> dict:
@@ -216,19 +225,21 @@ class Resolver:
         errors: list[Exception] = []
         for name in s.site_priority:
             site = SITES[name]
-            key = site.key_for(slug)
-            if not key or not s.site(name).enabled or (name != "jable" and not s.play_discover):
+            if not site.can_lookup or not s.site(name).enabled or (name != "jable" and not s.play_discover):
                 continue
             try:
-                d = await site.fetch_detail(self.fetcher.site(name), key, priority=True)
-            except (NotFound, VideoGone) as e:
-                errors.append(e)
-                continue
+                found = await find_by_code(site, self.fetcher.site(name), slug)
             except (Blocked, FetchError, ParseError) as e:
                 errors.append(e)
                 log.info("在 %s 找 %s 失败：%s", site.label, slug, e)
                 continue
-            vid = await self.db.upsert_detail(name, d, slug, s.site_rank)
+            if not found:
+                continue
+            item = found[0]
+            if isinstance(item, SourceDetail):
+                vid = await self.db.upsert_detail(name, item, slug, s.site_rank)
+            else:
+                vid, _ = await self.db.upsert_item(name, item, slug, s.site_rank)
             log.info("库里没有 %s，在 %s 找到了，已入库", slug, site.label)
             return await self.db.get_video_by_id(vid)
         hard = [e for e in errors if not isinstance(e, (NotFound, VideoGone))]
@@ -347,13 +358,14 @@ async def play(name: str, request: Request, t: str = "", proxy: int = 0, src: st
     ua = request.headers.get("user-agent", "")
     origin = request.headers.get("origin", "")
     fetch_mode = request.headers.get("sec-fetch-mode", "")
+    blocked_uas = s.proxy_user_agents if r.site.stream.ua_block else []
     proxied = (bool(proxy) or s.play_mode == "proxy" or not r.site.stream.direct
-               or bool(direct_blocker(s.proxy_user_agents, ua, origin, fetch_mode)))
+               or bool(direct_blocker(blocked_uas, ua, origin, fetch_mode)))
     log.info("播放 %s：%s %s（%s，客户端 %s，UA %s）", slug, _label(r), "中转" if proxied else "302", _left(r),
              request.client.host if request.client else "?", ua[:60])
     if proxied:
         ctx.metrics.inc("play_proxy")
-        resp = await _proxy_playlist(request, r, t)
+        resp = await (_proxy_playlist(request, r, t) if _is_hls(r.url) else _proxy_file(request, r))
     else:
         ctx.metrics.inc("play_redirect")
         resp = RedirectResponse(r.url, status_code=302)
@@ -422,6 +434,7 @@ def _encode_x(url: str) -> str:
 
 def _decode_x(path: str) -> str | None:
     _, sig, data = path.split("/", 2)
+    data = data.split(".", 1)[0]  # 去掉为播放器加的扩展名（base64url 里没有点）
     try:
         url = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode()
     except ValueError:
@@ -438,12 +451,13 @@ def rewrite_playlist(text: str, playlist_url: str, root: str, up: str, q: str, d
 
     def local(ref: str, segment: bool) -> str:
         absolute = urljoin(playlist_url, ref.strip())
-        if absolute.startswith(root) and "?" not in absolute:
-            rel = absolute[len(root):]
-            if not HLS_PATH_RE.fullmatch(rel) or ".." in rel.split("/"):
-                rel = _encode_x(absolute)
-        else:
-            rel = _encode_x(absolute)
+        rel = absolute[len(root):] if absolute.startswith(root) and "?" not in absolute else ""
+        if not rel or not HLS_PATH_RE.fullmatch(rel) or ".." in rel.split("/"):
+            # 不在源目录下（或带查询串）的地址：签名后中转，并带上扩展名让播放器认得出是清单还是分片
+            path = absolute.split("?", 1)[0].lower()
+            m = _EXT_RE.search(path.rsplit("/", 1)[-1])
+            ext = ".m3u8" if path.endswith(".m3u8") else ".ts" if segment else (m.group(0) if m else "")
+            rel = _encode_x(absolute) + ext
         if segment and disguised and rel.lower().endswith(DISGUISE_EXTS):
             rel += ".ts"  # 伪装成图片的 TS 分片：新版 ffmpeg 会按扩展名拒收，改名后再中转
         return up + rel + q
@@ -464,6 +478,50 @@ def _upstream(r: Resolved, path: str) -> str | None:
     if r.site.stream.disguised_segments and path.endswith(".ts") and path[:-3].lower().endswith(DISGUISE_EXTS):
         path = path[:-3]
     return r.url.rsplit("/", 1)[0] + "/" + path
+
+
+async def close_stream(resp) -> None:
+    """关闭 stream=True 的响应。curl_cffi 的 aclose() 只等传输结束：不先设 quit_now 的话，客户端拖动、断开后
+    会把整个文件继续下完、堆在内存里（mp4 中转时就是几百 MB）。"""
+    if getattr(resp, "quit_now", None) is not None:
+        resp.quit_now.set()
+    await resp.aclose()
+
+
+def _is_hls(url: str) -> bool:
+    return url.split("?", 1)[0].lower().endswith(".m3u8")
+
+
+async def _proxy_file(request: Request, r: Resolved) -> Response:
+    """直链是 mp4 这类单文件（如 streamtape）：原样转发，带上 Range，支持拖动。"""
+    ctx = _ctx(request)
+    headers = dict(r.site.stream.headers)
+    if rng := request.headers.get("range"):
+        headers["Range"] = rng
+    try:
+        resp = await ctx.fetcher.session.get(r.url, stream=True, headers=headers,
+                                             timeout=ctx.store.current.request_timeout)
+    except Exception as e:
+        raise HTTPException(502, f"请求直链失败：{e}") from None
+    if resp.status_code not in (200, 206):
+        await close_stream(resp)
+        raise HTTPException(502, f"直链返回 HTTP {resp.status_code}")
+    out = {k: v for k in ("content-length", "content-range", "accept-ranges")
+           if (v := resp.headers.get(k))}
+    if request.method == "HEAD":
+        await close_stream(resp)
+        return Response(status_code=resp.status_code, headers=out,
+                        media_type=resp.headers.get("content-type") or "video/mp4")
+
+    async def body():
+        try:
+            async for chunk in resp.aiter_content():
+                yield chunk
+        finally:
+            await close_stream(resp)
+
+    return StreamingResponse(body(), status_code=resp.status_code, headers=out,
+                             media_type=resp.headers.get("content-type") or "video/mp4")
 
 
 async def _proxy_playlist(request: Request, r: Resolved, t: str) -> Response:
@@ -509,7 +567,7 @@ async def hls_file(source_id: int, path: str, request: Request, t: str = ""):
         except Exception as e:
             raise HTTPException(502, f"CDN 请求失败：{e}") from None
         if resp.status_code in (403, 410) and attempt == 0 and not path.startswith("_x/"):
-            await resp.aclose()
+            await close_stream(resp)
             ctx.metrics.inc("play_token_expired")
             try:
                 r = await ctx.resolver.ensure_source(source_id, stale=r.url)
@@ -517,12 +575,12 @@ async def hls_file(source_id: int, path: str, request: Request, t: str = ""):
                 raise HTTPException(502, f"CDN 地址失效，换新失败：{e}") from None
             continue
         if resp.status_code != 200:
-            await resp.aclose()
+            await close_stream(resp)
             raise HTTPException(502, f"CDN 返回 HTTP {resp.status_code}")
         cors = dict(CORS_HEADERS) if request.headers.get("origin") else {}
-        if path.split("?", 1)[0].endswith(".m3u8") or (path.startswith("_x/") and url.split("?", 1)[0].endswith(".m3u8")):
+        if path.endswith(".m3u8"):
             body = b"".join([chunk async for chunk in resp.aiter_content()])
-            await resp.aclose()
+            await close_stream(resp)
             q = f"?t={quote(t)}" if t else ""
             up = "../" * path.count("/")  # 从当前子清单的位置回到 /hls/{源 id}/
             root = r.url.rsplit("/", 1)[0] + "/"
@@ -534,7 +592,7 @@ async def hls_file(source_id: int, path: str, request: Request, t: str = ""):
                 async for chunk in resp.aiter_content():
                     yield chunk
             finally:
-                await resp.aclose()
+                await close_stream(resp)
 
         headers = cors
         if cl := resp.headers.get("content-length"):

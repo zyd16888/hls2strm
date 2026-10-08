@@ -496,11 +496,12 @@ class Database:
         cols = ", ".join(f"{k}=?" for k in sets)
         await self.conn.execute(f"UPDATE videos SET {cols} WHERE id=?", (*sets.values(), video_id))
 
-    async def upsert_item(self, site: str, it: SourceItem, slug: str, rank: Callable[[str], int]) -> tuple[int, bool]:
-        """列表页数据入库：找到或新建作品，记下这个源。返回 (作品 id, 是否新作品)。"""
+    async def upsert_item(self, site: str, it: SourceItem, slug: str, rank: Callable[[str], int],
+                          video_id: int | None = None) -> tuple[int, bool]:
+        """列表页数据入库：找到或新建作品，记下这个源。返回 (作品 id, 是否新作品)。video_id 见 _attach。"""
         async with self._tx():
             video_id, _, created = await self._attach(site, it.key, it.code, it.uncensored, slug, it.site_vid,
-                                                      it.title, it.subtitle)
+                                                      it.title, it.subtitle, video_id)
             primary = await self._is_primary(video_id, site, rank)
             async with self.conn.execute("SELECT * FROM videos WHERE id=?", (video_id,)) as cur:
                 work = dict(await cur.fetchone())
