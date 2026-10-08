@@ -52,7 +52,7 @@ function connect() {
     es.close();
     source = null;
     emit();
-    retry = setTimeout(connect, 3000);
+    if (listeners.size) retry = setTimeout(connect, 3000);
   };
 }
 
@@ -62,9 +62,18 @@ export function clearLogs() {
 }
 
 function subscribe(cb: () => void) {
-  if (!source && !retry) connect();
   listeners.add(cb);
-  return () => listeners.delete(cb);
+  if (!source && !retry) connect();
+  return () => {
+    listeners.delete(cb);
+    if (listeners.size) return;
+    // 没人看了（比如回到登录页）就断开，不在后台反复重连
+    source?.close();
+    source = null;
+    if (retry) clearTimeout(retry);
+    retry = null;
+    connected = false;
+  };
 }
 
 export function useLogs(): Snapshot {

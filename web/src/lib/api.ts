@@ -6,6 +6,13 @@ export class ApiError extends Error {
   }
 }
 
+let onUnauthorized: () => void = () => {};
+
+/** 接口返回 401（没登录、会话过期）时调用；登录接口自己的 401（密码错）不算。 */
+export function setUnauthorizedHandler(fn: () => void) {
+  onUnauthorized = fn;
+}
+
 async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
   const init: RequestInit = { method, headers: {} };
   if (body !== undefined) {
@@ -21,6 +28,7 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
     data = text;
   }
   if (!r.ok) {
+    if (r.status === 401 && url !== "/api/login") onUnauthorized();
     const detail = (data as { detail?: unknown } | null)?.detail;
     const msg = typeof detail === "string" ? detail : Array.isArray(detail) ? detail.map(d => d.msg).join("；") : "";
     throw new ApiError(msg || `HTTP ${r.status}`, r.status);

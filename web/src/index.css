@@ -121,6 +121,17 @@
   .scroll-thin {
     scrollbar-width: thin;
   }
+  /* 胶片齿孔：强调色的边条上一列圆角方孔（登录页） */
+  .film-edge {
+    background: var(--accent);
+  }
+  .film-edge::after {
+    content: "";
+    position: absolute;
+    inset: 6px 3.5px;
+    background: repeating-linear-gradient(to bottom, var(--panel) 0 7px, transparent 7px 16px);
+    border-radius: 2px;
+  }
 }
 
 /* 弹层、抽屉的进出场：只在用户操作时出现 */

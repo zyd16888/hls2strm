@@ -106,7 +106,7 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 |---|---|---|
 | `HLS2STRM_DATA_DIR` | `data` | 数据库、日志、快照目录 |
 | `HLS2STRM_HOST` / `HLS2STRM_PORT` | `0.0.0.0` / `8080` | 监听地址 |
-| `HLS2STRM_UI_USER` / `HLS2STRM_UI_PASSWORD` | `admin` / 空 | Web 控制台的 Basic 认证；密码为空则不认证（启动日志会提示） |
+| `HLS2STRM_UI_USER` / `HLS2STRM_UI_PASSWORD` | `admin` / 空 | Web 控制台的登录账号；密码为空则不用登录（启动日志会提示）。登录后记 30 天（不勾「记住我」则关掉浏览器就失效），改了密码已登录的都要重新登录；同一 IP 15 分钟内输错 10 次暂时不让再试 |
 | `HLS2STRM_OUTPUT_DIR` | `数据目录/strm` | strm 输出目录（设置页可覆盖） |
 | `HLS2STRM_PUBLIC_BASE_URL` | `http://127.0.0.1:端口` | 写进 strm 的服务地址（设置页可覆盖） |
 | `HLS2STRM_LOG_LEVEL` | `INFO` | 日志级别；「日志」页也能现场切换（DEBUG 记下每个请求），不保存 |
@@ -293,7 +293,7 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 
 ## API
 
-所有 `/api/*` 接口都和 Web 控制台使用同一套认证；`/play` 和 `/hls` 不需要认证，可用播放令牌保护。
+所有 `/api/*` 接口都要登录：浏览器用登录页拿到的会话 cookie，脚本直接用 HTTP Basic（`curl -u admin:密码`）；`/play` 和 `/hls` 不需要登录，可用播放令牌保护。`POST /api/login`、`POST /api/logout`、`GET /api/session` 不用登录。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|

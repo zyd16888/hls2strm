@@ -1,4 +1,4 @@
-import { FileVideo, Film, FolderTree, LayoutDashboard, ListChecks, Menu as MenuIcon, Monitor, Moon, Pause, Play, ScrollText, Settings2, Sun } from "lucide-react";
+import { FileVideo, Film, FolderTree, LayoutDashboard, ListChecks, LogOut, Menu as MenuIcon, Monitor, Moon, Pause, Play, RotateCw, ScrollText, Settings2, Sun } from "lucide-react";
 import { type ComponentType, lazy, Suspense, useEffect, useState } from "react";
 import { ConfirmHost } from "./components/confirm";
 import { PlayerHost } from "./components/player";
@@ -10,7 +10,9 @@ import { closeDetail, DetailHost } from "./components/video-detail";
 import { api, type Status } from "./lib/api";
 import { useMeta, useRun, useStatus } from "./lib/queries";
 import { navigate, useRoute } from "./lib/route";
+import { loadSession, logout, useSession } from "./lib/session";
 import { cn } from "./lib/utils";
+import Login from "./pages/login";
 import Overview from "./pages/overview";
 
 const pages: { id: string; name: string; icon: ComponentType<{ className?: string }>; Page: ComponentType }[] = [
@@ -33,7 +35,28 @@ export function engineState(s: Status | undefined, error: boolean, label: (n: st
   return { text: "空闲", tone: "info" };
 }
 
+/** 先看要不要登录：要登录就只显示登录页，控制台的接口一个都不请求。 */
 export default function App() {
+  const session = useSession();
+  useEffect(() => {
+    loadSession();
+  }, []);
+  if (session.status === "loading") return null;
+  if (session.status === "offline")
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center gap-3 bg-bg px-4 text-center">
+        <p className="text-sm">连不上 hls2strm 服务。确认它在运行，再重试。</p>
+        <Button onClick={loadSession}>
+          <RotateCw />
+          重试
+        </Button>
+      </div>
+    );
+  if (session.status === "login") return <Login />;
+  return <Console user={session.required ? session.user : null} />;
+}
+
+function Console({ user }: { user: string | null }) {
   const route = useRoute();
   const current = pages.find(p => p.id === route.page) ?? pages[0];
   const [navOpen, setNavOpen] = useState(false);
@@ -50,6 +73,7 @@ export default function App() {
     <Nav
       current={current.id}
       status={status}
+      user={user}
       onGo={id => {
         navigate(id);
         setNavOpen(false);
@@ -93,7 +117,7 @@ export default function App() {
   );
 }
 
-function Nav({ current, status, onGo }: { current: string; status: Status | undefined; onGo: (id: string) => void }) {
+function Nav({ current, status, user, onGo }: { current: string; status: Status | undefined; user: string | null; onGo: (id: string) => void }) {
   const failed = Object.values(status?.queue ?? {}).reduce((a, q) => a + (q.failed ?? 0), 0);
   const run = useRun();
   const paused = status?.engine.paused;
@@ -144,6 +168,17 @@ function Nav({ current, status, onGo }: { current: string; status: Status | unde
           {paused ? "恢复全部任务" : "暂停全部任务"}
         </Button>
         <ThemeSwitch />
+        {user && (
+          <div className="flex items-center gap-2 pt-1 text-[13px]">
+            <span className="min-w-0 flex-1 truncate text-muted" title={`已登录：${user}`}>
+              {user}
+            </span>
+            <Button size="sm" variant="quiet" onClick={() => logout()}>
+              <LogOut />
+              退出
+            </Button>
+          </div>
+        )}
       </div>
     </>
   );

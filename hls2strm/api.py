@@ -7,18 +7,19 @@ import json
 import logging
 import os
 import re
-import secrets
 import sqlite3
 import time
 from typing import Literal
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__
+from . import auth as auth_module
+from .auth import COOKIE, REMEMBER_TTL, SESSION_TTL
 from .config import Settings
 from .db import DEFAULT_LIBRARY_ID, FACET_FIELDS, VIDEO_SORTS, VideoQuery, source_cooldown
 from .engine import snapshot_path
@@ -34,17 +35,60 @@ _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
 
 
 def require_auth(request: Request, cred: HTTPBasicCredentials | None = Depends(_basic)) -> None:
-    boot = request.app.state.ctx.boot
-    if not boot.ui_password:
+    """登录页给的会话 cookie，或者 HTTP Basic（脚本、curl -u 用）。
+    401 不带 WWW-Authenticate：浏览器不弹自己的登录框，由页面显示登录页。"""
+    auth = request.app.state.ctx.auth
+    if not auth.required or auth.verify(request.cookies.get(COOKIE)):
         return
-    if cred is None or not (
-        secrets.compare_digest(cred.username.encode(), boot.ui_user.encode())
-        and secrets.compare_digest(cred.password.encode(), boot.ui_password.encode())
-    ):
-        raise HTTPException(401, "需要登录", headers={"WWW-Authenticate": 'Basic realm="hls2strm"'})
+    if cred is not None and auth.check_password(cred.username, cred.password):
+        return
+    raise HTTPException(401, "需要登录")
 
 
 router = APIRouter(prefix="/api", dependencies=[Depends(require_auth)])
+public = APIRouter(prefix="/api")  # 不用登录的：登录、退出、查登录状态
+
+
+class LoginBody(BaseModel):
+    username: str
+    password: str
+    remember: bool = True
+
+
+@public.get("/session")
+async def session(request: Request):
+    """要不要登录、当前登录的是谁（没登录为 null）。"""
+    auth = _ctx(request).auth
+    if not auth.required:
+        return {"required": False, "user": None}
+    return {"required": True, "user": auth.verify(request.cookies.get(COOKIE))}
+
+
+@public.post("/login")
+async def login(body: LoginBody, request: Request, response: Response):
+    auth = _ctx(request).auth
+    ip = request.client.host if request.client else "?"
+    if not auth.required:
+        return {"user": None}
+    if wait := auth.blocked_for(ip):
+        raise HTTPException(429, f"密码输错次数太多，{wait // 60 + 1} 分钟后再试")
+    if not auth.check_password(body.username.strip(), body.password):
+        auth.failed(ip)
+        log.warning("登录失败：用户名 %s（来自 %s）", body.username.strip()[:40], ip)
+        await asyncio.sleep(auth_module.FAILURE_DELAY)
+        raise HTTPException(401, "用户名或密码不对")
+    auth.succeeded(ip)
+    ttl = REMEMBER_TTL if body.remember else SESSION_TTL
+    response.set_cookie(COOKIE, auth.issue(ttl), max_age=ttl if body.remember else None, httponly=True,
+                        samesite="lax", secure=request.url.scheme == "https", path="/")
+    log.info("登录：%s（来自 %s）", auth.boot.ui_user, ip)
+    return {"user": auth.boot.ui_user}
+
+
+@public.post("/logout")
+async def logout(response: Response):
+    response.delete_cookie(COOKIE, path="/")
+    return {"ok": True}
 
 
 def _ctx(request: Request):
