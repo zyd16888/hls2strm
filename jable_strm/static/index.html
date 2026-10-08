@@ -32,6 +32,14 @@
       </div>
     </template>
 
+    <template x-if="s.missing > 0">
+      <div class="notice warn">
+        <span>数据库里有记录、但磁盘上找不到的 strm 有 <b x-text="fmtNum(s.missing)"></b> 个。可能是换了输出目录的挂载，或者文件被删了。</span>
+        <button class="sm" @click="verifyLibrary(null)">核对并补回</button>
+        <button class="sm" @click="go('libraries')">看是哪些库</button>
+      </div>
+    </template>
+
     <div class="grid stats">
       <div class="card stat"><div class="label">影片总数</div><div class="value" x-text="fmtNum(s.videos?.total)"></div>
         <div class="sub">下架 <span x-text="fmtNum(s.videos?.gone)"></span></div></div>
@@ -190,6 +198,7 @@
             <option value="videos">指定影片</option>
             <option value="backfill">补全缺失详情</option>
             <option value="probe">补源（找备用源）</option>
+            <option value="verify">核对输出（记录和磁盘对不上时补回）</option>
             <option value="rewrite">重写输出</option>
           </select>
         </label>
@@ -200,10 +209,10 @@
             </select>
           </label>
         </template>
-        <template x-if="['list', 'videos', 'rewrite', 'probe'].includes(form.kind)">
+        <template x-if="['list', 'videos', 'rewrite', 'probe', 'verify'].includes(form.kind)">
           <label class="field"><span x-text="form.kind === 'probe' ? '给哪个库的影片找' : '输出库'"></span>
             <select x-model.number="form.library_id">
-              <option value="0" x-show="['rewrite', 'probe'].includes(form.kind)" x-text="form.kind === 'probe' ? '全部影片' : '全部库'"></option>
+              <option value="0" x-show="['rewrite', 'probe', 'verify'].includes(form.kind)" x-text="form.kind === 'probe' ? '全部影片' : '全部库'"></option>
               <template x-for="l in libraries" :key="l.id"><option :value="l.id" x-text="l.name" :selected="l.id === form.library_id"></option></template>
             </select>
           </label>
@@ -223,6 +232,13 @@
         </template>
         <template x-if="form.kind === 'list'">
           <label class="field"><span>抓详情</span><input type="checkbox" x-model="form.detail" style="margin:7px 0"></label>
+        </template>
+        <template x-if="form.kind === 'verify'">
+          <div class="form-row">
+            <label class="field"><span>发现问题就补回</span><input type="checkbox" x-model="form.repair" style="margin:7px 0"></label>
+            <label class="field"><span>补封面（要下载）</span><input type="checkbox" x-model="form.covers" :disabled="!form.repair" style="margin:7px 0"></label>
+            <label class="field"><span>外部整理目录是空的也写回</span><input type="checkbox" x-model="form.force_external" :disabled="!form.repair" style="margin:7px 0"></label>
+          </div>
         </template>
         <button class="primary" @click="createJob()">创建</button>
       </div>
@@ -374,11 +390,13 @@
                   <div x-show="l.sources.length" x-text="'来源：' + libNames(l.sources)"></div>
                   <div x-show="l.excludes.length" x-text="'排除：' + libNames(l.excludes)"></div>
                   <span class="chip warn" x-show="l.pending && l.excludes.length" x-text="'等待归入 ' + fmtNum(l.pending)"></span></td>
-                <td class="num" x-text="fmtNum(l.videos)"></td>
+                <td class="num"><div x-text="fmtNum(l.videos)"></div>
+                  <span class="chip err" x-show="l.missing" :title="'数据库里有记录、磁盘上找不到 strm'" x-text="'文件缺失 ' + fmtNum(l.missing)"></span></td>
                 <td class="num" x-text="l.subscriptions"></td>
                 <td class="nowrap">
                   <button class="sm" @click="editLibrary(l)">编辑</button>
                   <button class="sm" @click="post('/api/jobs', {kind: 'rewrite', library_id: l.id}).then(() => notify('已排队重写'))">重写</button>
+                  <button class="sm" @click="verifyLibrary(l)">核对</button>
                   <button class="sm" x-show="l.rule || l.sources.length || l.excludes.length" @click="post('/api/libraries/' + l.id + '/reclassify').then(() => notify('已排队重新归库'))">重新归库</button>
                   <button class="sm" x-show="l.external_dir" @click="post('/api/libraries/' + l.id + '/locate').then(() => notify('已排队同步位置'))">同步位置</button>
                   <button class="sm danger" x-show="l.id !== 1" @click="deleteLibrary(l)">删除</button>

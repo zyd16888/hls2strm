@@ -3,6 +3,7 @@
 job 种类：
   crawl        翻某个列表来源，输出到指定输出库（订阅的首轮全量也是它）
   probe        补源：按番号到某个站点找库里影片的备用源
+  verify       核对输出：数据库里的记录和磁盘上的 strm / nfo / 封面对不对得上，可选补回
   incremental  从第 1 页往后翻，连续遇到库里已有的影片就停（订阅的定时增量）
   videos       抓指定影片的详情（手动添加、补全缺失详情）
   rewrite      按当前设置重写输出（可限定某个库），路径变化时搬动文件
@@ -10,7 +11,7 @@ job 种类：
   locate       外部整理库：找回被外部工具（mdcng 等）移走、改名的 strm，更新记录的路径
   reclassify   重新归库：规则库重新求值，并按来源库、排除库归并（只在本地，不联网）
 子任务种类：list（目标=页码）、detail（目标=站内 key）、probe（目标=站点:作品 id）、rewrite（目标=all）、
-          purge / locate（目标=库 id）
+          purge / locate（目标=库 id）、verify（目标=all）、cover（目标=库 id:作品 id，补封面）
 list、detail 子任务带站点（tasks.site）：某个站被拦截时只暂停这个站的子任务，每个站的并发也各自限制。
 """
 
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import Counter
 from pathlib import Path
@@ -32,7 +34,7 @@ from .parser import ParseError, VideoGone, m3u8_duration
 from .rules import describe_rule, match_rule, normalize_rule
 from .sites import SITES, Site, SourceDetail, SourceItem, find_by_code, get_site
 from .strm_manage import StrmManager
-from .writer import OutputWriter
+from .writer import OutputWriter, cover_path
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +77,8 @@ class Engine:
         self._settle_lock = asyncio.Lock()
         self._settle_wanted = True
         self._settled_at = 0.0
+        self.missing: dict[int, int] = {}  # 库 id -> 有记录但磁盘上找不到的 strm 数（启动时、核对后统计）
+        self._missing_task: asyncio.Task | None = None
 
     # ---- 生命周期 ----
 
@@ -89,12 +93,15 @@ class Engine:
         self._resize_workers()
         self.store.on_change(lambda old, new: self._on_settings())
         self._scheduler = asyncio.create_task(self._schedule_loop(), name="scheduler")
+        self._missing_task = asyncio.create_task(self.count_missing(), name="count-missing")
 
     async def stop(self) -> None:
         self._stopping = True
         tasks = [t for t in self._workers if not t.done()]
         if self._scheduler:
             tasks.append(self._scheduler)
+        if self._missing_task and not self._missing_task.done():
+            tasks.append(self._missing_task)
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -192,7 +199,7 @@ class Engine:
                 await self.db.finish_task(tid, "pending", refund_attempt=True)
                 return
             handler = {"list": self._do_list, "detail": self._do_detail, "probe": self._do_probe,
-                       "rewrite": self._do_rewrite,
+                       "rewrite": self._do_rewrite, "verify": self._do_verify, "cover": self._do_cover,
                        "purge": self._do_purge, "reclassify": self._do_reclassify,
                        "scan": self.strm.do_scan, "adopt": self.strm.do_adopt,
                        "prefix": self.strm.do_prefix, "revert": self.strm.do_revert,
@@ -347,6 +354,7 @@ class Engine:
             raise e
 
         added_count = 0
+        restored: Counter = Counter()
         detail_keys = []
         state = (await self.db.get_job(job["id"]))["state"]
         probe_sites = [n for n in self.store.current.auto_probe_sites
@@ -360,13 +368,19 @@ class Engine:
                 state["known_streak"] = state.get("known_streak", 0) + 1
                 continue
             added = await self.db.ensure_output(v["id"], lib_id)
-            if added or not (await self.db.get_output(v["id"], lib_id))["strm_path"]:
+            strm_path = (await self.db.get_output(v["id"], lib_id))["strm_path"]
+            if not added and strm_path and not await asyncio.to_thread(os.path.isfile, strm_path):
+                # 记录在、文件不在了（换了输出目录的挂载、被删了，或者被外部刮削器挪走、改名）
+                restored[await self.restore_lost(v, lib)] += 1
+            elif added or not strm_path:
                 # 已有详情的影片（别的库抓过）直接带上 nfo 和封面
                 await self._output_one(v, lib_id, cover=bool(v["detail_at"]))
             if p.get("detail", True) and v["detail_at"] is None:
                 detail_keys.append(it.key)
             added_count += added
             state["known_streak"] = 0 if added else state.get("known_streak", 0) + 1
+        if restored["rewritten"] and self.missing.get(lib_id):  # 补回的不再算缺失
+            self.missing[lib_id] = max(0, self.missing[lib_id] - restored["rewritten"])
         if detail_keys:
             await self.db.add_tasks(job["id"], "detail", detail_keys, PRIORITY_DETAIL, site.name)
         self.metrics.inc("videos_new", added_count)
@@ -386,8 +400,9 @@ class Engine:
             if n:
                 log.info("任务 #%d：共 %d 页，已排队第 %d-%d 页", job["id"], last, page + 1, end)
         await self.db.update_job(job["id"], state=state)
-        log.info("%s 列表 %s 第 %d/%d 页 → 库「%s」：%d 部，新加入 %d，排队详情 %d", site.label,
-                 p["source"], page, last, self.libs[lib_id]["name"], len(lp.items), added_count, len(detail_keys))
+        log.info("%s 列表 %s 第 %d/%d 页 → 库「%s」：%d 部，新加入 %d，排队详情 %d%s", site.label,
+                 p["source"], page, last, self.libs[lib_id]["name"], len(lp.items), added_count, len(detail_keys),
+                 _restore_text(restored))
 
     async def _do_detail(self, job: dict, task: dict) -> None:
         await self.fetch_detail(task["site"] or "jable", task["target"], library_id=job["params"].get("library_id"))
@@ -543,6 +558,148 @@ class Engine:
             if n % 1000 == 0:
                 log.info("重写输出：已完成 %d 个", n)
         log.info("重写输出完成：共 %d 个", n)
+        await self.count_missing()
+
+    # ---- 核对输出 ----
+
+    async def restore_lost(self, v: dict, lib: dict, *, force: bool = False) -> str:
+        """记录的 strm 不在了，补回或找回。返回 rewritten（重新写了）/ relocated（外部工具挪走了，已更新路径）/
+        missing（外部整理库找不到，按设置不补）/ unavailable（外部整理目录不在或是空的，没补）。
+
+        普通库：直接按模板重写（含 nfo、封面）。外部整理库：先按内容在收件目录和外部整理目录里找，
+        外部工具改了目录、加了后缀也认得出，找到就只更新路径；都找不到才写回收件目录让外部工具再整理一次。
+        force：外部整理目录是空的也写回（「核对」里手动勾选）。
+        """
+        if not lib["external_dir"]:
+            await self._output_one(v, lib["id"], cover=bool(v["detail_at"]))
+            return "rewritten"
+        found = await self.strm.index(lib)
+        paths = [x for x in found.get(v["id"], []) if await asyncio.to_thread(os.path.isfile, x)]
+        if not paths and v["id"] in found:  # 缓存的位置又被挪了：重新扫一遍
+            found = await self.strm.index(lib, max_age=0)
+            paths = found.get(v["id"], [])
+        if paths:
+            await self.db.set_output_paths(lib["id"], [(self.strm.pick(lib, paths), v["id"])])
+            return "relocated"
+        if not force and not self.strm.external_available(lib, found):
+            return "unavailable"
+        if not force and not self.store.current.external_restore:
+            return "missing"
+        await self._output_one(v, lib["id"], cover=False, old_strm="", settle=True)
+        if (out := await self.db.get_output(v["id"], lib["id"])) and out["strm_path"]:
+            self.strm.remember(lib, v["id"], out["strm_path"])
+        return "rewritten"
+
+    def _output_problems(self, v: dict, strm_path: str) -> list[str]:
+        """一条输出在磁盘上缺什么：strm（没有或内容不是当前的播放地址）、nfo、cover。同步函数，放到线程里跑。"""
+        s = self.store.current
+        strm = Path(strm_path)
+        problems = []
+        try:
+            content = strm.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            content = None
+        if content is None or (s.play_mode != "direct" and content != self.writer.play_url(v)):
+            problems.append("strm")
+        if s.write_nfo and v.get("detail_at") and not cover_path(strm, ".nfo").is_file():
+            problems.append("nfo")
+        if s.download_cover and v.get("cover_url"):
+            names = ["-fanart.jpg"] + (["-poster.jpg"] if s.poster_crop else [])
+            if not all(cover_path(strm, n).is_file() for n in names):
+                problems.append("cover")
+        return problems
+
+    async def count_missing(self) -> dict[int, int]:
+        """统计每个库有记录、但磁盘上找不到 strm 的影片数。外部整理库按内容在收件目录和外部整理目录里找。"""
+        paths: list[tuple[int, str]] = []
+        external: Counter = Counter()
+        indexes = {lid: await self.strm.index(lib) for lid, lib in list(self.libs.items()) if lib["external_dir"]}
+        async for v, out in self.db.iter_outputs():
+            lib = self.libs.get(out["library_id"])
+            if not lib or v["status"] != "active" or not out["strm_path"]:
+                continue
+            if lib["external_dir"]:
+                external[lib["id"]] += v["id"] not in indexes[lib["id"]]  # 按内容找，外部工具挪走、改名不算丢
+            else:
+                paths.append((lib["id"], out["strm_path"]))
+        counts = await asyncio.to_thread(lambda: Counter(lid for lid, p in paths if not os.path.isfile(p)))
+        counts.update(+external)
+        self.missing = dict(counts)
+        if total := sum(counts.values()):
+            log.warning("磁盘上找不到 %d 个 strm（数据库里有记录）：%s。可以在「输出库与订阅」执行「核对」补回", total,
+                        "、".join(f"{self.libs[k]['name']} {n}" for k, n in counts.items()))
+        return self.missing
+
+    async def _do_verify(self, job: dict, task: dict) -> None:
+        p = job["params"]
+        lib_id, repair, covers = p.get("library_id"), p.get("repair", True), p.get("covers", True)
+        force_external = p.get("force_external", False)
+        st = Counter()
+        for lib in list(self.libs.values()):
+            if lib["external_dir"] and lib_id in (None, lib["id"]):
+                await self.strm.locate(lib)  # 外部整理库先找回被外部工具移走的文件
+        cover_targets = []
+        async for v, out in self.db.iter_outputs(lib_id):
+            lib = self.libs.get(out["library_id"])
+            if lib is None or v["status"] != "active" or not out["strm_path"]:
+                continue
+            st["checked"] += 1
+            if lib["external_dir"]:
+                # 上面已经同步过位置：记录的路径还找不到，就是收件目录和外部整理目录里都没有
+                if await asyncio.to_thread(os.path.isfile, out["strm_path"]):
+                    st["ok"] += 1
+                elif repair:
+                    st["external_" + await self.restore_lost(v, lib, force=force_external)] += 1
+                else:
+                    st["external_missing"] += 1
+                continue
+            problems = await asyncio.to_thread(self._output_problems, v, out["strm_path"])
+            if not problems:
+                st["ok"] += 1
+                continue
+            st.update(problems)
+            if not repair:
+                continue
+            if "strm" in problems or "nfo" in problems:
+                await self._output_one(v, lib["id"], cover=False, old_strm=out["strm_path"])
+                st["repaired"] += 1
+            if "cover" in problems:
+                if covers:
+                    cover_targets.append(f"{lib['id']}:{v['id']}")
+                else:
+                    await self.db.set_cover_done(v["id"], lib["id"], False)
+            if st["checked"] % 2000 == 0:
+                log.info("核对输出：已检查 %d 部", st["checked"])
+        if cover_targets:
+            st["covers_queued"] = await self.db.add_tasks(job["id"], "cover", cover_targets, PRIORITY_DETAIL)
+        await self.db.update_job(job["id"], state=dict(st))
+        await self.count_missing()
+        log.info("核对输出%s：检查 %d 部，正常 %d；strm 缺失或不对 %d，nfo 缺失 %d，封面缺失 %d%s",
+                 "并修复" if repair else "（只检查）", st["checked"], st["ok"], st["strm"], st["nfo"], st["cover"],
+                 f"；已补写 {st['repaired']} 部，排队补封面 {st['covers_queued']} 部" if repair else "")
+        ext = {k.removeprefix("external_"): n for k, n in st.items() if k.startswith("external_")}
+        if ext:
+            log.info("核对输出：外部整理库找不到的 %s", _restore_text(Counter(ext)).lstrip("，") or
+                     f"{ext.get('missing', 0)} 部（只检查）")
+
+    async def _do_cover(self, job: dict, task: dict) -> None:
+        lib_id, vid = (int(x) for x in task["target"].split(":"))
+        v = await self.db.get_video_by_id(vid)
+        out = await self.db.get_output(vid, lib_id)
+        if v is None or out is None or not out["strm_path"] or lib_id not in self.libs:
+            return
+        await self._output_one(v, lib_id, cover=True, old_strm=out["strm_path"])
+
+    async def create_verify(self, library_id: int | None = None, *, repair: bool = True, covers: bool = True,
+                            force_external: bool = False) -> int:
+        lib_name = self._library(library_id)["name"] if library_id else "全部库"
+        name = f"核对输出：{lib_name}" + ("（修复）" if repair else "（只检查）")
+        job_id = await self.db.create_job("verify", name, {"library_id": library_id, "repair": repair, "covers": covers,
+                                                           "force_external": force_external})
+        await self.db.add_tasks(job_id, "verify", ["all"], PRIORITY_USER)
+        log.info("新建任务 #%d「%s」", job_id, name)
+        self.notify()
+        return job_id
 
     async def apply_rules(self, v: dict, only_library: int | None = None) -> tuple[int, int]:
         """按规则库调整影片归属：命中就加入（via=rule），不再命中就移除规则加入的输出。返回 (加入, 移除)。"""
@@ -964,6 +1121,16 @@ async def playlist_duration(fetcher: Fetcher, url: str, headers: dict | None = N
             return None
         text = (await fetcher.get_bytes(urljoin(url, sub), headers=headers)).decode("utf-8", "replace")
     return m3u8_duration(text)
+
+
+def _restore_text(c: Counter) -> str:
+    """补回结果的日志文字。"""
+    parts = [f"补回 {c['rewritten']} 部" if c["rewritten"] else "",
+             f"外部工具挪走、改名的找回位置 {c['relocated']} 部" if c["relocated"] else "",
+             f"外部整理库找不到、按设置没补 {c['missing']} 部" if c["missing"] else "",
+             f"外部整理目录不在或是空的、没补 {c['unavailable']} 部（检查挂载）" if c["unavailable"] else ""]
+    text = "，".join(p for p in parts if p)
+    return f"，磁盘上丢失的：{text}" if text else ""
 
 
 def _overlap(a: Path, b: Path) -> bool:

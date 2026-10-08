@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from .engine import Engine
 
 log = logging.getLogger(__name__)
+INDEX_TTL = 600  # 按内容找文件的索引缓存多久（秒）：订阅连续翻多页时不用每页都扫一遍目录
 
 OURS_RE = re.compile(r"/play/([a-z0-9][a-z0-9._-]{0,80})\.m3u8$", re.I)
 CDN_RE = re.compile(r"/(?:hls/[^/]+/\d{9,11}/\d+|vod/\d+)/(\d+)/\1\.m3u8$")
@@ -201,6 +202,41 @@ class StrmManager:
     def __init__(self, engine: Engine) -> None:
         self.e = engine
         self.db = engine.db
+        self._index: dict[int, tuple[float, dict[int, list[str]]]] = {}
+
+    # ---- 按内容找文件 ----
+
+    async def index(self, lib: dict, max_age: float = INDEX_TTL) -> dict[int, list[str]]:
+        """这个库每部影片的 strm 在哪：在库目录（收件目录）和外部整理目录里按内容找，不看文件名，
+        所以外部刮削器改了目录、给文件名加了 -C / -破解 / -4K 之类的后缀也认得出。结果缓存一会儿。"""
+        cached = self._index.get(lib["id"])
+        if cached and time.time() - cached[0] < max_age:
+            return cached[1]
+        keys = await self.db.video_keys()
+        roots = [self.e.writer.library_root(lib), self.e.writer.external_root(lib)]
+        found = await asyncio.to_thread(find_by_video, [r for r in roots if r], await self.db.cdn_video_map(),
+                                        {s: i for i, s in keys})
+        self._index[lib["id"]] = (time.time(), found)
+        return found
+
+    def pick(self, lib: dict, paths: list[str]) -> str:
+        """同一部影片找到多个文件时优先外部整理目录里的（整理好的那份才是媒体库在用的）。"""
+        ext = self.e.writer.external_root(lib)
+        if ext is not None:
+            prefix = os.path.normcase(str(ext)) + os.sep
+            in_ext = [p for p in paths if os.path.normcase(p).startswith(prefix)]
+            if in_ext:
+                return in_ext[0]
+        return paths[0]
+
+    def external_available(self, lib: dict, found: dict[int, list[str]]) -> bool:
+        """外部整理目录在、而且这个库还找得到 strm：都不满足时多半是挂载出了问题，不能往收件目录补（会整库重刮）。"""
+        ext = self.e.writer.external_root(lib)
+        return ext is not None and ext.is_dir() and bool(found)
+
+    def remember(self, lib: dict, video_id: int, path: str) -> None:
+        if (cached := self._index.get(lib["id"])) is not None:
+            cached[1].setdefault(video_id, []).append(path)
 
     # ---- 扫描 ----
 
@@ -328,11 +364,7 @@ class StrmManager:
         同一部影片找到多个文件时优先外部整理目录里的（整理好的那份才是媒体库在用的）。
         """
         ext = self.e.writer.external_root(lib)
-        keys = await self.db.video_keys()
-        found = await asyncio.to_thread(
-            find_by_video, [self.e.writer.library_root(lib), ext], await self.db.cdn_video_map(),
-            {s: i for i, s in keys}
-        )
+        found = await self.index(lib, max_age=0)
         ext_prefix = os.path.normcase(str(ext)) + os.sep
         in_ext = {vid: [p for p in paths if os.path.normcase(p).startswith(ext_prefix)] for vid, paths in found.items()}
         updates: list[tuple[str, int]] = []

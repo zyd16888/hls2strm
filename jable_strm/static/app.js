@@ -3,7 +3,7 @@
 const KIND_NAMES = {
   list: "列表页", detail: "详情页", rewrite: "重写输出", purge: "删除库", reclassify: "重新归库",
   scan: "扫描", adopt: "纳管", prefix: "改前缀", revert: "回滚", locate: "同步位置",
-  crawl: "列表抓取", incremental: "增量", videos: "指定影片", probe: "补源",
+  crawl: "列表抓取", incremental: "增量", videos: "指定影片", probe: "补源", verify: "核对输出", cover: "补封面",
 };
 const JOB_STATUS = { running: "运行中", paused: "已暂停", done: "已完成", cancelled: "已取消" };
 const TASK_STATUS = { pending: "待处理", running: "运行中", done: "完成", failed: "失败", gone: "下架", cancelled: "已取消" };
@@ -14,7 +14,7 @@ const SETTING_GROUPS = [
   { title: "站点", keys: ["sites", "site_priority"] },
   { title: "抓取", keys: ["proxy", "impersonate", "request_timeout", "domain_cooldown", "solver_url", "solver_timeout"] },
   { title: "重试", keys: ["max_attempts", "retry_base_delay"] },
-  { title: "任务", keys: ["fetch_detail", "auto_probe_sites", "probe_recheck_days"] },
+  { title: "任务", keys: ["fetch_detail", "auto_probe_sites", "probe_recheck_days", "external_restore"] },
   { title: "输出", keys: ["output_dir", "path_template", "write_nfo", "download_cover", "poster_crop"] },
   { title: "播放", keys: ["public_base_url", "play_mode", "proxy_user_agents", "play_token", "hls_margin", "subtitle_priority",
                          "subtitle_fallback", "play_discover", "resolve_timeout", "resolve_token", "resolve_proxy_url"] },
@@ -28,7 +28,7 @@ const SETTING_LABELS = {
   proxy_user_agents: "中转 UA 片段", play_token: "播放令牌", hls_margin: "有效期余量（分钟）",
   resolve_token: "网关解析令牌", subtitle_priority: "字幕偏好", subtitle_fallback: "字幕回退",
   resolve_timeout: "取地址总时限（秒）", resolve_proxy_url: "公网中转地址", play_discover: "现场找源",
-  auto_probe_sites: "新片自动补源", probe_recheck_days: "补源重查间隔（天）",
+  auto_probe_sites: "新片自动补源", probe_recheck_days: "补源重查间隔（天）", external_restore: "外部整理库补回丢失的 strm",
 };
 const SUBTITLES = { zh: "中文字幕", en: "英文字幕", "": "无字幕" };
 const REWRITE_KEYS = ["public_base_url", "play_mode", "play_token", "path_template", "output_dir", "write_nfo"];
@@ -47,7 +47,8 @@ function app() {
     testing: false,
     testResult: null,
     meta: { sites: {} },
-    form: { kind: "list", site: "jable", source: "", sort: "post_date", start_page: 1, end_page: 0, detail: true, urls: "", library_id: 1 },
+    form: { kind: "list", site: "jable", source: "", sort: "post_date", start_page: 1, end_page: 0, detail: true, urls: "", library_id: 1,
+            repair: true, covers: true, force_external: false },
     libraries: [],
     subscriptions: [],
     libForm: { rule: {} },
@@ -193,6 +194,7 @@ function app() {
         list: `一次性抓取某个列表并输出到所选的库。${this.siteMeta(this.form.site).hint || ""}。同一番号已经在库里（别的站抓过）的，只给它加一个源。需要定时更新请用「输出库与订阅」里的订阅。`,
         videos: "抓取指定影片的详情并加入所选的库，优先级高于批量任务。",
         backfill: "为所有还没有详情的影片排队抓详情，写入它们所在的各个库。",
+        verify: "检查数据库里每条输出在磁盘上还在不在：strm 有没有、内容是不是当前的播放地址，nfo 和封面有没有。勾上「补回」会重新写 strm 和 nfo（不联网），封面先从别的库硬链接，没有再下载。外部整理库按 strm 内容在收件目录和外部整理目录里找（外部工具改了目录、加了 -C / -破解 之类的后缀也认得出），找到就只更新记录的路径；两边都找不到才写回收件目录，交给外部工具再整理；外部整理目录不在或是空的时候不补（多半是挂载出了问题），确认要补就勾「外部整理目录是空的也写回」。订阅增量遇到文件丢了的影片也会按同样的规则顺手处理。",
         probe: "给库里的影片找备用源：按番号到所选站点逐部查找（每部一次请求），找到就挂成这部影片的另一个源，播放时原来的源不能用会自动换过去。某个站没有的影片，按「补源重查间隔」内不再重复查。",
         rewrite: "修改对外地址、播放模式、令牌或路径模板后，用它重写已有的 strm / nfo（不联网），路径变了会搬动文件。",
       }[this.form.kind];
@@ -203,7 +205,8 @@ function app() {
       if (f.kind === "list") Object.assign(body, { site: f.site, source: f.source, sort: f.sort, start_page: f.start_page || 1, end_page: f.end_page || 0, detail: f.detail });
       if (f.kind === "videos") Object.assign(body, { site: f.site, urls: f.urls });
       if (f.kind === "probe") body.site = f.site;
-      if (["list", "videos", "rewrite", "probe"].includes(f.kind) && f.library_id) body.library_id = f.library_id;
+      if (f.kind === "verify") Object.assign(body, { repair: f.repair, covers: f.repair && f.covers, force_external: f.repair && f.force_external });
+      if (["list", "videos", "rewrite", "probe", "verify"].includes(f.kind) && f.library_id) body.library_id = f.library_id;
       const r = await this.post("/api/jobs", body);
       this.notify(`已创建任务 #${r.id}`);
       this.loadJobs();
@@ -235,6 +238,15 @@ function app() {
       let text = `${this.fmtNum(this.jobFinished(j))} / ${this.fmtNum(this.jobTotal(j))}`;
       if (j.state?.last_page) text += ` · 共 ${j.state.last_page} 页`;
       if (j.kind === "locate" && j.state?.checked != null) text += ` · 更新 ${this.fmtNum(j.state.updated)}，找不到 ${this.fmtNum(j.state.missing)}`;
+      if (j.kind === "verify" && j.state?.checked != null) {
+        const st = j.state, n = k => this.fmtNum(st[k] || 0);
+        text += ` · 检查 ${n("checked")}，正常 ${n("ok")}，strm 缺 ${n("strm")}，nfo 缺 ${n("nfo")}，封面缺 ${n("cover")}`
+          + (j.params?.repair ? `；补写 ${n("repaired")}，补封面 ${n("covers_queued")}` : "")
+          + (st.external_relocated ? `；外部整理库找回位置 ${n("external_relocated")}` : "")
+          + (st.external_rewritten ? `，写回收件目录 ${n("external_rewritten")}` : "")
+          + (st.external_missing ? `，找不到 ${n("external_missing")}` : "")
+          + (st.external_unavailable ? `，外部整理目录不在或是空的没补 ${n("external_unavailable")}` : "");
+      }
       return text;
     },
     jobCls(st) { return { running: "ok", paused: "warn", done: "info", cancelled: "" }[st] || ""; },
@@ -372,6 +384,15 @@ function app() {
                        sources: [...l.sources], excludes: [...l.excludes], useRule: !!l.rule, rule };
     },
     libNames(ids) { return ids.map(id => this.libraries.find(l => l.id === id)?.name || `#${id}`).join("、"); },
+    async verifyLibrary(l) {
+      const name = l ? `「${l.name}」` : "全部库";
+      if (!confirm(`核对${name}：检查数据库里的每条输出在磁盘上还在不在（strm、nfo、封面），缺的补回。\n`
+                   + "strm 和 nfo 在本地重写，封面先从别的库硬链接、没有再下载。\n"
+                   + "外部整理库按内容找文件（外部工具改名、加后缀也认得出），找到只更新路径；两边都找不到才写回收件目录；外部整理目录是空的不补。")) return;
+      const r = await this.post("/api/jobs", { kind: "verify", library_id: l ? l.id : null, repair: true, covers: true });
+      this.notify(`已创建核对任务 #${r.id}`);
+      if (this.tab === "jobs") this.loadJobs();
+    },
     async loadFacets() { this.facets = await this.get("/api/facets").catch(() => this.facets); },
     async saveLibrary() {
       const f = this.libForm;

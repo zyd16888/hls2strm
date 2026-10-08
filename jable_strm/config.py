@@ -129,6 +129,11 @@ class Settings(BaseModel):
         description="新片自动补源：列表任务、订阅收进新影片时，到这些站点按番号找备用源（填站点名，如 missav）；留空不自动找",
     )
     probe_recheck_days: int = Field(30, ge=1, le=3650, description="补源时某个站没有这部影片，多少天内不再去查")
+    external_restore: bool = Field(
+        True,
+        description="外部整理库的 strm 在收件目录和外部整理目录里都找不到时（按内容找，外部工具改名、加后缀也认得出），"
+                    "重新写进收件目录交给外部工具再整理；外部整理目录不存在或是空的时候不补，多半是挂载出了问题",
+    )
     # 输出
     output_dir: str = Field(
         "", description="输出根目录，各输出库的相对目录都在它下面；留空使用 JABLE_OUTPUT_DIR 或 数据目录/strm"

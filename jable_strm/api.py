@@ -65,6 +65,7 @@ async def status(request: Request):
         "metrics": c.metrics.snapshot(),
         "failures": await c.db.recent_failures(8),
         "subscriptions": await c.db.list_subscriptions(),
+        "missing": sum(c.engine.missing.values()),
         "output_dir": str(c.store.output_dir),
         "public_base_url": c.store.public_base_url,
         "play_mode": c.store.current.play_mode,
@@ -123,7 +124,7 @@ async def solver_test(body: SolverTestBody, request: Request):
 
 
 class JobCreate(BaseModel):
-    kind: Literal["list", "videos", "backfill", "rewrite", "probe"]
+    kind: Literal["list", "videos", "backfill", "rewrite", "probe", "verify"]
     site: str = "jable"
     source: str = ""
     sort: str = ""
@@ -132,6 +133,9 @@ class JobCreate(BaseModel):
     detail: bool | None = None
     urls: str = ""
     library_id: int | None = None
+    repair: bool = True  # verify：发现问题就补回；关掉只检查
+    covers: bool = True  # verify：补封面（要下载）
+    force_external: bool = False  # verify：外部整理目录是空的也把找不到的写回收件目录
 
 
 def _site_of_url(c, url: str) -> str | None:
@@ -175,6 +179,9 @@ async def create_job(body: JobCreate, request: Request):
             job_id = await e.create_backfill()
         elif body.kind == "probe":
             job_id = await e.create_probe(body.site, body.library_id or None)
+        elif body.kind == "verify":
+            job_id = await e.create_verify(body.library_id or None, repair=body.repair, covers=body.covers,
+                                           force_external=body.force_external)
         else:
             job_id = await e.create_rewrite(body.library_id)
     except ValueError as err:
@@ -343,6 +350,7 @@ async def list_libraries(request: Request):
     c = _ctx(request)
     libs = await c.db.list_libraries()
     for lib in libs:
+        lib["missing"] = c.engine.missing.get(lib["id"], 0)
         lib["root"] = str(c.writer.library_root(lib))
         lib["external_root"] = str(c.writer.external_root(lib) or "")
         lib["rule_text"] = describe_rule(lib["rule"])

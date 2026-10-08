@@ -144,11 +144,11 @@ def test_external_library_survives_mdcng_move(make_store, boot, tmp_path):
         assert not list(inbox.rglob("*.strm")) and not list(inbox.rglob("*.nfo"))
         assert mdc_nfo.read_text() == "mdc"
 
-        # 同步位置：按内容找回改了名的文件
-        job = await wait_job(db, await engine.strm.create_locate(lib_id))
-        assert job["state"] == {"checked": 24, "updated": 24, "missing": 0, "duplicates": 0, "extra": 0}
+        # 增量翻到这些影片时发现记录的文件不在了：按内容找到 mdcng 改了名的文件，只更新路径
         v = await db.get_video("ipzz-983")
         assert (await db.get_output(v["id"], lib_id))["strm_path"] == str(moved)
+        job = await wait_job(db, await engine.strm.create_locate(lib_id))
+        assert job["state"] == {"checked": 24, "updated": 0, "missing": 0, "duplicates": 0, "extra": 0}
 
         # mdcng 又挪了一次位置；改对外地址后重写：先自动同步位置，再原地改内容，不搬回收件目录
         moved2 = mdc / "另一女优" / "IPZZ-983.strm"

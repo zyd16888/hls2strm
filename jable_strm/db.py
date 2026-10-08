@@ -890,6 +890,10 @@ class Database:
                 (strm_path, now(), int(cover_done), video_id, library_id),
             )
 
+    async def set_cover_done(self, video_id: int, library_id: int, done: bool) -> None:
+        await self._write("UPDATE outputs SET cover_done=? WHERE video_id=? AND library_id=?",
+                          (int(done), video_id, library_id))
+
     async def set_output_paths(self, library_id: int, paths: list[tuple[str, int]]) -> int:
         """批量改记录的 strm 路径（外部工具移走文件后找回的新位置），paths 是 (路径, 影片 id)。"""
         return await self._write_many(
