@@ -6,7 +6,7 @@ import { Chip, Mono, Notice, Panel, Table, Td, Th } from "@/components/ui/data";
 import { Check, Field, Input, Select, Switch, Textarea } from "@/components/ui/form";
 import { rewriteAll } from "@/lib/actions";
 import { api, type LineConfig, type LineSpecMeta, type SchemaProp, type SettingsResponse, type SettingsValues, type SiteConfig } from "@/lib/api";
-import { PLAY_MODES, RESOLVE_MODES } from "@/lib/labels";
+import { PLAY_MODES, RESOLVE_MODES, VARIANT_MODES } from "@/lib/labels";
 import { useMeta, useRun } from "@/lib/queries";
 import { cn } from "@/lib/utils";
 
@@ -31,6 +31,8 @@ const GROUPS: { id: string; title: string; keys: string[] }[] = [
       "quality_max",
       "quality_unknown",
       "prefer_direct",
+      "variant_mode",
+      "version_min_height",
       "quality_capture",
       "play_discover",
       "resolve_timeout",
@@ -78,6 +80,8 @@ const LABELS: Record<string, string> = {
   quality_max: "画质上限",
   quality_unknown: "未知画质按",
   prefer_direct: "直连优先",
+  variant_mode: "多码率的源给几档",
+  version_min_height: "多画质版本最低档",
   quality_capture: "顺手探测画质",
   play_discover: "现场找源",
   resolve_timeout: "取地址总时限（秒）",
@@ -204,7 +208,7 @@ function Control({ k, schema, value, draft, set }: { k: string; schema: SchemaPr
       <Select value={String(value)} onChange={e => set(k, e.target.value)} className="w-full max-w-md">
         {schema.enum.map(o => (
           <option key={o} value={o}>
-            {(k === "play_mode" ? PLAY_MODES : k === "resolve_mode" ? RESOLVE_MODES : {})[o] ?? o}
+            {(k === "play_mode" ? PLAY_MODES : k === "resolve_mode" ? RESOLVE_MODES : k === "variant_mode" ? VARIANT_MODES : {})[o] ?? o}
           </option>
         ))}
       </Select>

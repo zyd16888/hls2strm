@@ -10,7 +10,7 @@ import re
 import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from PIL import Image
 
@@ -21,6 +21,8 @@ log = logging.getLogger(__name__)
 
 _INVALID = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 OUTPUT_SUFFIXES = (".strm", ".nfo", "-poster.jpg", "-fanart.jpg")
+VERSION_PATH_RE = re.compile(r"/play/([a-z0-9][a-z0-9._-]{0,80})@([a-z0-9]+)\.m3u8$", re.I)  # 多画质版本的播放地址
+VERSION_STYLES = ("emby", "suffix")  # 多画质版本文件的命名方式，见 OutputWriter.version_path
 
 
 def sanitize(value: str, max_len: int = 100) -> str:
@@ -102,14 +104,70 @@ class OutputWriter:
     def __init__(self, store: SettingsStore) -> None:
         self.store = store
 
-    def play_url(self, v: dict) -> str:
+    def play_url(self, v: dict, version: str = "") -> str:
+        """strm 里的播放地址；version 是多画质版本的档位（'720p'），写成 /play/{slug}@720p.m3u8。"""
         s = self.store.current
-        if s.play_mode == "direct" and v.get("stream_url"):
+        if s.play_mode == "direct" and v.get("stream_url") and not version:
             return v["stream_url"]
-        url = f"{self.store.public_base_url}/play/{v['slug']}.m3u8"
+        url = f"{self.store.public_base_url}/play/{v['slug']}{'@' + version.lower() if version else ''}.m3u8"
         if s.play_token:
             url += f"?t={quote(s.play_token)}"
         return url
+
+    # ---- 多画质版本 ----
+
+    @staticmethod
+    def version_path(strm: Path, label: str, style: str) -> Path | None:
+        """多画质版本文件的位置，和主 strm 同目录：
+        emby    「目录名 - 720p.strm」（Emby 官方多版本命名）；目录名得是主 strm 文件名的开头（一部片一个目录），
+                否则不写（合集目录里写了会串到别的片上）
+        suffix  「主文件名-720p.strm」（和 mdcng 的 -4K 后缀一个写法）
+        """
+        if style == "emby":
+            folder = strm.parent.name
+            if not folder or not strm.stem.lower().startswith(folder.lower()):
+                return None
+            return strm.parent / f"{folder} - {label}.strm"
+        if style == "suffix":
+            return strm.with_name(f"{strm.stem}-{label}.strm")
+        return None
+
+    @staticmethod
+    def own_versions(strm: Path, slug: str) -> dict[Path, str]:
+        """主 strm 旁边本程序写的版本文件 {路径: 档位}：按内容认（/play/{slug}@档位.m3u8），两种命名都认得，
+        换了命名方式、关掉多画质版本时能清干净，别人的文件不碰。"""
+        out = {}
+        folder, stem = strm.parent.name, strm.stem
+        try:
+            entries = list(os.scandir(strm.parent))
+        except OSError:
+            return out
+        for e in entries:
+            name = e.name
+            if (not name.lower().endswith(".strm") or name == strm.name
+                    or not (name.startswith(f"{folder} - ") or name.startswith(f"{stem}-"))):
+                continue
+            try:
+                with open(e.path, "rb") as f:
+                    first = f.read(1024).decode("utf-8", "replace").strip().splitlines()[:1]
+            except OSError:
+                continue
+            m = VERSION_PATH_RE.search(urlsplit(first[0]).path) if first else None
+            if m and m.group(1).lower() == slug:
+                out[Path(e.path)] = m.group(2).lower()
+        return out
+
+    def sync_versions(self, v: dict, strm: Path, labels: list[str], style: str) -> tuple[int, int]:
+        """把主 strm 旁边的多画质版本文件对齐到 labels（style 为空或 labels 为空就是全删）：缺的写、地址变了的改、
+        不要的删（只删本程序写的）。返回（写了几个, 删了几个）。同步函数，调用方放到线程里跑。"""
+        want = {p: label for label in labels if (p := self.version_path(strm, label, style)) is not None}
+        removed = 0
+        for p in self.own_versions(strm, v["slug"]):
+            if p not in want:
+                p.unlink(missing_ok=True)
+                removed += 1
+        wrote = sum(write_atomic(p, (self.play_url(v, label) + "\n").encode()) for p, label in want.items())
+        return wrote, removed
 
     def library_root(self, lib: dict) -> Path:
         """输出库目录：相对路径挂在输出根目录下，绝对路径原样使用。"""
@@ -157,13 +215,16 @@ class OutputWriter:
         base.parent.mkdir(parents=True, exist_ok=True)
         strm = base.with_name(base.name + ".strm")
         if old_strm and Path(old_strm) != strm:
-            self._relocate(Path(old_strm), base, keep_dirs)
+            self._relocate(Path(old_strm), base, keep_dirs, v["slug"])
         write_atomic(strm, url)
         if self.store.current.write_nfo and v.get("detail_at") and not lib.get("external_dir"):
             write_atomic(base.with_name(base.name + ".nfo"), build_nfo(v).encode())
         return strm
 
-    def _relocate(self, old_strm: Path, new_base: Path, keep_dirs: frozenset[Path]) -> None:
+    def _relocate(self, old_strm: Path, new_base: Path, keep_dirs: frozenset[Path], slug: str) -> None:
+        """搬到新位置：nfo、封面搬过去；旧的 strm 和多画质版本删掉（版本由调用方在新位置重新对齐）。"""
+        for p in self.own_versions(old_strm, slug):
+            p.unlink(missing_ok=True)
         old_base = old_strm.with_name(old_strm.name.removesuffix(".strm"))
         for suffix in OUTPUT_SUFFIXES:
             src = old_base.with_name(old_base.name + suffix)
@@ -176,11 +237,15 @@ class OutputWriter:
                 shutil.move(src, dst)
         self.remove_empty_dirs(old_strm.parent, keep_dirs)
 
-    def remove(self, strm: Path, keep_dirs: frozenset[Path] = frozenset(), strm_only: bool = False) -> None:
-        """删除一部影片在某个库里的全部输出文件（只删本程序生成的文件）。
+    def remove(self, strm: Path, keep_dirs: frozenset[Path] = frozenset(), strm_only: bool = False,
+               slug: str = "") -> None:
+        """删除一部影片在某个库里的全部输出文件（只删本程序生成的文件），多画质版本一起删（给了 slug 时）。
 
         strm_only：外部整理库只删 strm，旁边的 nfo、图片是外部工具生成的，不动。
         """
+        if slug:
+            for p in self.own_versions(strm, slug):
+                p.unlink(missing_ok=True)
         base = strm.with_name(strm.name.removesuffix(".strm"))
         for suffix in (".strm",) if strm_only else OUTPUT_SUFFIXES:
             base.with_name(base.name + suffix).unlink(missing_ok=True)

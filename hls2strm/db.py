@@ -318,8 +318,13 @@ async def _migrate_v10(conn: aiosqlite.Connection) -> None:
         "CREATE TABLE stream_health (key TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at INTEGER NOT NULL)")
 
 
+async def _migrate_v11(conn: aiosqlite.Connection) -> None:
+    """输出库的多画质版本：空 = 不写；emby =「目录名 - 720p.strm」；suffix =「文件名-720p.strm」（mdcng 的写法）。"""
+    await conn.execute("ALTER TABLE libraries ADD COLUMN versions TEXT NOT NULL DEFAULT ''")
+
+
 MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
-              _migrate_v8, _migrate_v9, _migrate_v10]
+              _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")
@@ -758,35 +763,39 @@ class Database:
                 (url, expires, line_id, t, t, line_id),
             )
 
-    async def set_quality(self, source_id: int, line_id: int | None, q: Quality | None) -> None:
+    async def set_quality(self, source_id: int, line_id: int | None, q: Quality | None) -> bool:
         """记下探测到的画质，可信度低的不覆盖高的；q 为 None 表示探测过但没认出来（mp4 等），只记时间、过一阵再试。
-        线路的画质变了，源上跟着记各线路里最好的那份（挑源时用）。"""
+        线路的画质变了，源上跟着记各线路里最好的那份（挑源时用）。返回源上的各档画质变了没有（多画质版本要跟着改）。"""
         t = now()
         table, row_id = ("source_lines", line_id) if line_id else ("sources", source_id)
         async with self._tx():
             async with self.conn.execute(f"SELECT quality_src FROM {table} WHERE id=?", (row_id,)) as cur:
                 row = await cur.fetchone()
-            if row is None:
-                return
+            async with self.conn.execute("SELECT heights FROM sources WHERE id=?", (source_id,)) as cur:
+                before = await cur.fetchone()
+            if row is None or before is None:
+                return False
             if q is None or not q.heights or TRUST[q.src] < TRUST.get(row["quality_src"], 0):
                 await self.conn.execute(f"UPDATE {table} SET quality_at=? WHERE id=?", (t, row_id))
-                return
+                return False
+            heights = ",".join(map(str, q.heights))
             await self.conn.execute(
                 f"UPDATE {table} SET height=?, heights=?, quality_src=?, quality_at=? WHERE id=?",
-                (q.height, ",".join(map(str, q.heights)), q.src, t, row_id),
+                (q.height, heights, q.src, t, row_id),
             )
-            if not line_id:
-                return
-            async with self.conn.execute(
-                "SELECT heights, quality_src FROM source_lines WHERE source_id=? AND height>0 ORDER BY height DESC",
-                (source_id,),
-            ) as cur:
-                lines = await cur.fetchall()
-            heights = parse_heights([h for ln in lines for h in parse_heights(ln["heights"])])
-            await self.conn.execute(
-                "UPDATE sources SET height=?, heights=?, quality_src=?, quality_at=? WHERE id=?",
-                (heights[0], ",".join(map(str, heights)), lines[0]["quality_src"], t, source_id),
-            )
+            if line_id:
+                async with self.conn.execute(
+                    "SELECT heights, quality_src FROM source_lines WHERE source_id=? AND height>0 ORDER BY height DESC",
+                    (source_id,),
+                ) as cur:
+                    lines = await cur.fetchall()
+                merged = parse_heights([h for ln in lines for h in parse_heights(ln["heights"])])
+                heights = ",".join(map(str, merged))
+                await self.conn.execute(
+                    "UPDATE sources SET height=?, heights=?, quality_src=?, quality_at=? WHERE id=?",
+                    (merged[0], heights, lines[0]["quality_src"], t, source_id),
+                )
+            return heights != before["heights"]
 
     async def use_line(self, source_id: int, line: dict) -> None:
         """改用这条线路已缓存的直链。"""
@@ -1037,12 +1046,13 @@ class Database:
         return _library_row(await self._one("SELECT * FROM libraries WHERE id=?", (library_id,)))
 
     async def create_library(self, name: str, dir: str, path_template: str = "", rule: dict | None = None,
-                             external_dir: str = "", sources: list[int] = (), excludes: list[int] = ()) -> int:
+                             external_dir: str = "", sources: list[int] = (), excludes: list[int] = (),
+                             versions: str = "") -> int:
         cur = await self._write(
-            "INSERT INTO libraries(name, dir, path_template, rule, external_dir, sources, excludes, created_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO libraries(name, dir, path_template, rule, external_dir, sources, excludes, versions, "
+            "created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (name, dir, path_template, json.dumps(rule, ensure_ascii=False) if rule else "", external_dir,
-             json.dumps(list(sources)), json.dumps(list(excludes)), now()),
+             json.dumps(list(sources)), json.dumps(list(excludes)), versions, now()),
         )
         return cur.lastrowid
 
@@ -1166,7 +1176,8 @@ class Database:
         conds.append(f"(o.via='source' AND {source_cond})")
         params += sources
         rows = await self._all(
-            f"SELECT o.video_id, o.strm_path FROM outputs o WHERE o.library_id=? AND ({' OR '.join(conds)})", params
+            f"""SELECT o.video_id, o.strm_path, v.slug FROM outputs o JOIN videos v ON v.id=o.video_id
+                WHERE o.library_id=? AND ({' OR '.join(conds)})""", params
         )
         return [dict(r) for r in rows]
 

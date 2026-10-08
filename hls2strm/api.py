@@ -464,6 +464,7 @@ class LibraryBody(BaseModel):
     external_dir: str = ""
     sources: list[int] = []
     excludes: list[int] = []
+    versions: str = ""  # 多画质版本文件：空 = 不写，emby / suffix 是命名方式
 
 
 @router.get("/libraries")
@@ -482,7 +483,8 @@ async def list_libraries(request: Request):
 async def create_library(body: LibraryBody, request: Request):
     try:
         return await _ctx(request).engine.create_library(body.name, body.dir, body.path_template, body.rule,
-                                                         body.external_dir, body.sources, body.excludes)
+                                                         body.external_dir, body.sources, body.excludes,
+                                                         body.versions)
     except ValueError as err:
         raise HTTPException(400, str(err)) from None
     except sqlite3.IntegrityError:
@@ -493,7 +495,8 @@ async def create_library(body: LibraryBody, request: Request):
 async def update_library(lib_id: int, body: LibraryBody, request: Request):
     try:
         return await _ctx(request).engine.update_library(lib_id, body.name, body.dir, body.path_template, body.rule,
-                                                         body.external_dir, body.sources, body.excludes)
+                                                         body.external_dir, body.sources, body.excludes,
+                                                         body.versions)
     except ValueError as err:
         raise HTTPException(400, str(err)) from None
     except sqlite3.IntegrityError:

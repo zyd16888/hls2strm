@@ -30,7 +30,8 @@ from .fetcher import Blocked, FetchError, Fetcher, NotFound, close_stream
 from .observability import Metrics
 from .parser import ParseError, VideoGone
 from .health import HealthTracker, host_key
-from .quality import QualityProber, from_master, label as quality_label, needed as quality_needed
+from .quality import QualityProber, filter_master, from_master, label as quality_label, needed as quality_needed
+from .quality import parse_heights, parse_label, tier as quality_tier
 from .sites.hosts import ts_start
 from .sites import SITES, Site, SourceDetail, StreamTraits, find_by_code, get_site
 
@@ -96,12 +97,13 @@ class Resolver:
     # ---- 挑源 ----
 
     def rank(self, sources: list[dict], *, site: str | None = None, direct_only: bool = False,
-             remote: bool = False) -> list[dict]:
+             remote: bool = False, want: int | None = None) -> list[dict]:
         """可用的源按播放优先顺序排列：字幕偏好 → 不在失败冷却中 →（按连通性挑源时）播放站的连通性
         →（直连优先时）能 302 的 → 画质 → 站点优先级 → 有现成地址。画质优先关掉时，画质排在站点优先级后面。
 
         字幕不回退（subtitle_fallback 关）时，只留首选里现有的那一档字幕。
         remote：播放器是外网客户端（网关），绑了本服务出口 IP 的直链不算能 302。
+        want：要指定档位（/play/{slug}@720p.m3u8）时，有这一档的源排前面，不管「画质优先」开没开。
         """
         s = self.store.current
         t = time.time()
@@ -123,12 +125,26 @@ class Resolver:
         if out and not s.subtitle_fallback:
             best = min(tier(x) for x in out)
             out = [x for x in out if tier(x) == best]
-        q = self.quality_key
         health = self.health.source_tier if s.health_rank else lambda _: 0
+
+        def quality(x: dict) -> tuple:
+            if want is not None:
+                return self.want_key(x, want)
+            return self.quality_key(x["height"]) if s.quality_first else ()
+
         return sorted(out, key=lambda x: (tier(x), source_cooldown(x) > t, health(get_site(x["site"])),
                                           s.prefer_direct and not self._can_302(get_site(x["site"]), remote),
-                                          q(x["height"]) if s.quality_first else (), s.site_rank(x["site"]),
-                                          not self._fresh(x, 60), q(x["height"])))
+                                          quality(x), s.site_rank(x["site"]), not self._fresh(x, 60),
+                                          self.quality_key(x["height"])))
+
+    def want_key(self, row: dict, want: int) -> tuple[int, int]:
+        """要指定档位时的排序键：有这一档的在前，其次是比它低里最接近的，最后是比它高的。"""
+        tiers = ({quality_tier(h) for h in parse_heights(row["heights"])}
+                 or {quality_tier(row["height"] or self.store.current.quality_unknown or 720)})
+        if want in tiers:
+            return 0, 0
+        lower = [x for x in tiers if x < want]
+        return (1, want - max(lower)) if lower else (2, min(tiers) - want)
 
     def quality_key(self, height: int | None) -> tuple[bool, int]:
         """画质的排序键：越清楚越靠前；设了上限时，超过上限的排在不超过的后面（超得越多越靠后）。
@@ -171,7 +187,7 @@ class Resolver:
         return (src["stream_expires"] or 0) - time.time() >= need
 
     def rank_lines(self, site: Site, lines: list[dict], *, want: str | None = None,
-                   direct_only: bool = False, remote: bool = False) -> list[dict]:
+                   direct_only: bool = False, remote: bool = False, height: int | None = None) -> list[dict]:
         """一个源的线路按设置排好：启用的、支持的；不在失败冷却中的在前，（按连通性挑源时）播放站连通性好的在前，
         （直连优先时）能 302 的在前，画质优先时再比画质，最后按设置里的线路顺序。"""
         s = self.store.current
@@ -196,9 +212,13 @@ class Resolver:
         def health(ln: dict) -> int:
             return self.health.tier(host_key(site, ln)) if s.health_rank else 0
 
+        def quality(ln: dict) -> tuple:
+            if height is not None:
+                return self.want_key(ln, height)
+            return self.quality_key(ln["height"]) if s.quality_first else ()
+
         return sorted(out, key=lambda ln: (source_cooldown(ln) > t, health(ln), s.prefer_direct and not can_302(ln),
-                                           self.quality_key(ln["height"]) if s.quality_first else (),
-                                           cfg.line_rank(ln["line"])))
+                                           quality(ln), cfg.line_rank(ln["line"])))
 
     def _need(self, v: dict, min_remaining: int | None) -> int:
         if min_remaining is not None:
@@ -208,22 +228,23 @@ class Resolver:
     # ---- 取地址 ----
 
     async def resolve(self, slug: str, *, min_remaining: int | None = None, site: str | None = None,
-                      line: str | None = None, direct_only: bool = False, remote: bool = False) -> Resolved:
+                      line: str | None = None, direct_only: bool = False, remote: bool = False,
+                      want: int | None = None) -> Resolved:
         """挑一个能用的源并返回它的新鲜地址；依次尝试，全部失败才报错。line 只在指定了 site 时有效。
-        拿到地址后，还不知道画质的在后台顺手探测（只请求 CDN）。"""
+        want：要的档位，有这一档的源、线路优先。拿到地址后，还不知道画质的在后台顺手探测（只请求 CDN）。"""
         r = await self._resolve(slug, min_remaining=min_remaining, site=site, line=line, direct_only=direct_only,
-                                remote=remote)
+                                remote=remote, want=want)
         if self.store.current.quality_capture and quality_needed(r.line or r.source):
             self.quality.spawn(r.source["id"], r.line["id"] if r.line else None, r.url, r.traits.headers)
         return r
 
     async def _resolve(self, slug: str, *, min_remaining: int | None, site: str | None, line: str | None,
-                       direct_only: bool, remote: bool) -> Resolved:
+                       direct_only: bool, remote: bool, want: int | None) -> Resolved:
         v = await self.db.get_video(slug.lower())
         if v is None:
             v = await self.discover(slug.lower())
         sources = await self.db.get_sources(v["id"])
-        ranked = self.rank(sources, site=site, direct_only=direct_only, remote=remote)
+        ranked = self.rank(sources, site=site, direct_only=direct_only, remote=remote, want=want)
         timeout = self.store.current.resolve_timeout
         deadline = time.monotonic() + timeout
         if not ranked:
@@ -243,7 +264,7 @@ class Resolver:
             label = f"{get_site(src['site']).label} {src['key']}"
             try:
                 r = await asyncio.wait_for(self._ensure(v, src, self._need(v, min_remaining), line=line if site else None,
-                                                        direct_only=direct_only, remote=remote), left)
+                                                        direct_only=direct_only, remote=remote, height=want), left)
             except (NotFound, VideoGone) as e:
                 await self.db.mark_source_gone(src["site"], src["key"])
                 gone += 1
@@ -354,11 +375,11 @@ class Resolver:
         raise NotFound(slug)
 
     async def _ensure(self, v: dict, src: dict, need: int, stale: str | None = None, *, line: str | None = None,
-                      direct_only: bool = False, remote: bool = False) -> Resolved:
+                      direct_only: bool = False, remote: bool = False, height: int | None = None) -> Resolved:
         """保证这个源有剩余有效期 ≥ need 的地址；stale 是调用方确认已失效的地址，缓存仍是它时强制刷新。"""
         site = get_site(src["site"])
         if site.multi_line:
-            return await self._ensure_lines(v, src, site, need, stale, line, direct_only, remote)
+            return await self._ensure_lines(v, src, site, need, stale, line, direct_only, remote, height)
         if stale is None and self._fresh(src, need):
             self.metrics.inc("play_cache_hit")
             return Resolved(v, src, site)
@@ -387,7 +408,8 @@ class Resolver:
         return Resolved(v, src, site)
 
     async def _ensure_lines(self, v: dict, src: dict, site: Site, need: int, stale: str | None,
-                            want: str | None, direct_only: bool, remote: bool = False) -> Resolved:
+                            want: str | None, direct_only: bool, remote: bool = False,
+                            height: int | None = None) -> Resolved:
         """多线路站点：按顺序找一条有新鲜直链的线路，没有就逐条现取；全失败时重抓一次详情（线路数据可能换了）再试。"""
         lock = self._locks.setdefault(src["id"], asyncio.Lock())
         errors: list[str] = []
@@ -399,7 +421,8 @@ class Resolver:
                 refreshed = True
                 lines = await self.db.get_lines(src["id"])
             for _ in range(2):
-                for ln in self.rank_lines(site, lines, want=want, direct_only=direct_only, remote=remote):
+                for ln in self.rank_lines(site, lines, want=want, direct_only=direct_only, remote=remote,
+                                          height=height):
                     traits = site.line_traits(ln["line"], ln["host"])
                     fresh = ln["stream_url"] and (not traits.expires or (ln["stream_expires"] or 0) - time.time() >= need)
                     if fresh and ln["stream_url"] != stale:
@@ -434,7 +457,7 @@ class Resolver:
         self.health.record(host_key(site, {"line": ln["line"], "host": hs.host}), True)
         await self.db.set_line_stream(ln["id"], hs.url, hs.expires, hs.host, hs.referer, use=use)
         if hs.quality is not None:
-            await self.db.set_quality(src["id"], ln["id"], hs.quality)
+            await self.quality.save(src["id"], ln["id"], hs.quality)
 
     async def line_stream(self, v: dict, src: dict, ln: dict, need: int = 60) -> Resolved:
         """指定线路的新鲜地址（探测画质、检测连通性用）：有没过期的现成地址就不访问播放站；
@@ -530,17 +553,45 @@ async def _resolve_or_http(request: Request, slug: str, **kw) -> Resolved:
         raise HTTPException(502, f"解析播放地址失败：{e}") from None
 
 
+def _parse_name(name: str) -> tuple[str, int | None]:
+    """'ipzz-983.m3u8' → ('ipzz-983', None)；'ipzz-983@720p.m3u8' → ('ipzz-983', 720)。认不出的 404。"""
+    slug, _, version = name.lower().removesuffix(".m3u8").partition("@")
+    want = parse_label(version) if version else None
+    if not SLUG_RE.fullmatch(slug) or (version and want is None):
+        raise HTTPException(404, f"无法识别的影片：{name}")
+    return slug, want
+
+
+def _variant_wanted(ctx, r: Resolved, want: int | None) -> bool:
+    """要不要从多档的主播放列表里挑一档：指定了档位，或者设置是只给最高一档；源知道自己有不止一档才挑。"""
+    if want is None and ctx.store.current.variant_mode != "highest":
+        return False
+    row = r.line or r.source
+    return _is_hls(r.url) and len({quality_tier(h) for h in parse_heights(row["heights"])}) > 1
+
+
+async def _pick_variant(ctx, r: Resolved, want: int | None) -> str:
+    """302 用：多档的主播放列表挑出要的那一档（没指定就最高档）的子清单地址；不用挑、读不到的给主播放列表地址。"""
+    if not _variant_wanted(ctx, r, want):
+        return r.url
+    try:
+        text = (await ctx.fetcher.get_bytes(r.url, headers=r.traits.headers)).decode("utf-8", "replace")
+    except (FetchError, NotFound):
+        return r.url
+    picked = filter_master(text, want)
+    return urljoin(r.url, picked[1]) if picked and picked[1] else r.url
+
+
 @router.api_route("/play/{name}", methods=["GET", "HEAD"])
 async def play(name: str, request: Request, t: str = "", proxy: int = 0, src: str = "", line: str = ""):
     """proxy=1 强制中转（网页试播用）；src=站点 只用这个站点的源，line=线路 再限定线路。
+    {slug}@720p.m3u8 要指定档位（多画质版本的 strm 用）：有这一档的源优先，多档的主播放列表只给这一档。
     浏览器跨域请求（带 Origin）也走中转并返回 CORS 头。"""
     ctx = _ctx(request)
     _check_token(request, t)
-    slug = name.lower().removesuffix(".m3u8")
-    if not SLUG_RE.fullmatch(slug):
-        raise HTTPException(404)
+    slug, want = _parse_name(name)
     ctx.metrics.inc("play_requests")
-    r = await _resolve_or_http(request, slug, site=src or None, line=line or None)
+    r = await _resolve_or_http(request, slug, site=src or None, line=line or None, want=want)
     s = ctx.store.current
     ua = request.headers.get("user-agent", "")
     origin = request.headers.get("origin", "")
@@ -548,14 +599,14 @@ async def play(name: str, request: Request, t: str = "", proxy: int = 0, src: st
     blocked_uas = s.proxy_user_agents if r.traits.ua_block else []
     proxied = (bool(proxy) or s.play_mode == "proxy" or not r.traits.direct
                or bool(direct_blocker(blocked_uas, ua, origin, fetch_mode)))
-    log.info("播放 %s：%s %s（%s，客户端 %s，UA %s）", slug, _label(r), "中转" if proxied else "302", _left(r),
-             request.client.host if request.client else "?", ua[:60])
+    log.info("播放 %s%s：%s %s（%s，客户端 %s，UA %s）", slug, f"（要 {quality_label(want)}）" if want else "", _label(r),
+             "中转" if proxied else "302", _left(r), request.client.host if request.client else "?", ua[:60])
     if proxied:
         ctx.metrics.inc("play_proxy")
-        resp = await (_proxy_playlist(request, r, t) if _is_hls(r.url) else _proxy_file(request, r))
+        resp = await (_proxy_playlist(request, r, t, want) if _is_hls(r.url) else _proxy_file(request, r))
     else:
         ctx.metrics.inc("play_redirect")
-        resp = RedirectResponse(r.url, status_code=302)
+        resp = RedirectResponse(await _pick_variant(ctx, r, want), status_code=302)
     if origin:
         resp.headers.update(CORS_HEADERS)
     return resp
@@ -580,7 +631,8 @@ async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin:
     直连的源都取地址失败、或者站点拦截中，有公网中转地址就给它（中转时还能用别的源），不报错：
     网关遇到错误会回退去反代 Emby，Emby 再 302 到 strm 里的内网地址，外网客户端访问不到。
     ua / origin / fetch_mode 只记日志，方便排查。
-    name 可以是 slug、slug.m3u8，也可以是网关 objectKey 原样（如 play/ipzz-983.m3u8），取最后一段。
+    name 可以是 slug、slug.m3u8，也可以是网关 objectKey 原样（如 play/ipzz-983.m3u8），取最后一段；
+    多画质版本的 strm 是 ipzz-983@720p.m3u8，挑有这一档的源，多档的主播放列表给这一档的子清单。
     """
     ctx = _ctx(request)
     s = ctx.store.current
@@ -590,15 +642,13 @@ async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin:
     given = auth.removeprefix("Bearer ").strip() if auth.startswith("Bearer ") else request.query_params.get("token", "")
     if not secrets.compare_digest(given.encode(), s.resolve_token.encode()):
         raise HTTPException(401, "resolve_token 错误")
-    slug = name.rsplit("/", 1)[-1].lower().removesuffix(".m3u8")
-    if not SLUG_RE.fullmatch(slug):
-        raise HTTPException(404, f"无法识别的影片：{name}")
+    slug, want = _parse_name(name.rsplit("/", 1)[-1])
     mode = mode or s.resolve_mode
     if mode not in ("auto", "redirect", "proxy"):
         raise HTTPException(400, f"mode 只能是 auto、redirect、proxy：{mode}")
     ctx.metrics.inc("resolve_requests")
     extra = f"，UA {ua[:60]}" + (f"，fetch_mode {fetch_mode}" if fetch_mode else "")
-    relay = _relay_url(s, slug) if s.resolve_proxy_url else ""
+    relay = _relay_url(s, slug, want) if s.resolve_proxy_url else ""
 
     def relayed(why: str, duration: int | None = None) -> dict:
         log.info("resolve %s：%s，返回本服务中转地址（%s%s）", slug, why, mode, extra)
@@ -611,11 +661,11 @@ async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin:
     resolver = ctx.resolver
     try:
         if mode == "auto" and relay:
-            r = await resolver.resolve(slug, min_remaining=min_remaining, remote=True)
+            r = await resolver.resolve(slug, min_remaining=min_remaining, remote=True, want=want)
             if not (r.traits.direct and not r.traits.ip_bound):
                 return relayed(f"挑中 {_label(r)} 要中转", r.video.get("duration"))
         else:
-            r = await resolver.resolve(slug, min_remaining=min_remaining, direct_only=True, remote=True)
+            r = await resolver.resolve(slug, min_remaining=min_remaining, direct_only=True, remote=True, want=want)
     except NoDirectSource:
         if not relay:
             log.info("resolve %s：只有要中转的源，没设公网中转地址，返回 409（%s）", slug, extra.lstrip("，"))
@@ -632,12 +682,12 @@ async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin:
         raise HTTPException(502, f"解析播放地址失败：{e}") from None
     expires = r.expires or 0
     log.info("resolve %s：返回 %s 的 CDN 地址（%s，%s%s）", slug, _label(r), _left(r), mode, extra)
-    return {"slug": slug, "url": r.url, "expires_at": expires,
+    return {"slug": slug, "url": await _pick_variant(ctx, r, want), "expires_at": expires,
             "ttl": max(0, int(expires - time.time())), "duration": r.video.get("duration")}
 
 
-def _relay_url(s, slug: str) -> str:
-    url = f"{s.resolve_proxy_url}/play/{slug}.m3u8?proxy=1"
+def _relay_url(s, slug: str, want: int | None = None) -> str:
+    url = f"{s.resolve_proxy_url}/play/{slug}{'@' + quality_label(want).lower() if want else ''}.m3u8?proxy=1"
     return url + (f"&t={quote(s.play_token)}" if s.play_token else "")
 
 
@@ -756,7 +806,7 @@ async def _proxy_file(request: Request, r: Resolved) -> Response:
                              media_type=resp.headers.get("content-type") or "video/mp4")
 
 
-async def _proxy_playlist(request: Request, r: Resolved, t: str) -> Response:
+async def _proxy_playlist(request: Request, r: Resolved, t: str, want: int | None = None) -> Response:
     ctx = _ctx(request)
     try:
         raw = await ctx.fetcher.get_bytes(r.url, headers=r.traits.headers)
@@ -768,7 +818,9 @@ async def _proxy_playlist(request: Request, r: Resolved, t: str) -> Response:
     body = raw.decode("utf-8", "replace")
     row = r.line or r.source
     if (found := from_master(body)) is not None and row["heights"] != ",".join(map(str, found.heights)):
-        await ctx.db.set_quality(r.source["id"], r.line["id"] if r.line else None, found)  # 多码率的源记下各档，挑源时用
+        await ctx.resolver.quality.save(r.source["id"], r.line["id"] if r.line else None, found)  # 多码率的源记下各档，挑源时用
+    if (want is not None or ctx.store.current.variant_mode == "highest") and (picked := filter_master(body, want)):
+        body = picked[0]  # 只给要的那一档（没指定就最高档）
     # /play/{slug}.m3u8 回到 /hls/{源 id}/：相对地址解析，不依赖对外地址的写法
     text = rewrite_playlist(body, r.url, root, f"../hls/{r.source['id']}/", q, r.traits.disguised_segments)
     return Response(text, media_type="application/vnd.apple.mpegurl")

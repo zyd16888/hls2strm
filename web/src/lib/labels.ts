@@ -58,8 +58,15 @@ export const STRM_KINDS: Record<string, string> = {
   ours: "本服务格式",
   cdn: "CDN 直链",
   named: "文件名识别",
+  version: "多画质版本",
   other: "其他来源",
   invalid: "无效",
+};
+
+export const VERSION_STYLES: Record<string, string> = {
+  "": "不写",
+  emby: "Emby 风格：目录名 - 720p.strm",
+  suffix: "后缀风格：文件名-720p.strm（和 mdcng 一样）",
 };
 
 export const SUBTITLES: Record<string, string> = { zh: "中文字幕", en: "英文字幕", "": "无字幕" };
@@ -69,6 +76,11 @@ export const PLAY_MODES: Record<string, string> = {
   redirect: "302 跳转（ffmpeg 类客户端自动中转）",
   proxy: "全部中转",
   direct: "直写 CDN 地址（仅调试）",
+};
+
+export const VARIANT_MODES: Record<string, string> = {
+  highest: "只给最高一档（画质优先）",
+  all: "全部给播放器，按网速自适应",
 };
 
 export const RESOLVE_MODES: Record<string, string> = {

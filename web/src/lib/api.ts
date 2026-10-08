@@ -353,6 +353,8 @@ export interface Library {
   external_dir: string;
   external_root: string;
   root: string;
+  /** 多画质版本文件：空 = 不写，emby / suffix 是命名方式 */
+  versions: "" | "emby" | "suffix";
   sources: number[];
   excludes: number[];
   videos: number;

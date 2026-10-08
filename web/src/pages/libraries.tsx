@@ -10,6 +10,7 @@ import { rewriteAll, runSubscription, verifyLibrary } from "@/lib/actions";
 import { api, type FacetItem, type FacetField, type Library, type Subscription } from "@/lib/api";
 import { fmtNum, fmtTime } from "@/lib/format";
 import { useLibraries, useMeta, useRun, useStatus, useSubscriptions } from "@/lib/queries";
+import { VERSION_STYLES } from "@/lib/labels";
 import { navigate } from "@/lib/route";
 import { subState } from "./overview";
 
@@ -93,6 +94,13 @@ function LibrariesPanel() {
                   <div className="mt-1 flex items-center gap-1.5">
                     <Chip tone="info">外部整理</Chip>
                     <Mono className="text-muted">{l.external_root}</Mono>
+                  </div>
+                )}
+                {l.versions && (
+                  <div className="mt-1">
+                    <Chip tone="info" title={VERSION_STYLES[l.versions]}>
+                      多画质版本
+                    </Chip>
                   </div>
                 )}
               </Td>
@@ -187,6 +195,7 @@ function LibraryForm({ lib, libs, onDone }: { lib: Library | null; libs: Library
     dir: lib?.dir ?? "",
     path_template: lib?.path_template ?? "",
     external_dir: lib?.external_dir ?? "",
+    versions: lib?.versions ?? "",
     sources: lib?.sources ?? [],
     excludes: lib?.excludes ?? [],
   });
@@ -256,6 +265,19 @@ function LibraryForm({ lib, libs, onDone }: { lib: Library | null; libs: Library
         </Field>
         <Field label="外部整理目录" hint="交给 mdcng 等工具移动、刮削时，填它的整理目标；留空由本服务管理">
           <Input value={f.external_dir} onChange={e => setF({ ...f, external_dir: e.target.value })} placeholder="/media/jable-mdc/中文字幕" />
+        </Field>
+        <Field
+          label="多画质版本"
+          hint="一部片有好几档画质时，在主 strm 旁边写每一档的 strm，在 Emby / fyms 里能选版本。外部整理库等外部工具整理好以后再写。改了会排一次重写"
+          className="sm:col-span-2"
+        >
+          <Select value={f.versions} onChange={e => setF({ ...f, versions: e.target.value as Library["versions"] })}>
+            {Object.entries(VERSION_STYLES).map(([k, v]) => (
+              <option key={k} value={k}>
+                {v}
+              </option>
+            ))}
+          </Select>
         </Field>
       </div>
       {others.length > 0 && (

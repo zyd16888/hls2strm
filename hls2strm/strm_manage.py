@@ -2,6 +2,7 @@
 
 扫描把目录下每个 .strm 分类：
   ours     本服务格式：…/play/{slug}.m3u8（域名不限）
+  version  本服务写的多画质版本：…/play/{slug}@720p.m3u8，跟着主 strm 走，不纳管、不当成影片的主文件
   cdn      CDN 直链：…/hls/{token}/{expires}/{n}/{videoId}/{videoId}.m3u8
            或 …&expires={expires}&…/vod/{n}/{videoId}/{videoId}.m3u8（大概率已过期）
   named    URL 不认识，但文件名或父目录里有番号（可能是别的片源，纳管需手动勾选）
@@ -26,7 +27,7 @@ from urllib.parse import urlsplit
 
 from .fetcher import NotFound
 from .parser import VideoGone, hls_expires
-from .writer import write_atomic
+from .writer import VERSION_PATH_RE, write_atomic
 
 if TYPE_CHECKING:
     from .engine import Engine
@@ -83,6 +84,8 @@ def classify(path: Path, content: str, now: float) -> StrmInfo:
     parts = urlsplit(url)
     prefix = url_prefix(url)
     if parts.scheme in ("http", "https") and parts.netloc:
+        if m := VERSION_PATH_RE.search(parts.path):
+            return StrmInfo("version", url, prefix, m.group(1).lower())
         if m := OURS_RE.search(parts.path):
             return StrmInfo("ours", url, prefix, m.group(1).lower())
         if m := CDN_RE.search(parts.path):
@@ -399,6 +402,10 @@ class StrmManager:
                 result["missing"] += 1
         await self.db.set_output_paths(lib["id"], updates)
         result["updated"] = len(updates)
+        if lib["versions"]:  # 外部工具刚整理好的，在整理后的位置旁边补上多画质版本
+            for path, vid in updates:
+                if (v := await self.db.get_video_by_id(vid)) is not None:
+                    await self.e.sync_versions(v, lib, path)
         result["extra"] = sum(1 for vid, paths in in_ext.items() if paths and vid not in seen)
         log.info("同步位置「%s」：检查 %d 部，更新路径 %d，找不到 %d，外部整理目录里重复 %d，不在本库 %d",
                  lib["name"], result["checked"], result["updated"], result["missing"], result["duplicates"],

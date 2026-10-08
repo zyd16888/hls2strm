@@ -185,6 +185,15 @@ class Settings(BaseModel):
         description="直连优先：能 302 的源排在要本服务中转的前面（省本服务带宽），画质其次；"
                     "关掉则画质优先，更清楚的源要中转也用它",
     )
+    variant_mode: Literal["highest", "all"] = Field(
+        "highest",
+        description="多码率的源（MissAV、VidHide 等的主播放列表里有好几档）给播放器哪些档：highest 只给最高一档"
+                    "（画质优先；网络差时播放器没法自己降档）；all 整个交给播放器按网速自适应",
+    )
+    version_min_height: int = Field(
+        480, ge=0, le=4320,
+        description="多画质版本（输出库里开了才写）：低于这一档的不单独写版本文件；一部片至少有两档才写",
+    )
     quality_capture: bool = Field(
         True,
         description="顺手探测画质：抓详情、播放拿到播放地址时读一次播放列表认出分辨率；只请求 CDN，不多访问源站",

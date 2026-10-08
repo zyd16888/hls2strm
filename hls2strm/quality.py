@@ -14,6 +14,7 @@ import asyncio
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import urljoin
@@ -52,6 +53,62 @@ def label(height: int | None) -> str:
     if not height:
         return "未知"
     return "4K" if height >= 2000 else f"{height}p"
+
+
+STANDARD_TIERS = (2160, 1440, 1080, 720, 480, 360, 240)
+
+
+def tier(height: int) -> int:
+    """归到常见档位：1920x800 这种宽银幕的算 720p 档。"""
+    return min(STANDARD_TIERS, key=lambda t: (abs(t - height), -t))
+
+
+def parse_label(text: str) -> int | None:
+    """'720p' / '1080' / '4k' → 档位；认不出返回 None。"""
+    s = text.strip().lower()
+    if s in ("4k", "uhd"):
+        return 2160
+    m = re.fullmatch(r"(\d{3,4})p?", s)
+    return tier(int(m.group(1))) if m else None
+
+
+def pick_tier(available: set[int], want: int | None) -> int:
+    """想要的档位：有就用它；没有用比它低里最高的；都比它高用最低的。want 为 None 取最高。"""
+    if want is None or want in available:
+        return max(available) if want is None else want
+    lower = [t for t in available if t < want]
+    return max(lower) if lower else min(available)
+
+
+def filter_master(text: str, want: int | None) -> tuple[str, str] | None:
+    """多码率主播放列表只留一档（want 档，没有就最接近的；None 取最高），返回（改好的播放列表, 这一档的子清单地址）。
+    不是主播放列表、只有一档、或者有的档没写分辨率时返回 None（原样用）。"""
+    lines = text.splitlines()
+    variants: list[tuple[int, int, int | None]] = []  # (STREAM-INF 行, 子清单行, 档位)
+    i = 0
+    while i < len(lines):
+        if not lines[i].startswith("#EXT-X-STREAM-INF"):
+            i += 1
+            continue
+        m = _RES_RE.search(lines[i])
+        j = i + 1
+        while j < len(lines) and (not lines[j].strip() or lines[j].startswith("#")):
+            j += 1
+        if j < len(lines):
+            variants.append((i, j, tier(int(m.group(1))) if m else None))
+        i = j + 1
+    tiers = {t for *_, t in variants}
+    if len(variants) < 2 or None in tiers:
+        return None
+    target = pick_tier(tiers, want)
+    drop: set[int] = set()
+    uri = ""
+    for i, j, t in variants:
+        if t == target:
+            uri = uri or lines[j].strip()
+        else:
+            drop.update(range(i, j + 1))
+    return "\n".join(ln for k, ln in enumerate(lines) if k not in drop) + "\n", uri
 
 
 def height_for_kbps(kbps: float) -> int:
@@ -135,9 +192,18 @@ class QualityProber:
     def __init__(self, db: Database, fetcher: Fetcher, concurrency: int = 2) -> None:
         self.db = db
         self.fetcher = fetcher
+        self.on_change: Callable[[int], Awaitable[None]] | None = None  # 源的各档画质变了（参数是源 id）
         self._busy: set[tuple[int, int | None]] = set()
         self._tasks: set[asyncio.Task] = set()
         self._sem = asyncio.Semaphore(concurrency)
+
+    async def save(self, source_id: int, line_id: int | None, q: Quality | None) -> None:
+        """记下画质；源的各档变了就通知（多画质版本文件要跟着改）。"""
+        if await self.db.set_quality(source_id, line_id, q) and self.on_change is not None:
+            try:
+                await self.on_change(source_id)
+            except Exception:
+                log.exception("画质变了之后更新多画质版本出错（源 #%d）", source_id)
 
     async def probe_and_save(self, source_id: int, line_id: int | None, url: str,
                              headers: dict | None = None) -> Quality | None:
@@ -155,7 +221,7 @@ class QualityProber:
                 except Exception as e:  # 多半在后台跑，出什么错都只记日志，不影响播放
                     log.warning("探测画质出错 %s：%s: %s", url, type(e).__name__, e)
                     return None
-                await self.db.set_quality(source_id, line_id, q)
+                await self.save(source_id, line_id, q)
                 return q
         finally:
             self._busy.discard(key)

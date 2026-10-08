@@ -34,12 +34,12 @@ from .parser import ParseError, VideoGone, m3u8_duration
 from .health import host_key, host_label, measure
 from .play import Resolver
 from .quality import RETRY_AFTER as QUALITY_RETRY_AFTER, SOURCE_NAMES as QUALITY_SOURCES, Quality
-from .quality import label as quality_label, needed as quality_needed, parse_heights
+from .quality import label as quality_label, needed as quality_needed, parse_heights, tier as quality_tier
 from .sites.hosts import MP4_HOSTS
 from .rules import describe_rule, match_rule, normalize_rule
 from .sites import SITES, Site, SourceDetail, SourceItem, find_by_code, get_site
 from .strm_manage import StrmManager
-from .writer import OutputWriter, cover_path
+from .writer import VERSION_STYLES, OutputWriter, cover_path
 
 log = logging.getLogger(__name__)
 
@@ -74,6 +74,7 @@ class Engine:
         self.store = store
         self.metrics = metrics
         self.resolver = Resolver(db, fetcher, store, metrics)  # 播放和画质探测共用：同一个源取地址只抓一次
+        self.resolver.quality.on_change = self._quality_changed
         self.snapshot_dir = boot.data_dir / "snapshots"
         self.paused = False
         self.blocked: dict[str, float] = {}  # 站点 -> 被拦截到什么时候
@@ -339,7 +340,9 @@ class Engine:
         return lib
 
     async def _output_one(self, v: dict, library_id: int, *, cover: bool, old_strm: str | None = None,
-                          settle: bool = False) -> None:
+                          settle: bool = False, versions: bool | None = None) -> None:
+        """写一部影片在某个库里的输出。versions：要不要对齐多画质版本文件，默认库开了才对齐；
+        重写输出时传 True，库关了也清掉以前写的。"""
         lib = self._library(library_id)
         if old_strm is None:
             out = await self.db.get_output(v["id"], library_id)
@@ -357,6 +360,45 @@ class Engine:
                         if o["library_id"] != library_id and o["strm_path"]]
             cover_done = await self.writer.write_cover(self.fetcher, v, strm, siblings)
         await self.db.set_output(v["id"], library_id, str(strm), cover_done)
+        if versions or (versions is None and lib["versions"]):
+            await self.sync_versions(v, lib, str(strm))
+
+    # ---- 多画质版本 ----
+
+    async def version_labels(self, video_id: int) -> list[str]:
+        """这部片要写哪些画质版本：各可用源实际有的档位（不低于「多画质版本最低档」），至少两档才写，最多 7 档
+        （Emby 的版本列表最多显示 8 个，主 strm 占一个）。"""
+        s = self.store.current
+        tiers: set[int] = set()
+        for src in await self.db.get_sources(video_id):
+            if src["status"] == "active" and src["site"] in SITES and s.site(src["site"]).enabled:
+                tiers |= {quality_tier(h) for h in parse_heights(src["heights"])}
+        picked = sorted((t for t in tiers if t >= s.version_min_height), reverse=True)[:7]
+        return [quality_label(t) for t in picked] if len(picked) >= 2 else []
+
+    async def sync_versions(self, v: dict, lib: dict, strm_path: str) -> None:
+        """对齐主 strm 旁边的多画质版本文件（库没开就清掉以前写的）。
+        外部整理库：strm 还在收件目录（外部工具还没整理）时不动，整理好以后在整理后的位置旁边补。"""
+        ext = self.writer.external_root(lib)
+        strm = Path(strm_path)
+        if not strm_path or (ext is not None and ext not in strm.parents):
+            return
+        labels = await self.version_labels(v["id"]) if lib["versions"] else []
+        wrote, removed = await asyncio.to_thread(self.writer.sync_versions, v, strm, labels, lib["versions"])
+        if wrote or removed:
+            log.info("多画质版本 %s（%s）：写 %d 个、删 %d 个，现有 %s", v["slug"], lib["name"], wrote, removed,
+                     "、".join(labels) or "无")
+
+    async def _quality_changed(self, source_id: int) -> None:
+        """某个源的各档画质变了：开了多画质版本的库里，这部片的版本文件跟着改。"""
+        src = await self.db.get_source(source_id)
+        v = await self.db.get_video_by_id(src["video_id"]) if src else None
+        if v is None:
+            return
+        for out in await self.db.get_outputs(v["id"]):
+            lib = self.libs.get(out["library_id"])
+            if lib and lib["versions"] and out["strm_path"]:
+                await self.sync_versions(v, lib, out["strm_path"])
 
     async def _output_all(self, v: dict, *, cover: bool) -> None:
         for out in await self.db.get_outputs(v["id"]):
@@ -657,8 +699,9 @@ class Engine:
             if out is None:
                 continue
             if out["strm_path"]:
+                v = await self.db.get_video_by_id(vid)
                 await asyncio.to_thread(self.writer.remove, Path(out["strm_path"]), self.keep_dirs(),
-                                        bool(lib["external_dir"]))
+                                        bool(lib["external_dir"]), v["slug"] if v else "")
             await self.db.delete_output(vid, library_id)
             removed += 1
         log.info("输出库「%s」：手动移出 %d 部", lib["name"], removed)
@@ -709,7 +752,7 @@ class Engine:
         async for v, out in self.db.iter_outputs(lib_id):
             if v["status"] != "active" or out["library_id"] not in self.libs:
                 continue
-            await self._output_one(v, out["library_id"], cover=False, old_strm=out["strm_path"])
+            await self._output_one(v, out["library_id"], cover=False, old_strm=out["strm_path"], versions=True)
             n += 1
             if n % 1000 == 0:
                 log.info("重写输出：已完成 %d 个", n)
@@ -882,7 +925,7 @@ class Engine:
             elif not should and out is not None and out["via"] == "rule":
                 if out["strm_path"]:
                     await asyncio.to_thread(self.writer.remove, Path(out["strm_path"]), self.keep_dirs(),
-                                            bool(lib["external_dir"]))
+                                            bool(lib["external_dir"]), v["slug"])
                 await self.db.delete_output(v["id"], lib["id"])
                 removed += 1
         return added, removed
@@ -933,7 +976,7 @@ class Engine:
         drop = await self.db.outputs_to_drop(lib["id"], lib["sources"], lib["excludes"])
         for out in drop:
             if out["strm_path"]:
-                await asyncio.to_thread(self.writer.remove, Path(out["strm_path"]), keep, external)
+                await asyncio.to_thread(self.writer.remove, Path(out["strm_path"]), keep, external, out["slug"])
             await self.db.delete_output(out["video_id"], lib["id"])
         pulled = await self.db.pull_from_sources(lib["id"], lib["sources"], lib["excludes"])
         written = 0
@@ -1026,9 +1069,9 @@ class Engine:
                 await self.strm.locate(lib)
             keep = self.keep_dirs() - {self.writer.library_root(lib)}
             n = 0
-            async for _, out in self.db.iter_outputs(lib_id):
+            async for v, out in self.db.iter_outputs(lib_id):
                 if out["strm_path"]:
-                    await asyncio.to_thread(self.writer.remove, Path(out["strm_path"]), keep, external)
+                    await asyncio.to_thread(self.writer.remove, Path(out["strm_path"]), keep, external, v["slug"])
                     n += 1
             log.info("输出库「%s」：已删除 %d 部影片的文件", lib["name"], n)
         await self.db.delete_library(lib_id)
@@ -1301,12 +1344,14 @@ class Engine:
         return name, dir, template, external_dir
 
     async def create_library(self, name: str, dir: str, path_template: str = "", rule: dict | None = None,
-                             external_dir: str = "", sources: list[int] = (), excludes: list[int] = ()) -> dict:
+                             external_dir: str = "", sources: list[int] = (), excludes: list[int] = (),
+                             versions: str = "") -> dict:
         """新建输出库；带规则、来源库或排除库时自动排一个重新归库任务。"""
         name, dir, template, external_dir = self._check_library(name, dir, path_template, external_dir)
         sources, excludes = self._check_links(None, list(sources), list(excludes))
         rule = normalize_rule(rule)
-        lib_id = await self.db.create_library(name, dir, template, rule, external_dir, sources, excludes)
+        lib_id = await self.db.create_library(name, dir, template, rule, external_dir, sources, excludes,
+                                              _check_versions(versions))
         await self.reload_libraries()
         lib = self.libs[lib_id]
         log.info("新建输出库「%s」：%s%s%s%s", name, self.writer.library_root(lib),
@@ -1322,8 +1367,9 @@ class Engine:
 
     async def update_library(self, lib_id: int, name: str, dir: str, path_template: str = "",
                              rule: dict | None = None, external_dir: str = "", sources: list[int] = (),
-                             excludes: list[int] = ()) -> dict:
-        """修改输出库：目录或模板变了排重写任务搬文件，规则变了排重新归库任务。
+                             excludes: list[int] = (), versions: str = "") -> dict:
+        """修改输出库：目录或模板变了排重写任务搬文件，多画质版本改了也排重写（写上或清掉版本文件），
+        规则变了排重新归库任务。
 
         外部整理库的文件归外部工具管，目录或模板变了也不搬，只影响以后新写的 strm；外部整理目录变了排同步位置。
         """
@@ -1331,11 +1377,12 @@ class Engine:
         name, dir, template, external_dir = self._check_library(name, dir, path_template, external_dir, lib_id)
         sources, excludes = self._check_links(lib_id, list(sources), list(excludes))
         rule = normalize_rule(rule)
+        versions = _check_versions(versions)
         await self.db.update_library(lib_id, name=name, dir=dir, path_template=template, rule=rule,
-                                     external_dir=external_dir, sources=sources, excludes=excludes)
+                                     external_dir=external_dir, sources=sources, excludes=excludes, versions=versions)
         await self.reload_libraries()
         jobs = {"rewrite_job_id": None, "reclassify_job_id": None, "locate_job_id": None}
-        if (dir, template) != (old["dir"], old["path_template"]) and not external_dir:
+        if ((dir, template) != (old["dir"], old["path_template"]) and not external_dir) or versions != old["versions"]:
             jobs["rewrite_job_id"] = await self.create_rewrite(lib_id)
         if external_dir and external_dir != old["external_dir"]:
             jobs["locate_job_id"] = await self.strm.create_locate(lib_id)
@@ -1437,6 +1484,13 @@ def _fmt_secs(s: float) -> str:
 def _counts_text(counts: dict) -> str:
     """子任务各状态的个数：'完成 120，失败 3，待处理 375'。"""
     return "，".join(f"{name} {counts[k]}" for k, name in TASK_STATUS_NAMES.items() if counts.get(k)) or "没有子任务"
+
+
+def _check_versions(style: str) -> str:
+    style = (style or "").strip()
+    if style and style not in VERSION_STYLES:
+        raise ValueError(f"多画质版本的命名方式只能是 {'、'.join(VERSION_STYLES)}，或者留空不写：{style}")
+    return style
 
 
 def _quality_text(q: Quality | None) -> str:
