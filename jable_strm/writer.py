@@ -68,11 +68,20 @@ def build_nfo(v: dict) -> str:
         add("tag", t["name"])
     if v.get("quality"):
         add("tag", v["quality"])
+    if v.get("uncensored"):
+        add("tag", "无码流出")
+    if v.get("maker"):
+        add("studio", v["maker"])
+    if v.get("director"):
+        add("director", v["director"])
+    if v.get("series"):
+        el = ET.SubElement(root, "set")
+        ET.SubElement(el, "name").text = v["series"]
     for m in v.get("models") or []:
         actor = ET.SubElement(root, "actor")
         ET.SubElement(actor, "name").text = m["name"]
         ET.SubElement(actor, "type").text = "Actor"
-    add("uniqueid", v["id"], type="jable", default="true")
+    add("uniqueid", code, type="num", default="true")
     ET.indent(root)
     return '<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n' + ET.tostring(root, encoding="unicode") + "\n"
 
@@ -95,8 +104,8 @@ class OutputWriter:
 
     def play_url(self, v: dict) -> str:
         s = self.store.current
-        if s.play_mode == "direct" and v.get("hls_url"):
-            return v["hls_url"]
+        if s.play_mode == "direct" and v.get("stream_url"):
+            return v["stream_url"]
         url = f"{self.store.public_base_url}/play/{v['slug']}.m3u8"
         if s.play_token:
             url += f"?t={quote(s.play_token)}"

@@ -107,10 +107,12 @@ def iter_strm(root: Path, now: float):
 
 
 def video_of(info: StrmInfo, slug_by_id: dict[int, str], id_by_slug: dict[str, int]) -> tuple[str, int | None]:
-    """strm 对应库里的哪部影片，返回 (slug, 影片 id)；库里没有时 id 为 None。"""
-    if info.kind == "cdn" and info.video_id in slug_by_id:
-        return slug_by_id[info.video_id], info.video_id  # videoId 就是库里的主键，直接换出 slug
-    return info.slug, (id_by_slug.get(info.slug) if info.slug else None)
+    """strm 对应库里的哪部影片，返回 (slug, 作品 id)；库里没有时 id 为 None。
+
+    slug_by_id 是 Jable 的 videoId -> 作品 slug（CDN 直链里只有 videoId）。
+    """
+    slug = slug_by_id.get(info.video_id, info.slug) if info.kind == "cdn" else info.slug
+    return slug, (id_by_slug.get(slug) if slug else None)
 
 
 def scan_directory(
@@ -221,7 +223,7 @@ class StrmManager:
         managed = {os.path.normcase(p) for p in await self.db.all_output_paths()}
         keys = await self.db.video_keys()
         rows = await asyncio.to_thread(
-            scan_directory, root, lib_roots, managed, dict(keys), {s: i for i, s in keys}, job["id"]
+            scan_directory, root, lib_roots, managed, await self.db.cdn_video_map(), {s: i for i, s in keys}, job["id"]
         )
         dir_prefix = str(root) + os.sep
         await self.db.replace_strm_files(dir_prefix, rows)
@@ -274,7 +276,7 @@ class StrmManager:
                 await self.db.update_strm_file(path, note="库里没有这部影片（未勾选先抓详情）")
                 return
             try:
-                v = await self.e.fetch_detail(slug)
+                v = await self.e.fetch_detail("jable", slug)
             except (NotFound, VideoGone):
                 await self.db.update_strm_file(path, note=f"站点上不存在 {slug}")
                 raise
@@ -328,7 +330,8 @@ class StrmManager:
         ext = self.e.writer.external_root(lib)
         keys = await self.db.video_keys()
         found = await asyncio.to_thread(
-            find_by_video, [self.e.writer.library_root(lib), ext], dict(keys), {s: i for i, s in keys}
+            find_by_video, [self.e.writer.library_root(lib), ext], await self.db.cdn_video_map(),
+            {s: i for i, s in keys}
         )
         ext_prefix = os.path.normcase(str(ext)) + os.sep
         in_ext = {vid: [p for p in paths if os.path.normcase(p).startswith(ext_prefix)] for vid, paths in found.items()}

@@ -94,7 +94,7 @@ def test_try_solver(servers, make_store):
 
     async def run():
         db, store = await make_store()
-        f = Fetcher(store, Metrics())
+        f = Fetcher(store, Metrics()).site("jable")
         r = await f.try_solver(ok)
         assert r["ok"] and r["cookies"] == 2 and r["target"] == "https://fs1.app/"
         assert not f.domains[0].cookies  # 只是检测，不注入 cookie

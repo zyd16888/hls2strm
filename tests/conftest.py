@@ -44,12 +44,17 @@ class FakeFetcher:
             if slug not in self.ids:
                 raise NotFound(path)
             html = re.sub(r"videoId: '\d+'", f"videoId: '{self.ids[slug]}'", self.detail_html)
+            html = html.replace("IPZZ-983", slug.upper())  # 标题里的番号换成这部影片的
             # 样本里的播放地址早已过期：换成「现在 + 3 小时」，模拟刚抓到的地址
             html = re.sub(r"(/hls/[^/]+/)\d{9,11}/", rf"\g<1>{int(time.time()) + 10800}/", html)
             return Page(html, "https://fs1.app" + path, "https://fs1.app")
         return Page(self.list_html, "https://fs1.app" + path, "https://fs1.app")
 
-    async def get_bytes(self, url: str, *, referer=None) -> bytes:
+    def site(self, name: str) -> "FakeFetcher":
+        """各站点的抓取通道都由它应答。"""
+        return self
+
+    async def get_bytes(self, url: str, *, referer=None, headers=None) -> bytes:
         if url.endswith(".m3u8"):
             return b"#EXTM3U\n#EXTINF:3600.0,\na.ts\n#EXTINF:1800.5,\nb.ts\n#EXT-X-ENDLIST\n"
         return jpeg()

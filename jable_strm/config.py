@@ -8,7 +8,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from .sites import SITES
 
 
 class BootConfig(BaseModel):
@@ -51,18 +53,52 @@ def check_path_template(v: str) -> str:
     return v
 
 
+def normalize_domains(v: list[str]) -> list[str]:
+    out = []
+    for d in v:
+        d = d.strip().rstrip("/")
+        if not d:
+            continue
+        if not d.startswith(("http://", "https://")):
+            d = "https://" + d
+        out.append(d)
+    return out
+
+
+class SiteConfig(BaseModel):
+    """单个站点的抓取设置；每个站点各自限速、冷却，一个站被拦不影响其他站。"""
+
+    enabled: bool = True
+    domains: list[str] = Field(default_factory=list)
+    rate_per_sec: float = Field(1.0, gt=0, le=20)
+    concurrency: int = Field(2, ge=1, le=16)
+    solver: bool = True  # 全部域名被拦时是否调用解题服务
+
+    @field_validator("domains")
+    @classmethod
+    def _check_domains(cls, v: list[str]) -> list[str]:
+        return normalize_domains(v)
+
+
+def default_sites() -> dict[str, SiteConfig]:
+    return {name: SiteConfig(domains=list(site.default_domains)) for name, site in SITES.items()}
+
+
 class Settings(BaseModel):
     """运行时设置。字段说明会显示在 Web 设置页。"""
 
-    # 抓取
-    domains: list[str] = Field(
-        default_factory=lambda: ["https://fs1.app", "https://jable.tv"],
-        description="站点域名，按顺序优先使用；被拦截的域名进入冷却并切换到下一个",
+    # 站点
+    sites: dict[str, SiteConfig] = Field(
+        default_factory=default_sites,
+        description="各站点的启用、域名（按顺序优先使用，被拦的进入冷却并切到下一个）、限速、并发",
     )
+    site_priority: list[str] = Field(
+        default_factory=lambda: list(SITES),
+        description="同一部影片有多个源时，站点的优先顺序（播放择优、元数据取用都按它）",
+    )
+    # 抓取
     proxy: str = Field("", description="抓取代理，如 http://host:port、socks5h://user:pass@host:port")
     impersonate: str = Field("chrome", description="curl_cffi 模拟的浏览器指纹")
-    rate_per_sec: float = Field(1.0, gt=0, le=20, description="站点请求速率上限（次/秒）")
-    concurrency: int = Field(2, ge=1, le=16, description="并发 worker 数")
     request_timeout: int = Field(30, ge=5, le=300, description="单次请求超时（秒）")
     domain_cooldown: int = Field(300, ge=10, le=86400, description="域名被拦后的首次冷却（秒），连续被拦翻倍，上限 1 小时")
     solver_url: str = Field("", description="Byparr / FlareSolverr 地址，如 http://byparr:8191；留空不启用")
@@ -98,31 +134,57 @@ class Settings(BaseModel):
         "", description="供 embyGateway 等调用 /api/resolve 的令牌（Bearer）；留空则不开放该接口"
     )
     hls_margin: int = Field(15, ge=0, le=120, description="302 前要求播放地址剩余有效期 ≥ 影片时长 + 该值（分钟）")
+    subtitle_priority: list[Literal["zh", "none", "en"]] = Field(
+        default_factory=lambda: ["zh", "none", "en"],
+        description="同一部影片有多个源时的字幕偏好：zh 中文字幕、none 无字幕、en 英文字幕，排前面的优先",
+    )
+    subtitle_fallback: bool = Field(
+        True, description="首选字幕的源都不能用时，是否用其他字幕的源顶上（比如中字源失效时播无字幕版）"
+    )
+    resolve_timeout: int = Field(20, ge=5, le=120, description="一次播放请求挑源、取地址的总时限（秒），超时不再试后面的源")
+    resolve_proxy_url: str = Field(
+        "", description="网关 resolve 用：作品只有要中转的源（如 MissAV）时返回这个地址下的中转链接，须能从公网访问；留空返回 409"
+    )
 
-    @field_validator("domains")
-    @classmethod
-    def _check_domains(cls, v: list[str]) -> list[str]:
-        out = []
-        for d in v:
-            d = d.strip().rstrip("/")
-            if not d:
-                continue
-            if not d.startswith(("http://", "https://")):
-                d = "https://" + d
-            out.append(d)
-        if not out:
-            raise ValueError("至少需要一个域名")
-        return out
+    @model_validator(mode="after")
+    def _fill_sites(self) -> Settings:
+        """补齐新加的站点；域名留空用站点默认；优先顺序去掉未知站点、补上漏掉的。"""
+        for name, site in SITES.items():
+            cfg = self.sites.get(name) or SiteConfig()
+            if not cfg.domains:
+                cfg.domains = list(site.default_domains)
+            self.sites[name] = cfg
+        self.sites = {k: v for k, v in self.sites.items() if k in SITES}
+        order = [n for n in dict.fromkeys(self.site_priority) if n in SITES]
+        self.site_priority = order + [n for n in SITES if n not in order]
+        return self
+
+    def site(self, name: str) -> SiteConfig:
+        return self.sites[name]
+
+    def site_rank(self, name: str) -> int:
+        """站点优先级，越小越优先。"""
+        return self.site_priority.index(name) if name in self.site_priority else len(self.site_priority)
 
     @field_validator("path_template")
     @classmethod
     def _check_template(cls, v: str) -> str:
         return check_path_template(v)
 
-    @field_validator("public_base_url", "solver_url", "proxy")
+    @field_validator("public_base_url", "solver_url", "proxy", "resolve_proxy_url")
     @classmethod
     def _strip(cls, v: str) -> str:
         return v.strip().rstrip("/")
+
+
+def migrate_settings(data: dict) -> dict:
+    """单站点时代的 domains、rate_per_sec、concurrency 搬到 sites.jable 下。"""
+    if "sites" in data:
+        return data
+    jable = {k: data.pop(k) for k in ("domains", "rate_per_sec", "concurrency") if k in data}
+    if jable:
+        data["sites"] = {"jable": jable}
+    return data
 
 
 class SettingsStore:
@@ -137,12 +199,17 @@ class SettingsStore:
     async def load(self) -> None:
         raw = await self._db.get_setting("settings")
         if raw:
-            data = json.loads(raw)
+            data = migrate_settings(json.loads(raw))
             known = {k: v for k, v in data.items() if k in Settings.model_fields}
             self.current = Settings.model_validate(known)
 
     async def update(self, patch: dict) -> Settings:
-        new = Settings.model_validate({**self.current.model_dump(), **patch})
+        """改设置；sites 按站点、按字段合并，只传改动的部分就行。"""
+        data = self.current.model_dump()
+        patch = dict(patch)
+        for name, cfg in (patch.pop("sites", None) or {}).items():
+            data["sites"][name] = {**data["sites"].get(name, {}), **cfg}
+        new = Settings.model_validate({**data, **patch})
         old, self.current = self.current, new
         await self._db.set_setting("settings", new.model_dump_json())
         for fn in self._listeners:

@@ -74,7 +74,7 @@ def test_retry_gone_and_blocked(make_store, boot):
         engine = build(db, store, boot, fetcher)
         await engine.start()
 
-        job_id = await engine.create_videos([slugs[0], slugs[1], "not-exist-1"])
+        job_id = await engine.create_videos([("jable", x) for x in (slugs[0], slugs[1], "not-exist-1")])
         job = await wait_job(db, job_id)
         counts = await db.task_counts(job_id)
         assert job["status"] == "done"
@@ -84,12 +84,12 @@ def test_retry_gone_and_blocked(make_store, boot):
 
         # 被拦截：不计失败次数，引擎暂停到冷却结束
         fetcher.fail = {slugs[2]: Blocked("所有域名都被拦截", 30)}
-        job_id = await engine.create_videos([slugs[2]])
+        job_id = await engine.create_videos([("jable", slugs[2])])
         for _ in range(100):
-            if engine.blocked_until > time.time():
+            if engine.blocked.get("jable", 0) > time.time():
                 break
             await asyncio.sleep(0.05)
-        assert engine.blocked_until > time.time() + 20
+        assert engine.blocked["jable"] > time.time() + 20 and "jable" in engine._skip_sites()
         task = (await db.list_tasks(job_id))[0]
         assert task["status"] == "pending" and task["attempts"] == 0
 
@@ -109,7 +109,7 @@ def test_resume_after_crash(make_store, boot):
         db, store = await make_store()
         html, ids = model_fixture()
         job_id = await db.create_job("videos", "t", {})
-        await db.add_tasks(job_id, "detail", list(ids)[:3])
+        await db.add_tasks(job_id, "detail", list(ids)[:3], site="jable")
         claimed = await db.claim_task()  # 模拟崩溃前正在执行
         assert claimed["status"] == "running"
 
@@ -135,22 +135,29 @@ def test_resolver_cache_and_single_flight(make_store):
         fetcher.ids[slug] = 62384
         r = Resolver(db, fetcher, store, Metrics())
 
+        # 库里还没有：按番号到站点上找到并入库
+        first = await r.resolve(slug, min_remaining=60)
+        assert fetcher.calls == ["/videos/ipzz-983/"]
+        src_id = first.source["id"]
+
+        # 已有作品、地址过期：同一个源的并发请求只抓一次
+        await db.update_source(src_id, stream_expires=0)
         vs = await asyncio.gather(*(r.resolve(slug, min_remaining=60) for _ in range(5)))
-        assert len([c for c in fetcher.calls if c.startswith("/videos/")]) == 1
-        assert all(v["hls_url"] == vs[0]["hls_url"] for v in vs)
+        assert len(fetcher.calls) == 2
+        assert all(x.url == vs[0].url for x in vs)
 
         # 缓存仍新鲜：不再请求
         await r.resolve(slug, min_remaining=60)
-        assert len(fetcher.calls) == 1
+        assert len(fetcher.calls) == 2
         # 要求的剩余时间超过缓存：重新请求
         await r.resolve(slug, min_remaining=10**10)
-        assert len(fetcher.calls) == 2
+        assert len(fetcher.calls) == 3
         # 指定的失效地址与缓存一致：强制刷新；不一致：直接返回
-        v = await db.get_video(slug)
-        await r.resolve(slug, stale=v["hls_url"])
-        assert len(fetcher.calls) == 3
-        await r.resolve(slug, stale="https://old")
-        assert len(fetcher.calls) == 3
+        cur = await r.ensure_source(src_id)
+        await r.ensure_source(src_id, stale=cur.url)
+        assert len(fetcher.calls) == 4
+        await r.ensure_source(src_id, stale="https://old")
+        assert len(fetcher.calls) == 4
         await db.close()
 
     asyncio.run(run())

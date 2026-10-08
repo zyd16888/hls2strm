@@ -11,21 +11,25 @@ const STRM_KINDS = { ours: "本服务格式", cdn: "CDN 直链", named: "文件�
 const LEVELS = { DEBUG: 10, INFO: 20, WARNING: 30, ERROR: 40, CRITICAL: 50 };
 
 const SETTING_GROUPS = [
-  { title: "抓取", keys: ["domains", "proxy", "impersonate", "rate_per_sec", "concurrency", "request_timeout", "domain_cooldown", "solver_url", "solver_timeout"] },
+  { title: "站点", keys: ["sites", "site_priority"] },
+  { title: "抓取", keys: ["proxy", "impersonate", "request_timeout", "domain_cooldown", "solver_url", "solver_timeout"] },
   { title: "重试", keys: ["max_attempts", "retry_base_delay"] },
   { title: "任务", keys: ["fetch_detail"] },
   { title: "输出", keys: ["output_dir", "path_template", "write_nfo", "download_cover", "poster_crop"] },
-  { title: "播放", keys: ["public_base_url", "play_mode", "proxy_user_agents", "play_token", "hls_margin", "resolve_token"] },
+  { title: "播放", keys: ["public_base_url", "play_mode", "proxy_user_agents", "play_token", "hls_margin", "subtitle_priority",
+                         "subtitle_fallback", "resolve_timeout", "resolve_token", "resolve_proxy_url"] },
 ];
 const SETTING_LABELS = {
-  domains: "站点域名", proxy: "抓取代理", impersonate: "浏览器指纹", rate_per_sec: "请求速率上限",
-  concurrency: "并发数", request_timeout: "请求超时", domain_cooldown: "域名冷却", solver_url: "解题服务地址",
+  sites: "站点", site_priority: "站点优先顺序", proxy: "抓取代理", impersonate: "浏览器指纹",
+  request_timeout: "请求超时", domain_cooldown: "域名冷却", solver_url: "解题服务地址",
   solver_timeout: "解题超时", max_attempts: "最大尝试次数", retry_base_delay: "首次重试间隔",
   fetch_detail: "默认抓取详情", output_dir: "输出根目录", path_template: "默认路径模板", write_nfo: "写 nfo",
   download_cover: "下载封面", poster_crop: "裁剪 poster", public_base_url: "对外地址", play_mode: "播放模式",
   proxy_user_agents: "中转 UA 片段", play_token: "播放令牌", hls_margin: "有效期余量（分钟）",
-  resolve_token: "网关解析令牌",
+  resolve_token: "网关解析令牌", subtitle_priority: "字幕偏好", subtitle_fallback: "字幕回退",
+  resolve_timeout: "取地址总时限（秒）", resolve_proxy_url: "公网中转地址",
 };
+const SUBTITLES = { zh: "中文字幕", en: "英文字幕", "": "无字幕" };
 const REWRITE_KEYS = ["public_base_url", "play_mode", "play_token", "path_template", "output_dir", "write_nfo"];
 const PLAY_MODES = { redirect: "302 跳转（ffmpeg 类客户端自动中转）", proxy: "全部中转", direct: "直写 CDN 地址（仅调试）" };
 
@@ -41,8 +45,8 @@ function app() {
     offline: false,
     testing: false,
     testResult: null,
-    meta: { presets: [], sorts: {} },
-    form: { kind: "list", source: "", sort: "post_date", start_page: 1, end_page: 0, detail: true, urls: "", library_id: 1 },
+    meta: { sites: {} },
+    form: { kind: "list", site: "jable", source: "", sort: "post_date", start_page: 1, end_page: 0, detail: true, urls: "", library_id: 1 },
     libraries: [],
     subscriptions: [],
     libForm: { rule: {} },
@@ -70,6 +74,7 @@ function app() {
     draft: {},
     needRewrite: false,
     solverTest: { busy: false, mode: "", result: null },
+    solverSite: "jable",
     settingGroups: SETTING_GROUPS,
     labels: SETTING_LABELS,
     logs: [],
@@ -144,12 +149,24 @@ function app() {
       try { this.s = await this.get("/api/status"); this.offline = false; }
       catch { this.offline = true; }
     },
+    siteMeta(name) { return this.meta.sites?.[name] || { label: name, presets: [], sorts: {} }; },
+    siteLabel(name) { return this.siteMeta(name).label || name || ""; },
+    siteTitle(st) { return st.label + (st.enabled ? "" : "（未启用）") + (st.blocked_for > 0 ? "，被拦截 " + this.fmtDur(st.blocked_for) : ""); },
+    blockedText() {
+      return Object.entries(this.s.engine?.blocked || {}).map(([k, v]) => `${this.siteLabel(k)} 被拦截（${this.fmtDur(v)} 后重试）`).join("，");
+    },
+    rateText() {
+      return (this.s.sites || []).filter(x => x.enabled).map(x => `${x.label} ${x.rate.current}/${x.rate.limit}`).join(" · ") || "-";
+    },
+    domainRows() {
+      return (this.s.sites || []).flatMap(st => st.domains.map((d, i) => ({ key: st.name + d.base, site: st, d, first: i === 0 })));
+    },
     engineState() {
       if (this.offline) return { text: "服务离线", cls: "err" };
       const e = this.s.engine;
       if (!e) return { text: "加载中", cls: "" };
       if (e.paused) return { text: "已暂停", cls: "" };
-      if (e.blocked_for > 0) return { text: "被拦截，" + this.fmtDur(e.blocked_for) + "后重试", cls: "warn" };
+      if (e.blocked_for > 0) return { text: Object.keys(e.blocked).map(k => this.siteLabel(k)).join("、") + " 被拦截", cls: "warn" };
       if (e.running.length) return { text: "运行中", cls: "ok" };
       return { text: "空闲", cls: "info" };
     },
@@ -172,7 +189,7 @@ function app() {
     async loadJobs() { this.jobs = await this.get("/api/jobs").catch(() => this.jobs); },
     jobHint() {
       return {
-        list: "一次性抓取某个列表并输出到所选的库。分类 /categories/xxx/、标签 /tags/xxx/、女优 /models/xxx/、搜索 /search/关键词/、热门 /hot/ 都可以，直接粘贴站点网址也行。需要定时更新请用「输出库与订阅」里的订阅；全站抓取就是默认订阅的首轮全量。",
+        list: `一次性抓取某个列表并输出到所选的库。${this.siteMeta(this.form.site).hint || ""}。同一番号已经在库里（别的站抓过）的，只给它加一个源。需要定时更新请用「输出库与订阅」里的订阅。`,
         videos: "抓取指定影片的详情并加入所选的库，优先级高于批量任务。",
         backfill: "为所有还没有详情的影片排队抓详情，写入它们所在的各个库。",
         rewrite: "修改对外地址、播放模式、令牌或路径模板后，用它重写已有的 strm / nfo（不联网），路径变了会搬动文件。",
@@ -181,8 +198,8 @@ function app() {
     async createJob() {
       const f = this.form;
       const body = { kind: f.kind };
-      if (f.kind === "list") Object.assign(body, { source: f.source, sort: f.sort, start_page: f.start_page || 1, end_page: f.end_page || 0, detail: f.detail });
-      if (f.kind === "videos") body.urls = f.urls;
+      if (f.kind === "list") Object.assign(body, { site: f.site, source: f.source, sort: f.sort, start_page: f.start_page || 1, end_page: f.end_page || 0, detail: f.detail });
+      if (f.kind === "videos") Object.assign(body, { site: f.site, urls: f.urls });
       if (["list", "videos", "rewrite"].includes(f.kind) && f.library_id) body.library_id = f.library_id;
       const r = await this.post("/api/jobs", body);
       this.notify(`已创建任务 #${r.id}`);
@@ -247,18 +264,21 @@ function app() {
       } finally { v._busy = false; }
     },
     openDetail(v) { this.detail = v; },
-    hlsState(v) {
-      if (!v.hls_url) return { text: "未缓存", cls: "" };
-      if (!v.hls_expires) return { text: "有效期未知", cls: "warn" };
-      const left = v.hls_expires - Date.now() / 1000;
-      if (left <= 0) return { text: "已过期", cls: "err" };
+    srcState(src) {
+      const now = Date.now() / 1000;
+      if (src.status === "gone") return { text: "已下架", cls: "err" };
+      if (src.status === "disabled") return { text: "已禁用", cls: "" };
+      if (src.cooldown_until > now) return { text: "失败冷却 " + this.fmtDur(src.cooldown_until - now), cls: "warn" };
+      if (!src.stream_url) return { text: "未缓存", cls: "" };
+      if (!src.expires_stream) return { text: "长期有效", cls: "ok" };
+      if (!src.stream_expires) return { text: "有效期未知", cls: "warn" };
+      const left = src.stream_expires - now;
+      if (left <= 0) return { text: "已过期", cls: "" };
       return { text: "剩 " + this.fmtDur(left), cls: left > 3600 ? "ok" : "warn" };
     },
-    siteUrls(v) {
-      const bases = (this.s.domains || []).map(d => d.base);
-      if (!bases.length) bases.push("https://jable.tv");
-      return bases.map(b => `${b}/videos/${v.slug}/`);
-    },
+    srcTitle(src) { return `${src.label} ${src.key}：${this.srcState(src).text}` + (src.last_error ? `\n${src.last_error}` : ""); },
+    subtitleName(code) { return SUBTITLES[code ?? ""] || code; },
+    subtitleTag(code) { return code === "zh" ? "·中字" : code === "en" ? "·英字" : ""; },
     async copy(text) {
       let ok = false;
       if (navigator.clipboard && window.isSecureContext) {
@@ -277,10 +297,11 @@ function app() {
       if (ok) this.notify("已复制：" + text);
       else prompt("复制失败，请手动复制", text);
     },
-    async playVideo(v) {
-      this.player = { slug: v.slug, title: v.title };
+    async playVideo(v, source = null) {
+      this.closePlayer();
+      this.player = { slug: v.slug, title: (source ? `[${source.label}] ` : "") + v.title };
       const token = new URL(v.play_url, location.href).searchParams.get("t");
-      const src = `/play/${v.slug}.m3u8?proxy=1` + (token ? `&t=${encodeURIComponent(token)}` : "");
+      const src = `/play/${v.slug}.m3u8?proxy=1` + (source ? `&src=${source.site}` : "") + (token ? `&t=${encodeURIComponent(token)}` : "");
       await this.$nextTick();
       const video = this.$refs.video;
       if (video.canPlayType("application/vnd.apple.mpegurl")) { video.src = src; return; }
@@ -342,11 +363,11 @@ function app() {
       } catch (e) { this.notify(e.message, true); }
     },
     resetSubForm() {
-      this.subForm = { id: null, name: "", source: "", sort: "post_date", library_id: 1, interval: 60, stop_after_known: 48,
+      this.subForm = { id: null, name: "", site: "jable", source: "", sort: "post_date", library_id: 1, interval: 60, stop_after_known: 48,
                        max_pages: 20, detail: true, enabled: true, initial_full: true };
     },
     editSub(sub) {
-      this.subForm = { id: sub.id, name: sub.name, source: sub.source, sort: sub.sort, library_id: sub.library_id,
+      this.subForm = { id: sub.id, name: sub.name, site: sub.site, source: sub.source, sort: sub.sort, library_id: sub.library_id,
                        interval: sub.interval, stop_after_known: sub.stop_after_known, max_pages: sub.max_pages,
                        detail: !!sub.detail, enabled: !!sub.enabled, initial_full: false };
     },
@@ -459,6 +480,7 @@ function app() {
     },
     fieldType(k) {
       const sc = this.settings.schema?.[k];
+      if (k === "sites") return "sites";
       if (!sc) return "text";
       if (sc.enum) return "enum";
       if (sc.type === "boolean") return "bool";
@@ -486,7 +508,7 @@ function app() {
     async testSolver(mode) {
       this.solverTest = { busy: true, mode, result: null };
       try {
-        const result = await this.req("POST", "/api/solver/test", { url: this.draft.solver_url || "", mode });
+        const result = await this.req("POST", "/api/solver/test", { url: this.draft.solver_url || "", mode, site: this.solverSite });
         this.solverTest = { busy: false, mode, result };
       } catch (e) {
         this.solverTest = { busy: false, mode, result: { ok: false, error: e.message } };

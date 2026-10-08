@@ -140,7 +140,7 @@ def test_external_library_survives_mdcng_move(make_store, boot, tmp_path):
         # 增量跟踪、重抓详情都不在收件目录补写，也不碰 mdcng 的 nfo
         await wait_job(db, await engine.create_crawl("/models/abc/", end_page=1, detail=False, library_id=lib_id,
                                                      incremental=True))
-        await engine.fetch_detail("ipzz-983", priority=True)
+        await engine.fetch_detail("jable", "ipzz-983", priority=True)
         assert not list(inbox.rglob("*.strm")) and not list(inbox.rglob("*.nfo"))
         assert mdc_nfo.read_text() == "mdc"
 

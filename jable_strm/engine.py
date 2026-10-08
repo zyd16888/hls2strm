@@ -8,7 +8,8 @@ job 种类：
   purge        删除输出库及其文件
   locate       外部整理库：找回被外部工具（mdcng 等）移走、改名的 strm，更新记录的路径
   reclassify   重新归库：规则库重新求值，并按来源库、排除库归并（只在本地，不联网）
-子任务种类：list（目标=页码）、detail（目标=slug）、rewrite（目标=all）、purge / locate（目标=库 id）
+子任务种类：list（目标=页码）、detail（目标=站内 key）、rewrite（目标=all）、purge / locate（目标=库 id）
+list、detail 子任务带站点（tasks.site）：某个站被拦截时只暂停这个站的子任务，每个站的并发也各自限制。
 """
 
 from __future__ import annotations
@@ -16,15 +17,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import Counter
 from pathlib import Path
+from urllib.parse import urljoin
 
-from . import sources
+from .codes import work_slug
 from .config import BootConfig, SettingsStore, check_path_template
 from .db import DEFAULT_LIBRARY_ID, Database
 from .fetcher import Blocked, FetchError, Fetcher, NotFound
 from .observability import Metrics
-from .parser import ParseError, VideoGone, m3u8_duration, parse_detail, parse_list
+from .parser import ParseError, VideoGone, m3u8_duration
 from .rules import describe_rule, match_rule, normalize_rule
+from .sites import SITES, Site, SourceDetail, SourceItem, get_site
 from .strm_manage import StrmManager
 from .writer import OutputWriter
 
@@ -57,8 +61,9 @@ class Engine:
         self.metrics = metrics
         self.snapshot_dir = boot.data_dir / "snapshots"
         self.paused = False
-        self.blocked_until = 0.0
+        self.blocked: dict[str, float] = {}  # 站点 -> 被拦截到什么时候
         self.running: dict[int, dict] = {}
+        self._claim_lock = asyncio.Lock()
         self.libs: dict[int, dict] = {}
         self.strm = StrmManager(self)
         self._workers: list[asyncio.Task] = []
@@ -80,7 +85,7 @@ class Engine:
             if job["status"] == "running":
                 await self._maybe_finish_job(job["id"])
         self._resize_workers()
-        self.store.on_change(lambda old, new: self._resize_workers())
+        self.store.on_change(lambda old, new: self._on_settings())
         self._scheduler = asyncio.create_task(self._schedule_loop(), name="scheduler")
 
     async def stop(self) -> None:
@@ -92,11 +97,18 @@ class Engine:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    def _worker_count(self) -> int:
+        """worker 总数 = 各启用站点的并发之和；各站点实际并发在领任务时再限制。"""
+        return max(1, sum(c.concurrency for c in self.store.current.sites.values() if c.enabled))
+
     def _resize_workers(self) -> None:
         self._workers = [t for t in self._workers if not t.done()]
-        want = self.store.current.concurrency
-        for i in range(len(self._workers), want):
+        for i in range(len(self._workers), self._worker_count()):
             self._workers.append(asyncio.create_task(self._worker(i), name=f"worker-{i}"))
+
+    def _on_settings(self) -> None:
+        self._resize_workers()
+        self.notify()
 
     def notify(self) -> None:
         self._wake.set()
@@ -108,10 +120,17 @@ class Engine:
             pass
         self._wake.clear()
 
+    def blocked_sites(self) -> dict[str, int]:
+        """正被拦截的站点 -> 剩余秒数。"""
+        t = time.time()
+        return {name: int(until - t) for name, until in self.blocked.items() if until > t}
+
     def status(self) -> dict:
+        blocked = self.blocked_sites()
         return {
             "paused": self.paused,
-            "blocked_for": max(0, int(self.blocked_until - time.time())),
+            "blocked": blocked,
+            "blocked_for": max(blocked.values(), default=0),
             "workers": len([t for t in self._workers if not t.done()]),
             "running": list(self.running.values()),
         }
@@ -122,24 +141,40 @@ class Engine:
 
     def resume(self) -> None:
         self.paused = False
-        self.blocked_until = 0
+        self.blocked.clear()
         self.notify()
         log.info("引擎已恢复")
+
+    def clear_blocked(self, site: str | None = None) -> None:
+        if site is None:
+            self.blocked.clear()
+        else:
+            self.blocked.pop(site, None)
+        self.notify()
+
+    def _skip_sites(self) -> list[str]:
+        """现在不能领任务的站点：未启用、被拦截中、并发已满。"""
+        t = time.time()
+        busy = Counter(r["site"] for r in self.running.values() if r["site"])
+        cfg = self.store.current.sites
+        return [name for name in SITES
+                if not cfg[name].enabled or self.blocked.get(name, 0) > t or busy[name] >= cfg[name].concurrency]
 
     # ---- worker ----
 
     async def _worker(self, idx: int) -> None:
         while not self._stopping:
-            if idx >= self.store.current.concurrency:
+            if idx >= self._worker_count():
                 return
             if self.paused:
                 await self._idle(2)
                 continue
-            wait = self.blocked_until - time.time()
-            if wait > 0:
-                await self._idle(min(wait, 5))
-                continue
-            task = await self.db.claim_task()
+            async with self._claim_lock:  # 算可领站点和登记 running 要原子，否则并发会超出站点上限
+                task = await self.db.claim_task(self._skip_sites())
+                if task is not None:
+                    self.running[task["id"]] = {
+                        "id": task["id"], "job_id": task["job_id"], "kind": task["kind"], "site": task["site"],
+                        "target": task["target"], "attempt": task["attempts"], "started": time.time()}
             if task is None:
                 await self._idle(2)
                 continue
@@ -148,8 +183,6 @@ class Engine:
     async def _run(self, task: dict) -> None:
         tid = task["id"]
         t0 = time.monotonic()
-        self.running[tid] = {"id": tid, "job_id": task["job_id"], "kind": task["kind"], "target": task["target"],
-                             "attempt": task["attempts"], "started": time.time()}
         finished = False
         try:
             job = await self.db.get_job(task["job_id"])
@@ -171,17 +204,18 @@ class Engine:
         except (NotFound, VideoGone) as e:
             await self.db.finish_task(tid, "gone", f"已下架：{e}")
             if task["kind"] == "detail":
-                await self.db.mark_gone(task["target"])
+                await self.db.mark_source_gone(task["site"] or "jable", task["target"])
             self.metrics.inc("task_gone")
             log.info("%s %s 已下架：%s", task["kind"], task["target"], e)
             finished = True
         except Blocked as e:
-            first = self.blocked_until < time.time()
-            self.blocked_until = max(self.blocked_until, time.time() + e.retry_after)
+            site = task["site"] or "jable"
+            first = self.blocked.get(site, 0) < time.time()
+            self.blocked[site] = max(self.blocked.get(site, 0), time.time() + e.retry_after)
             await self.db.finish_task(tid, "pending", f"被拦截：{e}",
-                                      next_run_at=int(self.blocked_until), refund_attempt=True)
+                                      next_run_at=int(self.blocked[site]), refund_attempt=True)
             if first:
-                log.warning("%s，暂停抓取 %d 秒后自动重试", e, int(e.retry_after))
+                log.warning("%s，暂停该站点 %d 秒后自动重试", e, int(e.retry_after))
         except ParseError as e:
             snap = self._save_snapshot(task, getattr(e, "html", ""))
             await self.db.finish_task(tid, "failed", f"解析失败：{e}" + (f"（快照 {snap}）" if snap else ""))
@@ -260,6 +294,8 @@ class Engine:
             old_strm = out["strm_path"] if out else ""
         if not old_strm and lib["excludes"] and not settle:
             return  # 有排除库的库：新片等归并确认它不属于排除库后再写
+        if self.store.current.play_mode == "direct":
+            v = {**v, "stream_url": await self.db.cached_stream_url(v["id"])}
         strm = await asyncio.to_thread(self.writer.write, v, lib, old_strm, self.keep_dirs())
         if strm is None:
             return  # 外部整理库：文件已被外部工具移走，等「同步位置」找回
@@ -276,25 +312,42 @@ class Engine:
 
     # ---- 子任务处理 ----
 
+    def _rank(self, site: str) -> int:
+        return self.store.current.site_rank(site)
+
+    @staticmethod
+    def _slug_for(site: Site, key: str, code: str, uncensored: bool) -> str:
+        """新作品的 slug：Jable 沿用站内 slug（和老数据一致），其他站用番号。"""
+        return key if site.name == "jable" else work_slug(code, uncensored)
+
+    async def upsert_item(self, site: Site, it: SourceItem) -> tuple[dict, bool]:
+        vid, created = await self.db.upsert_item(site.name, it, self._slug_for(site, it.key, it.code, it.uncensored),
+                                                 self._rank)
+        return await self.db.get_video_by_id(vid), created
+
+    async def upsert_detail(self, site: Site, d: SourceDetail) -> dict:
+        vid = await self.db.upsert_detail(site.name, d, self._slug_for(site, d.key, d.code, d.uncensored), self._rank)
+        return await self.db.get_video_by_id(vid)
+
     async def _do_list(self, job: dict, task: dict) -> None:
         p = job["params"]
+        site = get_site(p.get("site", "jable"))
         lib_id = p.get("library_id") or DEFAULT_LIBRARY_ID
         lib = self._library(lib_id)
         page = int(task["target"])
-        url = sources.page_url(p["source"], page, p.get("sort", ""), p.get("block_id"))
-        pg = await self.fetcher.get_page(url)
-        lp = parse_list(pg.html)
+        url = site.page_url(p["source"], page, p.get("sort", ""), p.get("block_id"))
+        pg = await self.fetcher.site(site.name).get_page(url)
+        lp = site.parse_list(pg.html)
         if not lp.items and page == p["start_page"]:
             e = ParseError("列表为空，检查列表地址是否正确")
             e.html = pg.html
             raise e
 
         added_count = 0
-        detail_slugs = []
+        detail_keys = []
         state = (await self.db.get_job(job["id"]))["state"]
         for it in lp.items:
-            await self.db.upsert_list_item(it)
-            v = await self.db.get_video(it.slug)
+            v, _ = await self.upsert_item(site, it)
             if await self.db.in_libraries(v["id"], lib["excludes"]):
                 # 已分到排除库：本库不收，但算作已知，增量照常停
                 state["known_streak"] = state.get("known_streak", 0) + 1
@@ -304,11 +357,11 @@ class Engine:
                 # 已有详情的影片（别的库抓过）直接带上 nfo 和封面
                 await self._output_one(v, lib_id, cover=bool(v["detail_at"]))
             if p.get("detail", True) and v["detail_at"] is None:
-                detail_slugs.append(it.slug)
+                detail_keys.append(it.key)
             added_count += added
             state["known_streak"] = 0 if added else state.get("known_streak", 0) + 1
-        if detail_slugs:
-            await self.db.add_tasks(job["id"], "detail", detail_slugs, PRIORITY_DETAIL)
+        if detail_keys:
+            await self.db.add_tasks(job["id"], "detail", detail_keys, PRIORITY_DETAIL, site.name)
         self.metrics.inc("videos_new", added_count)
 
         last = lp.last_page or page
@@ -318,47 +371,68 @@ class Engine:
             if state["known_streak"] >= p["stop_after_known"]:
                 log.info("增量：连续 %d 部已在库里，停止翻页", state["known_streak"])
             elif page < end and pages_done < p["max_pages"]:
-                await self.db.add_tasks(job["id"], "list", [page + 1], PRIORITY_LIST)
+                await self.db.add_tasks(job["id"], "list", [page + 1], PRIORITY_LIST, site.name)
         elif page == p["start_page"] and not state.get("pages_enqueued"):
-            n = await self.db.add_tasks(job["id"], "list", range(page + 1, end + 1), PRIORITY_LIST)
+            n = await self.db.add_tasks(job["id"], "list", range(page + 1, end + 1), PRIORITY_LIST, site.name)
             state["pages_enqueued"] = True
             state["last_page"] = last
             if n:
                 log.info("任务 #%d：共 %d 页，已排队第 %d-%d 页", job["id"], last, page + 1, end)
         await self.db.update_job(job["id"], state=state)
-        log.info("列表 %s 第 %d/%d 页 → 库「%s」：%d 部，新加入 %d，排队详情 %d",
-                 p["source"], page, last, self.libs[lib_id]["name"], len(lp.items), added_count, len(detail_slugs))
+        log.info("%s 列表 %s 第 %d/%d 页 → 库「%s」：%d 部，新加入 %d，排队详情 %d", site.label,
+                 p["source"], page, last, self.libs[lib_id]["name"], len(lp.items), added_count, len(detail_keys))
 
     async def _do_detail(self, job: dict, task: dict) -> None:
-        await self.fetch_detail(task["target"], library_id=job["params"].get("library_id"))
+        await self.fetch_detail(task["site"] or "jable", task["target"], library_id=job["params"].get("library_id"))
 
-    async def fetch_detail(self, slug: str, *, library_id: int | None = None, priority: bool = False) -> dict:
-        """抓详情、更新元数据；library_id 不为空时把影片加入该库。影片所在的每个库都会重写输出。"""
+    async def fetch_detail(self, site_name: str, key: str, *, library_id: int | None = None,
+                           priority: bool = False) -> dict:
+        """抓某个源的详情、合并作品元数据；library_id 不为空时把作品加入该库。作品所在的每个库都会重写输出。"""
         if library_id:
             self._library(library_id)
-        pg = await self.fetcher.get_page(f"/videos/{slug}/", priority=priority)
-        try:
-            d = parse_detail(pg.html, slug)
-        except ParseError as e:
-            e.html = pg.html
-            raise
-        await self.db.upsert_detail(d)
-        v = await self.db.get_video(slug)
-        if not v["duration"]:
-            await self._fill_duration(v)
+        site = get_site(site_name)
+        d = await site.fetch_detail(self.fetcher.site(site.name), key, priority=priority)
+        v = await self.upsert_detail(site, d)
+        if not v["duration"] and d.stream_url:
+            await self._fill_duration(v, site, d.stream_url)
         if library_id:
             await self.db.ensure_output(v["id"], library_id)
         await self._output_all(v, cover=True)
         await self.apply_rules(v)
         self.metrics.inc("videos_detail")
-        log.info("详情 %s：%s，女优 %s，%d 个标签", slug, v["release_date"] or "无日期",
+        log.info("详情 %s %s：%s，女优 %s，%d 个标签", site.label, key, v["release_date"] or "无日期",
                  "、".join(m["name"] for m in v["models"]) or "无", len(v["tags"]))
-        return await self.db.get_video(slug)
+        return await self.db.get_video_by_id(v["id"])
 
-    async def _fill_duration(self, v: dict) -> None:
+    async def refresh_video(self, slug: str) -> dict:
+        """重抓作品每个可用源的详情；全部失败才报错（都下架时抛 NotFound）。"""
+        v = await self.db.get_video(slug)
+        if v is None:
+            raise NotFound(slug)
+        cfg = self.store.current.sites
+        srcs = [s for s in await self.db.get_sources(v["id"])
+                if s["status"] == "active" and s["site"] in cfg and cfg[s["site"]].enabled]
+        if not srcs:
+            raise NotFound(f"{slug} 没有可用的源")
+        errors: list[Exception] = []
+        for src in srcs:
+            try:
+                await self.fetch_detail(src["site"], src["key"], priority=True)
+            except (NotFound, VideoGone) as e:
+                await self.db.mark_source_gone(src["site"], src["key"])
+                errors.append(e)
+            except (Blocked, FetchError, ParseError) as e:
+                errors.append(e)
+        if len(errors) == len(srcs):
+            if all(isinstance(e, (NotFound, VideoGone)) for e in errors):
+                raise errors[0]
+            raise next(e for e in errors if not isinstance(e, (NotFound, VideoGone)))
+        return await self.db.get_video_by_id(v["id"])
+
+    async def _fill_duration(self, v: dict, site: Site, stream_url: str) -> None:
         """没走过列表页的影片（指定影片任务）没有时长：从 m3u8 分片时长累加。"""
         try:
-            duration = m3u8_duration((await self.fetcher.get_bytes(v["hls_url"])).decode("utf-8", "replace"))
+            duration = await playlist_duration(self.fetcher, stream_url, site.stream.headers)
         except Exception as e:
             log.info("%s 获取时长失败：%s", v["slug"], e)
             return
@@ -556,6 +630,7 @@ class Engine:
         self,
         source: str,
         *,
+        site: str = "jable",
         sort: str = "",
         start_page: int = 1,
         end_page: int = 0,
@@ -567,9 +642,11 @@ class Engine:
         max_pages: int = DEFAULT_MAX_PAGES,
         subscription_id: int | None = None,
     ) -> int:
-        source = sources.normalize_source(source)
+        st = get_site(site)
+        source = st.normalize_source(source)
         lib = self._library(library_id)
         params = {
+            "site": st.name,
             "source": source,
             "sort": sort,
             "start_page": max(1, start_page),
@@ -584,36 +661,41 @@ class Engine:
         kind = "incremental" if incremental else "crawl"
         if not name:
             pages = f"第 {params['start_page']}-{end_page} 页" if end_page else f"第 {params['start_page']} 页起"
-            name = f"{'增量' if incremental else '列表'} {source} {pages} → {lib['name']}"
+            name = f"{'增量' if incremental else '列表'} {st.label} {source} {pages} → {lib['name']}"
         job_id = await self.db.create_job(kind, name, params)
-        await self.db.add_tasks(job_id, "list", [params["start_page"]], PRIORITY_LIST)
+        await self.db.add_tasks(job_id, "list", [params["start_page"]], PRIORITY_LIST, st.name)
         log.info("新建任务 #%d「%s」", job_id, name)
         self.notify()
         return job_id
 
     async def create_videos(
         self,
-        slugs: list[str],
+        items: list[tuple[str, str]],
         *,
         library_id: int | None = DEFAULT_LIBRARY_ID,
         name: str = "",
         priority: int = PRIORITY_USER,
     ) -> int:
-        slugs = list(dict.fromkeys(s.lower() for s in slugs))
-        if not slugs:
+        """抓指定影片的详情。items 是 [(站点, 站内 key)]。"""
+        items = list(dict.fromkeys((site, key.lower()) for site, key in items))
+        if not items:
             raise ValueError("没有可抓取的影片")
         if library_id:
             self._library(library_id)
-        name = name or f"影片 {slugs[0]}" + (f" 等 {len(slugs)} 部" if len(slugs) > 1 else "")
-        job_id = await self.db.create_job("videos", name, {"count": len(slugs), "library_id": library_id})
-        await self.db.add_tasks(job_id, "detail", slugs, priority)
+        name = name or f"影片 {items[0][1]}" + (f" 等 {len(items)} 部" if len(items) > 1 else "")
+        job_id = await self.db.create_job("videos", name, {"count": len(items), "library_id": library_id})
+        by_site: dict[str, list[str]] = {}
+        for site, key in items:
+            by_site.setdefault(get_site(site).name, []).append(key)
+        for site, keys in by_site.items():
+            await self.db.add_tasks(job_id, "detail", keys, priority, site)
         log.info("新建任务 #%d「%s」", job_id, name)
         self.notify()
         return job_id
 
     async def create_backfill(self) -> int:
-        slugs = await self.db.slugs_missing_detail()
-        return await self.create_videos(slugs, library_id=None, name=f"补全缺失详情（{len(slugs)} 部）",
+        items = await self.db.sources_missing_detail(self._rank)
+        return await self.create_videos(items, library_id=None, name=f"补全缺失详情（{len(items)} 部）",
                                         priority=PRIORITY_DETAIL)
 
     async def create_rewrite(self, library_id: int | None = None) -> int:
@@ -751,7 +833,7 @@ class Engine:
             raise ValueError(f"订阅「{sub['name']}」已有任务在执行：#{active['id']}")
         full = mode == "full" or (mode == "auto" and not sub["initialized"])
         job_id = await self.create_crawl(
-            sub["source"], sort=sub["sort"], detail=bool(sub["detail"]), library_id=sub["library_id"],
+            sub["source"], site=sub["site"], sort=sub["sort"], detail=bool(sub["detail"]), library_id=sub["library_id"],
             incremental=not full, stop_after_known=sub["stop_after_known"], max_pages=sub["max_pages"],
             subscription_id=sub_id, name=f"订阅「{sub['name']}」" + ("首轮全量" if full else "增量"),
         )
@@ -782,6 +864,17 @@ class Engine:
             if sub["last_run_at"] and t - sub["last_run_at"] < sub["interval"] * 60:
                 continue
             await self.run_subscription(sub["id"], "incremental")
+
+
+async def playlist_duration(fetcher: Fetcher, url: str, headers: dict | None = None) -> int | None:
+    """m3u8 的总时长（秒）；多码率的 master 取第一个子清单再算。"""
+    text = (await fetcher.get_bytes(url, headers=headers)).decode("utf-8", "replace")
+    if "#EXT-X-STREAM-INF" in text:
+        sub = next((ln.strip() for ln in text.splitlines() if ln.strip() and not ln.startswith("#")), "")
+        if not sub:
+            return None
+        text = (await fetcher.get_bytes(urljoin(url, sub), headers=headers)).decode("utf-8", "replace")
+    return m3u8_duration(text)
 
 
 def _overlap(a: Path, b: Path) -> bool:

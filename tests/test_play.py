@@ -23,11 +23,12 @@ def test_play_and_resolve(tmp_path):
             assert r.status_code == 302 and r.headers["location"].endswith("/62384.m3u8")
             # ffmpeg（Lavf）：中转，分片走相对地址
             r = c.get("/play/ipzz-983.m3u8", headers={"User-Agent": "Lavf/61.7.100"})
-            assert r.status_code == 200 and "../hls/ipzz-983/a.ts" in r.text
+            src_id = c.get("/api/videos", params={"q": "ipzz-983"}).json()["items"][0]["sources"][0]["id"]
+            assert r.status_code == 200 and f"../hls/{src_id}/a.ts" in r.text
             # 浏览器跨域：中转 + CORS
             r = c.get("/play/ipzz-983.m3u8", headers={"User-Agent": "Mozilla/5.0", "Origin": "http://emby:8096"})
             assert r.status_code == 200 and r.headers["access-control-allow-origin"] == "*"
-            assert c.options("/hls/ipzz-983/a.ts").status_code == 204
+            assert c.options(f"/hls/{src_id}/a.ts").status_code == 204
             # 同源的脚本请求（不带 Origin，但 Sec-Fetch-Mode: cors）也要中转
             r = c.get("/play/ipzz-983.m3u8", headers={"User-Agent": "Mozilla/5.0", "Sec-Fetch-Mode": "cors"},
                       follow_redirects=False)

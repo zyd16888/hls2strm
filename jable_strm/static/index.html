@@ -26,7 +26,7 @@
   <section x-show="tab === 'overview'">
     <template x-if="s.engine && s.engine.blocked_for > 0">
       <div class="notice warn">
-        <span>所有抓取通道都被拦截，<b x-text="fmtDur(s.engine.blocked_for)"></b> 后自动重试。</span>
+        <span><b x-text="blockedText()"></b>。冷却结束后自动重试，其他站点照常抓取。</span>
         <button class="sm" @click="testDomains()">测试连通性</button>
         <button class="sm" @click="post('/api/fetcher/reset').then(refreshStatus)">立即重试</button>
       </div>
@@ -44,7 +44,7 @@
       <div class="card stat"><div class="label">失败子任务</div><div class="value" :style="queueSum('failed') ? 'color:var(--err)' : ''" x-text="fmtNum(queueSum('failed'))"></div>
         <div class="sub">活动任务内</div></div>
       <div class="card stat"><div class="label">请求 / 分钟</div><div class="value" x-text="s.metrics?.requests_per_minute ?? '-'"></div>
-        <div class="sub">限速 <span x-text="s.rate ? s.rate.current + ' / ' + s.rate.limit : '-'"></span> 次/秒</div></div>
+        <div class="sub ellipsis" :title="rateText()">限速（次/秒）<span x-text="rateText()"></span></div></div>
       <div class="card stat"><div class="label">被拦截次数</div><div class="value" x-text="fmtNum(c('fetch_blocked'))"></div>
         <div class="sub">网络错误 <span x-text="fmtNum(c('fetch_error'))"></span></div></div>
       <div class="card stat"><div class="label">播放请求</div><div class="value" x-text="fmtNum(c('play_requests'))"></div>
@@ -74,7 +74,7 @@
             <tbody>
               <template x-for="r in s.engine?.running || []" :key="r.id">
                 <tr><td>#<span x-text="r.job_id"></span></td><td x-text="kindName(r.kind)"></td>
-                  <td class="mono" x-text="r.target"></td><td class="num" x-text="r.attempt"></td>
+                  <td class="mono" x-text="(r.site ? siteLabel(r.site) + ' ' : '') + r.target"></td><td class="num" x-text="r.attempt"></td>
                   <td class="num" x-text="fmtDur(s.now - r.started)"></td></tr>
               </template>
             </tbody>
@@ -91,16 +91,17 @@
         </h3>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>域名</th><th>状态</th><th class="num">成功</th><th class="num">被拦</th><th class="num">错误</th></tr></thead>
+            <thead><tr><th>站点 / 域名</th><th>状态</th><th class="num">成功</th><th class="num">被拦</th><th class="num">错误</th></tr></thead>
             <tbody>
-              <template x-for="d in s.domains || []" :key="d.base">
-                <tr>
-                  <td class="mono" x-text="d.host"></td>
+              <template x-for="row in domainRows()" :key="row.key">
+                <tr :class="{muted: !row.site.enabled}">
+                  <td><div x-show="row.first" style="font-weight:600" x-text="siteTitle(row.site)"></div>
+                    <span class="mono" x-text="row.d.host"></span></td>
                   <td>
-                    <span class="pill" :class="d.cooling ? 'warn' : (d.ok ? 'ok' : '')" x-text="d.cooling ? '冷却 ' + fmtDur(d.cooling) : (d.ok ? '可用' : '未使用')"></span>
-                    <div class="small muted ellipsis" :title="d.last_status" x-text="d.last_status"></div>
+                    <span class="pill" :class="row.d.cooling ? 'warn' : (row.d.ok ? 'ok' : '')" x-text="row.d.cooling ? '冷却 ' + fmtDur(row.d.cooling) : (row.d.ok ? '可用' : '未使用')"></span>
+                    <div class="small muted ellipsis" :title="row.d.last_status" x-text="row.d.last_status"></div>
                   </td>
-                  <td class="num" x-text="fmtNum(d.ok)"></td><td class="num" x-text="fmtNum(d.blocked)"></td><td class="num" x-text="fmtNum(d.errors)"></td>
+                  <td class="num" x-text="fmtNum(row.d.ok)"></td><td class="num" x-text="fmtNum(row.d.blocked)"></td><td class="num" x-text="fmtNum(row.d.errors)"></td>
                 </tr>
               </template>
             </tbody>
@@ -108,9 +109,9 @@
         </div>
         <template x-if="testResult">
           <div class="section small">
-            <template x-for="r in testResult" :key="r.host">
+            <template x-for="r in testResult" :key="r.site + r.host">
               <div><span class="chip" :class="r.ok ? 'ok' : 'err'" x-text="r.ok ? '通' : '不通'"></span>
-                <span class="mono" x-text="r.host"></span>
+                <span x-text="siteLabel(r.site)"></span> <span class="mono" x-text="r.host"></span>
                 <span class="muted" x-text="r.error ? r.error : ('HTTP ' + r.status + (r.blocked ? '，被 CF 拦截' : '') + '，' + r.ms + 'ms')"></span></div>
             </template>
           </div>
@@ -127,7 +128,7 @@
           <tbody>
             <template x-for="sub in s.subscriptions || []" :key="sub.id">
               <tr>
-                <td><div x-text="sub.name"></div><div class="small muted mono" x-text="sub.source"></div></td>
+                <td><div x-text="sub.name"></div><div class="small muted mono" x-text="siteLabel(sub.site) + ' ' + sub.source"></div></td>
                 <td class="small" x-text="sub.library_name"></td>
                 <td class="small"><span class="chip" :class="subState(sub).cls" x-text="subState(sub).text"></span></td>
                 <td class="nowrap">
@@ -191,6 +192,13 @@
             <option value="rewrite">重写输出</option>
           </select>
         </label>
+        <template x-if="['list', 'videos'].includes(form.kind)">
+          <label class="field"><span>站点</span>
+            <select x-model="form.site" @change="form.sort = siteMeta(form.site).default_sort || ''">
+              <template x-for="[k, m] in Object.entries(meta.sites || {})" :key="k"><option :value="k" x-text="m.label" :selected="k === form.site"></option></template>
+            </select>
+          </label>
+        </template>
         <template x-if="['list', 'videos', 'rewrite'].includes(form.kind)">
           <label class="field"><span>输出库</span>
             <select x-model.number="form.library_id">
@@ -202,11 +210,11 @@
         <template x-if="form.kind === 'list'">
           <div class="form-row grow" style="flex:1">
             <label class="field grow"><span>列表地址（站点网址或路径）</span>
-              <input x-model="form.source" list="presets" placeholder="/tags/creampie/ 或 https://jable.tv/models/xxx/">
-              <datalist id="presets"><template x-for="p in meta.presets" :key="p.source"><option :value="p.source" x-text="p.name"></option></template></datalist>
+              <input x-model="form.source" list="presets-job" placeholder="站点上的列表路径，或直接粘贴列表页网址">
+              <datalist id="presets-job"><template x-for="p in siteMeta(form.site).presets" :key="p.source"><option :value="p.source" x-text="p.name"></option></template></datalist>
             </label>
             <label class="field"><span>排序</span>
-              <select x-model="form.sort"><template x-for="[k, v] in Object.entries(meta.sorts || {})" :key="k"><option :value="k" x-text="v" :selected="k === form.sort"></option></template></select>
+              <select x-model="form.sort"><template x-for="[k, v] in Object.entries(siteMeta(form.site).sorts || {})" :key="k"><option :value="k" x-text="v" :selected="k === form.sort"></option></template></select>
             </label>
             <label class="field"><span>起始页</span><input type="number" min="1" style="width:80px" x-model.number="form.start_page"></label>
             <label class="field"><span>结束页（0=最后）</span><input type="number" min="0" style="width:110px" x-model.number="form.end_page"></label>
@@ -218,8 +226,8 @@
         <button class="primary" @click="createJob()">创建</button>
       </div>
       <template x-if="form.kind === 'videos'">
-        <label class="field section"><span>影片网址或番号 slug，每行一个</span>
-          <textarea x-model="form.urls" placeholder="https://jable.tv/videos/ipzz-983/&#10;sone-001-c"></textarea></label>
+        <label class="field section"><span>影片网址或站内 key，每行一个（网址按域名认站点；只写 key 的用上面选的站点）</span>
+          <textarea x-model="form.urls" placeholder="https://jable.tv/videos/ipzz-983/&#10;sone-001"></textarea></label>
       </template>
       <div class="small muted section" x-text="jobHint()"></div>
     </div>
@@ -308,7 +316,7 @@
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th></th><th>番号</th><th>标题</th><th>女优</th><th class="num">时长</th><th>上市</th><th>详情 / 所在库</th><th>原站播放地址（缓存）</th><th></th></tr></thead>
+          <thead><tr><th></th><th>番号</th><th>标题</th><th>女优</th><th class="num">时长</th><th>上市</th><th>详情 / 所在库</th><th>源（按播放顺序）</th><th></th></tr></thead>
           <tbody>
             <template x-for="v in videos.items" :key="v.id">
               <tr>
@@ -322,9 +330,10 @@
                 <td class="small nowrap" x-text="v.release_date"></td>
                 <td><span class="chip" :class="v.detail_at ? 'ok' : ''" x-text="v.detail_at ? '已补' : '缺'"></span>
                   <div><template x-for="o in v.outputs || []" :key="o.library_id"><span class="chip" x-text="o.library_name"></span></template></div></td>
-                <td class="small nowrap">
-                  <span class="chip" :class="hlsState(v).cls" x-text="hlsState(v).text"></span>
-                  <button class="sm" x-show="v.hls_url" @click="copy(v.hls_url)" :title="v.hls_url">复制</button>
+                <td class="small">
+                  <template x-for="src in v.sources || []" :key="src.id">
+                    <span class="chip" :class="srcState(src).cls" :title="srcTitle(src)" x-text="src.label + subtitleTag(src.subtitle)"></span>
+                  </template>
                 </td>
                 <td class="nowrap">
                   <button class="sm" @click="playVideo(v)">试播</button>
@@ -443,7 +452,7 @@
             <template x-for="sub in subscriptions" :key="sub.id">
               <tr>
                 <td class="num" x-text="sub.id"></td>
-                <td><div x-text="sub.name"></div><div class="small muted mono" x-text="sub.source + (sub.sort ? ' · ' + (meta.sorts[sub.sort] || sub.sort) : '')"></div></td>
+                <td><div x-text="sub.name"></div><div class="small muted mono" x-text="siteLabel(sub.site) + ' ' + sub.source + (sub.sort ? ' · ' + (siteMeta(sub.site).sorts?.[sub.sort] || sub.sort) : '')"></div></td>
                 <td x-text="sub.library_name"></td>
                 <td class="small" x-text="sub.interval ? '每 ' + sub.interval + ' 分钟' : '手动'"></td>
                 <td class="small" x-text="'连续 ' + sub.stop_after_known + ' 部已在库停 · 最多 ' + sub.max_pages + ' 页' + (sub.detail ? '' : ' · 不抓详情')"></td>
@@ -467,10 +476,15 @@
       <h3 class="section" x-text="subForm.id ? '编辑订阅 #' + subForm.id : '新建订阅'"></h3>
       <div class="form-row">
         <label class="field"><span>名称</span><input x-model="subForm.name" placeholder="中文字幕"></label>
+        <label class="field"><span>站点</span>
+          <select x-model="subForm.site" @change="subForm.sort = siteMeta(subForm.site).default_sort || ''">
+            <template x-for="[k, m] in Object.entries(meta.sites || {})" :key="k"><option :value="k" x-text="m.label" :selected="k === subForm.site"></option></template>
+          </select></label>
         <label class="field grow"><span>列表地址</span>
-          <input x-model="subForm.source" list="presets" placeholder="/categories/chinese-subtitle/"></label>
+          <input x-model="subForm.source" list="presets-sub" placeholder="/categories/chinese-subtitle/">
+          <datalist id="presets-sub"><template x-for="p in siteMeta(subForm.site).presets" :key="p.source"><option :value="p.source" x-text="p.name"></option></template></datalist></label>
         <label class="field"><span>排序</span>
-          <select x-model="subForm.sort"><template x-for="[k, v] in Object.entries(meta.sorts || {})" :key="k"><option :value="k" x-text="v" :selected="k === subForm.sort"></option></template></select></label>
+          <select x-model="subForm.sort"><template x-for="[k, v] in Object.entries(siteMeta(subForm.site).sorts || {})" :key="k"><option :value="k" x-text="v" :selected="k === subForm.sort"></option></template></select></label>
         <label class="field"><span>输出库</span>
           <select x-model.number="subForm.library_id"><template x-for="l in libraries" :key="l.id"><option :value="l.id" x-text="l.name" :selected="l.id === subForm.library_id"></option></template></select></label>
       </div>
@@ -694,11 +708,32 @@
               <template x-if="fieldType(k) === 'text'">
                 <input type="text" x-model="draft[k]" spellcheck="false">
               </template>
+              <template x-if="fieldType(k) === 'sites'">
+                <div>
+                  <template x-for="name in Object.keys(draft.sites || {})" :key="name">
+                    <div class="site-edit">
+                      <div class="toolbar" style="margin:0 0 6px">
+                        <b x-text="siteMeta(name).label || name"></b>
+                        <span class="chip" x-text="siteMeta(name).direct ? '可以 302' : '必须中转'"></span>
+                        <label class="small"><input type="checkbox" x-model="draft.sites[name].enabled"> 启用</label>
+                        <label class="small"><input type="checkbox" x-model="draft.sites[name].solver"> 被拦时用解题服务</label>
+                      </div>
+                      <div class="form-row">
+                        <label class="field grow"><span>域名（每行一个，按顺序优先）</span>
+                          <textarea :value="(draft.sites[name].domains || []).join('\n')" @input="draft.sites[name].domains = $event.target.value.split('\n').map(x => x.trim()).filter(Boolean)"></textarea></label>
+                        <label class="field"><span>限速（次/秒）</span><input type="number" step="0.1" min="0.05" max="20" style="width:90px" x-model.number="draft.sites[name].rate_per_sec"></label>
+                        <label class="field"><span>并发</span><input type="number" min="1" max="16" style="width:70px" x-model.number="draft.sites[name].concurrency"></label>
+                      </div>
+                    </div>
+                  </template>
+                </div>
+              </template>
               <template x-if="k === 'solver_url'">
                 <div class="toolbar" style="margin:6px 0 0">
                   <button class="sm" @click="testSolver('ping')" :disabled="solverTest.busy || !draft.solver_url">测试连通</button>
+                  <select class="sm" x-model="solverSite"><template x-for="[k, m] in Object.entries(meta.sites || {})" :key="k"><option :value="k" x-text="m.label"></option></template></select>
                   <button class="sm" @click="testSolver('solve')" :disabled="solverTest.busy || !draft.solver_url"
-                          title="让解题服务实际打开一次首选域名（走当前代理），最长等到解题超时">试解一次</button>
+                          title="让解题服务实际打开一次所选站点的首选域名（走当前代理），最长等到解题超时">试解一次</button>
                   <span class="small muted" x-show="solverTest.busy" x-text="solverTest.mode === 'solve' ? '解题中，最长等到解题超时…' : '检测中…'"></span>
                   <span class="small" :class="solverTest.result?.ok ? '' : 'err-text'" x-show="solverTest.result && !solverTest.busy"
                         x-text="solverResultText()"></span>
@@ -756,7 +791,8 @@
             <dt>时长</dt><dd x-text="fmtClockDur(detail.duration) || '-'"></dd>
             <dt>画质</dt><dd x-text="detail.quality || '-'"></dd>
             <dt>观看 / 收藏</dt><dd x-text="fmtNum(detail.views) + ' / ' + fmtNum(detail.favs)"></dd>
-            <dt>videoId</dt><dd class="mono" x-text="detail.id"></dd>
+            <dt>番号</dt><dd class="mono" x-text="(detail.code || '-') + (detail.uncensored ? '（无码流出）' : '')"></dd>
+            <dt>发行商 / 导演</dt><dd x-text="(detail.maker || '-') + ' / ' + (detail.director || '-')"></dd>
             <dt>入库 / 详情</dt><dd x-text="fmtTime(detail.created_at) + ' / ' + (detail.detail_at ? fmtTime(detail.detail_at) : '未抓')"></dd>
           </dl>
         </div>
@@ -764,27 +800,32 @@
 
       <div class="url-list">
         <div class="url-row">
-          <div class="url-label">原站播放地址（CDN，缓存）
-            <span class="chip" :class="hlsState(detail).cls" x-text="hlsState(detail).text"></span>
+          <div class="url-label">源（按播放优先顺序，第一个不能用时自动换下一个）</div>
+          <div class="table-wrap">
+            <table class="small">
+              <thead><tr><th>站点</th><th>站内页面</th><th>字幕</th><th>状态</th><th>播放地址（缓存）</th><th></th></tr></thead>
+              <tbody>
+                <template x-for="src in detail.sources || []" :key="src.id">
+                  <tr>
+                    <td class="nowrap"><span x-text="src.label"></span> <span class="chip" x-text="src.direct ? '302' : '中转'"></span></td>
+                    <td class="mono"><a :href="src.page_url" target="_blank" rel="noreferrer" x-text="src.key"></a></td>
+                    <td x-text="subtitleName(src.subtitle)"></td>
+                    <td><span class="chip" :class="srcState(src).cls" x-text="srcState(src).text"></span>
+                      <div class="small muted ellipsis" x-show="src.last_error" :title="src.last_error" x-text="src.last_error"></div></td>
+                    <td class="nowrap"><button class="sm" x-show="src.stream_url" @click="copy(src.stream_url)" :title="src.stream_url">复制</button>
+                      <span class="muted" x-show="!src.stream_url">播放时获取</span></td>
+                    <td class="nowrap"><button class="sm" x-show="src.status === 'active'" @click="playVideo(detail, src)">试播此源</button></td>
+                  </tr>
+                </template>
+                <tr x-show="!(detail.sources || []).length"><td colspan="6" class="muted">没有源</td></tr>
+              </tbody>
+            </table>
           </div>
-          <template x-if="detail.hls_url">
-            <div class="url-box"><code x-text="detail.hls_url"></code><button class="sm" @click="copy(detail.hls_url)">复制</button></div>
-          </template>
-          <div class="small muted" x-show="!detail.hls_url">还没有缓存，播放或点「刷新」时获取。</div>
-          <div class="small muted" x-show="detail.hls_url">
-            获取于 <span x-text="fmtTime(detail.detail_at)"></span>，过期于 <span x-text="fmtTime(detail.hls_expires)"></span>（约 3 小时有效）。
-            CDN 不接受 UA 含 Lavf / python-requests 的请求，外部播放器用 ffmpeg 拉流时需要换 UA。
-          </div>
+          <div class="small muted">Jable 的地址约 3 小时过期，能 302 直连；MissAV 等要中转的源，地址只能由本服务带上请求头去取。</div>
         </div>
         <div class="url-row">
           <div class="url-label">本服务播放地址（strm 内容）</div>
           <div class="url-box"><code x-text="detail.play_url"></code><button class="sm" @click="copy(detail.play_url)">复制</button></div>
-        </div>
-        <div class="url-row">
-          <div class="url-label">原站页面</div>
-          <template x-for="u in siteUrls(detail)" :key="u">
-            <div class="url-box"><a :href="u" target="_blank" rel="noreferrer" class="mono" x-text="u"></a><button class="sm" @click="copy(u)">复制</button></div>
-          </template>
         </div>
         <div class="url-row">
           <div class="url-label">strm 文件（按输出库）</div>

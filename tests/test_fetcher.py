@@ -40,15 +40,16 @@ CHALLENGE = Resp(403, "<html><head><title>Just a moment...</title>", {"cf-mitiga
 
 
 def make_fetcher(store, by_host):
+    """返回 Jable 站点的抓取通道，底层会话换成假的。"""
     f = Fetcher(store, Metrics())
     f._session = FakeSession(by_host)
-    return f
+    return f.site("jable")
 
 
 def test_rotates_to_next_domain_when_blocked(make_store):
     async def run():
         db, store = await make_store()
-        await store.update({"rate_per_sec": 20})
+        await store.update({"sites": {"jable": {"rate_per_sec": 20}}})
         f = make_fetcher(store, {"fs1.app": CHALLENGE, "jable.tv": Resp(200, "<html>page</html>")})
         page = await f.get_page("/videos/abc-1/")
         assert page.domain == "https://jable.tv"
@@ -56,7 +57,7 @@ def test_rotates_to_next_domain_when_blocked(make_store):
         assert fs1.blocked == 1 and fs1.cooldown_until > time.time()
         # 冷却中的域名不再请求
         await f.get_page("/videos/abc-2/")
-        assert f._session.calls[-1].startswith("https://jable.tv")
+        assert f.parent._session.calls[-1].startswith("https://jable.tv")
         await db.close()
 
     asyncio.run(run())
@@ -65,7 +66,7 @@ def test_rotates_to_next_domain_when_blocked(make_store):
 def test_all_blocked_and_errors(make_store):
     async def run():
         db, store = await make_store()
-        await store.update({"rate_per_sec": 20})
+        await store.update({"sites": {"jable": {"rate_per_sec": 20}}})
         f = make_fetcher(store, {"fs1.app": CHALLENGE, "jable.tv": CHALLENGE})
         with pytest.raises(Blocked) as e:
             await f.get_page("/x/")
@@ -89,7 +90,7 @@ def test_all_blocked_and_errors(make_store):
 def test_challenge_page_with_200_is_blocked(make_store):
     async def run():
         db, store = await make_store()
-        await store.update({"rate_per_sec": 20})
+        await store.update({"sites": {"jable": {"rate_per_sec": 20}}})
         f = make_fetcher(store, {"fs1.app": Resp(200, "<title>Just a moment...</title>"), "jable.tv": Resp(200)})
         assert (await f.get_page("/")).domain == "https://jable.tv"
         await db.close()

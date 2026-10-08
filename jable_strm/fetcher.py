@@ -1,8 +1,9 @@
 """分层抓取器。
 
-L1：curl_cffi 模拟浏览器指纹，按顺序轮换多个域名；某个域名被拦就冷却（连续被拦翻倍），切到下一个。
+每个站点一条抓取通道（SiteFetcher），域名、冷却、限速各管各的；所有通道共用一个 curl_cffi 会话（代理、指纹）。
+L1：curl_cffi 模拟浏览器指纹，按顺序轮换该站的多个域名；某个域名被拦就冷却（连续被拦翻倍），切到下一个。
 L2：全部域名都被拦时，如果配置了 Byparr / FlareSolverr，用它拿 cookie 和页面；成功后 cookie 注入 L1 会话。
-全部失败抛 Blocked，由任务引擎暂停等待冷却结束。
+全部失败抛 Blocked，由任务引擎暂停这个站点，等冷却结束。
 """
 
 from __future__ import annotations
@@ -16,8 +17,9 @@ from urllib.parse import urlsplit, urlunsplit
 
 from curl_cffi.requests import AsyncSession
 
-from .config import Settings, SettingsStore
+from .config import Settings, SettingsStore, SiteConfig
 from .observability import Metrics
+from .sites import SITES, Site
 
 log = logging.getLogger(__name__)
 
@@ -221,29 +223,28 @@ async def ping_solver(solver_url: str, timeout: int = 10) -> dict:
 
 
 class Fetcher:
+    """共享的会话 + 各站点的抓取通道；CDN、封面、播放器页这些站外请求也走这里。"""
+
     def __init__(self, store: SettingsStore, metrics: Metrics) -> None:
         self.store = store
         self.metrics = metrics
-        self.domains: list[DomainState] = []
-        self.limiter = RateLimiter(store.current.rate_per_sec)
         self._session: AsyncSession | None = None
-        self._solver_lock = asyncio.Lock()
-        self._sync_domains(store.current)
+        self.sites: dict[str, SiteFetcher] = {name: SiteFetcher(self, site) for name, site in SITES.items()}
         store.on_change(self._on_settings)
+
+    def site(self, name: str) -> SiteFetcher:
+        sf = self.sites.get(name or "jable")
+        if sf is None:
+            raise ValueError(f"未知站点：{name}")
+        return sf
 
     # ---- 会话与设置 ----
 
     def _on_settings(self, old: Settings, new: Settings) -> None:
-        if old.domains != new.domains:
-            self._sync_domains(new)
         if old.proxy != new.proxy or old.impersonate != new.impersonate:
             self._reset_session()
-        if old.rate_per_sec != new.rate_per_sec:
-            self.limiter.set_limit(new.rate_per_sec)
-
-    def _sync_domains(self, s: Settings) -> None:
-        existing = {d.base: d for d in self.domains}
-        self.domains = [existing.get(base) or DomainState(base) for base in s.domains]
+        for name, sf in self.sites.items():
+            sf.sync(old.site(name), new.site(name))
 
     @property
     def session(self) -> AsyncSession:
@@ -272,18 +273,89 @@ class Fetcher:
             await self._session.close()
             self._session = None
 
+    def reset_cooldowns(self, site: str | None = None) -> None:
+        for name, sf in self.sites.items():
+            if site in (None, name):
+                sf.reset_cooldowns()
+
+    async def test_domains(self, site: str | None = None) -> list[dict]:
+        """测试启用站点的域名连通性（site 指定时只测这个站）。"""
+        out = []
+        for name, sf in self.sites.items():
+            if site in (None, name) and (site or sf.cfg.enabled):
+                out += [{"site": name, **r} for r in await sf.test_domains()]
+        return out
+
+    # ---- 站外请求：CDN、封面、播放器页 ----
+
+    async def get_bytes(self, url: str, *, referer: str | None = None, headers: dict | None = None) -> bytes:
+        headers = dict(headers or {})
+        if referer:
+            headers["Referer"] = referer
+        try:
+            resp = await self.session.get(url, timeout=self.store.current.request_timeout, headers=headers or None)
+        except Exception as e:
+            raise FetchError(f"{urlsplit(url).hostname}: {e}") from e
+        if resp.status_code == 404:
+            raise NotFound(url)
+        if resp.status_code != 200:
+            raise FetchError(f"{urlsplit(url).hostname}: HTTP {resp.status_code}")
+        return resp.content
+
+
+class SiteFetcher:
+    """一个站点的抓取通道：域名轮换、冷却、限速、解题服务。"""
+
+    def __init__(self, parent: Fetcher, site: Site) -> None:
+        self.parent = parent
+        self.site = site
+        self.name = site.name
+        self.metrics = parent.metrics
+        cfg = self.cfg
+        self.domains = [DomainState(base) for base in cfg.domains]
+        self.limiter = RateLimiter(cfg.rate_per_sec)
+        self._solver_lock = asyncio.Lock()
+
+    @property
+    def cfg(self) -> SiteConfig:
+        return self.parent.store.current.site(self.name)
+
+    @property
+    def session(self) -> AsyncSession:
+        return self.parent.session
+
+    def sync(self, old: SiteConfig, new: SiteConfig) -> None:
+        if old.domains != new.domains:
+            existing = {d.base: d for d in self.domains}
+            self.domains = [existing.get(base) or DomainState(base) for base in new.domains]
+        if old.rate_per_sec != new.rate_per_sec:
+            self.limiter.set_limit(new.rate_per_sec)
+
     def reset_cooldowns(self) -> None:
         for d in self.domains:
             d.cooldown_until = 0
             d.block_streak = 0
-        self.limiter.set_limit(self.store.current.rate_per_sec)
+        self.limiter.set_limit(self.cfg.rate_per_sec)
 
     def blocked_for(self) -> float:
         """距离最早一个域名解除冷却还有多少秒；有可用域名时为 0。"""
         now = time.time()
-        if any(d.cooldown_until <= now for d in self.domains):
+        if not self.domains or any(d.cooldown_until <= now for d in self.domains):
             return 0.0
         return min(d.cooldown_until for d in self.domains) - now
+
+    def status(self) -> dict:
+        cfg = self.cfg
+        return {
+            "name": self.name,
+            "label": self.site.label,
+            "enabled": cfg.enabled,
+            "direct": self.site.stream.direct,
+            "domains": [d.to_dict() for d in self.domains],
+            "rate": {"limit": self.limiter.limit, "current": round(self.limiter.rate, 3)},
+            "concurrency": cfg.concurrency,
+            "blocked_for": int(self.blocked_for()),
+        }
 
     # ---- 站点页面 ----
 
@@ -297,7 +369,7 @@ class Fetcher:
     def _mark_blocked(self, dom: DomainState, reason: str) -> None:
         dom.blocked += 1
         dom.block_streak += 1
-        cool = min(MAX_COOLDOWN, self.store.current.domain_cooldown * 2 ** (dom.block_streak - 1))
+        cool = min(MAX_COOLDOWN, self.parent.store.current.domain_cooldown * 2 ** (dom.block_streak - 1))
         dom.cooldown_until = time.time() + cool
         dom.last_status = f"被拦截（{reason}），冷却 {cool}s"
         self.limiter.penalize()
@@ -307,7 +379,7 @@ class Fetcher:
     async def get_page(self, path: str, *, priority: bool = False) -> Page:
         """抓取站点页面。priority=True 时跳过限速（播放请求用）。"""
         path = self._to_path(path)
-        s = self.store.current
+        s = self.parent.store.current
         now = time.time()
         candidates = [d for d in self.domains if d.cooldown_until <= now]
         errors: list[str] = []
@@ -357,16 +429,16 @@ class Fetcher:
         page = await self._solve(path)
         if page is not None:
             return page
-        raise Blocked("所有域名都被拦截", self.blocked_for())
+        raise Blocked(f"{self.site.label} 的域名都被拦截", self.blocked_for())
 
     async def _solve(self, path: str) -> Page | None:
-        s = self.store.current
-        if not s.solver_url:
+        s = self.parent.store.current
+        if not s.solver_url or not self.cfg.solver or not self.domains:
             return None
         async with self._solver_lock:  # 解题慢且占资源，串行
             dom = self.domains[0]
             url = dom.base + path
-            log.info("L1 全部被拦，调用解题服务：%s", url)
+            log.info("%s 的域名全部被拦，调用解题服务：%s", self.site.label, url)
             try:
                 result = await call_solver(s.solver_url, url, s.proxy, s.solver_timeout)
             except Exception as e:
@@ -390,7 +462,7 @@ class Fetcher:
 
     async def try_solver(self, solver_url: str) -> dict:
         """让解题服务实际打开一次首选域名首页（走当前代理），只返回结果，不注入 cookie。"""
-        s = self.store.current
+        s = self.parent.store.current
         target = self.domains[0].base + "/"
         t0 = time.monotonic()
         try:
@@ -408,7 +480,9 @@ class Fetcher:
         for dom in self.domains:
             t0 = time.monotonic()
             try:
-                resp = await self.session.get(dom.base + "/", timeout=self.store.current.request_timeout)
+                resp = await self.session.get(dom.base + "/", timeout=self.parent.store.current.request_timeout,
+                                              headers={"User-Agent": dom.user_agent} if dom.user_agent else None,
+                                              cookies=dom.cookies or None)
                 ms = int((time.monotonic() - t0) * 1000)
                 blocked = "challenge" in (resp.headers.get("cf-mitigated") or "") or looks_like_challenge(resp.text)
                 ok = resp.status_code == 200 and not blocked
@@ -420,18 +494,3 @@ class Fetcher:
             except Exception as e:
                 out.append({"host": dom.host, "status": 0, "blocked": False, "ok": False, "error": str(e)[:200]})
         return out
-
-    # ---- CDN / 封面 ----
-
-    async def get_bytes(self, url: str, *, referer: str | None = None) -> bytes:
-        try:
-            resp = await self.session.get(
-                url, timeout=self.store.current.request_timeout, headers={"Referer": referer} if referer else None
-            )
-        except Exception as e:
-            raise FetchError(f"{urlsplit(url).hostname}: {e}") from e
-        if resp.status_code == 404:
-            raise NotFound(url)
-        if resp.status_code != 200:
-            raise FetchError(f"{urlsplit(url).hostname}: HTTP {resp.status_code}")
-        return resp.content

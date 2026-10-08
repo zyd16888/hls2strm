@@ -8,13 +8,7 @@ from urllib.parse import urlsplit
 
 from selectolax.lexbor import LexborHTMLParser
 
-
-class ParseError(Exception):
-    """页面结构不符合预期（改版等）。"""
-
-
-class VideoGone(ParseError):
-    """影片已下架：站点返回 200 但只是兜底页，没有播放器。"""
+from .errors import ParseError, VideoGone  # noqa: F401  其他模块仍从这里导入
 
 
 @dataclass

@@ -11,19 +11,22 @@ import sqlite3
 import time
 from typing import Literal
 
+from urllib.parse import urlsplit
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field, ValidationError
 
-from . import __version__, sources
+from . import __version__
 from .config import Settings
-from .db import DEFAULT_LIBRARY_ID
+from .db import DEFAULT_LIBRARY_ID, source_cooldown
 from .engine import snapshot_path
 from .fetcher import Blocked, FetchError, NotFound, ping_solver
 from .observability import ring
-from .parser import ParseError, VideoGone, slug_from_url
+from .parser import ParseError, VideoGone
 from .rules import describe_rule
+from .sites import SITES, get_site
 
 _basic = HTTPBasic(auto_error=False)
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
@@ -56,8 +59,7 @@ async def status(request: Request):
     return {
         "version": __version__,
         "engine": c.engine.status(),
-        "domains": [d.to_dict() for d in c.fetcher.domains],
-        "rate": {"limit": c.fetcher.limiter.limit, "current": round(c.fetcher.limiter.rate, 3)},
+        "sites": [sf.status() for sf in c.fetcher.sites.values()],
         "solver": c.store.current.solver_url,
         "videos": await c.db.video_stats(),
         "queue": await c.db.queue_stats(),
@@ -79,32 +81,31 @@ async def engine_action(action: Literal["pause", "resume"], request: Request):
 
 
 @router.post("/fetcher/reset")
-async def fetcher_reset(request: Request):
+async def fetcher_reset(request: Request, site: str | None = None):
     c = _ctx(request)
-    c.fetcher.reset_cooldowns()
-    c.engine.blocked_until = 0
-    c.engine.notify()
+    c.fetcher.reset_cooldowns(site)
+    c.engine.clear_blocked(site)
     return {"ok": True}
 
 
 @router.post("/fetcher/test")
-async def fetcher_test(request: Request):
+async def fetcher_test(request: Request, site: str | None = None):
     c = _ctx(request)
-    result = await c.fetcher.test_domains()
-    if any(r["ok"] for r in result):
-        c.engine.blocked_until = 0
-        c.engine.notify()
+    result = await c.fetcher.test_domains(site)
+    for name in {r["site"] for r in result if r["ok"]}:
+        c.engine.clear_blocked(name)
     return result
 
 
 class SolverTestBody(BaseModel):
     url: str = ""  # 留空用已保存的设置；设置页传输入框里的值，不用先保存
     mode: Literal["ping", "solve"] = "ping"
+    site: str = "jable"  # solve 时打开哪个站点的首选域名
 
 
 @router.post("/solver/test")
 async def solver_test(body: SolverTestBody, request: Request):
-    """ping：只看能不能连上；solve：让解题服务实际打开一次首选域名。"""
+    """ping：只看能不能连上；solve：让解题服务实际打开一次某个站点的首选域名。"""
     c = _ctx(request)
     url = (body.url or c.store.current.solver_url).strip().rstrip("/")
     if not url:
@@ -112,7 +113,10 @@ async def solver_test(body: SolverTestBody, request: Request):
     if not url.startswith(("http://", "https://")):
         raise HTTPException(400, "地址要以 http:// 或 https:// 开头，如 http://byparr:8191")
     if body.mode == "solve":
-        return await c.fetcher.try_solver(url)
+        try:
+            return await c.fetcher.site(body.site).try_solver(url)
+        except ValueError as err:
+            raise HTTPException(400, str(err)) from None
     return await ping_solver(url)
 
 
@@ -121,6 +125,7 @@ async def solver_test(body: SolverTestBody, request: Request):
 
 class JobCreate(BaseModel):
     kind: Literal["list", "videos", "backfill", "rewrite"]
+    site: str = "jable"
     source: str = ""
     sort: str = ""
     start_page: int = 1
@@ -130,16 +135,30 @@ class JobCreate(BaseModel):
     library_id: int | None = None
 
 
-def _parse_slugs(text: str) -> list[str]:
+def _site_of_url(c, url: str) -> str | None:
+    host = (urlsplit(url).hostname or "").lower()
+    for name, site in SITES.items():
+        bases = c.store.current.site(name).domains + site.default_domains
+        if any(host == (urlsplit(b).hostname or "").lower() for b in bases):
+            return name
+    return None
+
+
+def _parse_videos(c, text: str, default_site: str) -> list[tuple[str, str]]:
+    """每行一个影片网址或站内 key；网址按域名认站点，key 用 default_site。"""
     out = []
     for line in re.split(r"[\s,，]+", text):
         line = line.strip()
         if not line:
             continue
-        slug = slug_from_url(line) if "/" in line else line.lower()
-        if not slug or not _SLUG_RE.fullmatch(slug):
+        if "/" in line:
+            site = _site_of_url(c, line if "://" in line else "https://" + line)
+            key = get_site(site).key_from_url(line) if site else None
+        else:
+            site, key = default_site, line.lower()
+        if not site or not key or not _SLUG_RE.fullmatch(key):
             raise ValueError(f"无法识别的影片：{line}")
-        out.append(slug)
+        out.append((site, key))
     return out
 
 
@@ -149,10 +168,10 @@ async def create_job(body: JobCreate, request: Request):
     try:
         lib_id = body.library_id or DEFAULT_LIBRARY_ID
         if body.kind == "list":
-            job_id = await e.create_crawl(body.source, sort=body.sort, start_page=body.start_page,
+            job_id = await e.create_crawl(body.source, site=body.site, sort=body.sort, start_page=body.start_page,
                                           end_page=body.end_page, detail=body.detail, library_id=lib_id)
         elif body.kind == "videos":
-            job_id = await e.create_videos(_parse_slugs(body.urls), library_id=lib_id)
+            job_id = await e.create_videos(_parse_videos(_ctx(request), body.urls, body.site), library_id=lib_id)
         elif body.kind == "backfill":
             job_id = await e.create_backfill()
         else:
@@ -206,10 +225,28 @@ async def snapshot(name: str, request: Request):
 # ---- 影片 ----
 
 
-def _video_view(c, v: dict) -> dict:
+def _source_view(c, src: dict) -> dict:
+    site = SITES.get(src["site"])
+    out = dict(src)
+    out["label"] = site.label if site else src["site"]
+    out["direct"] = bool(site and site.stream.direct)
+    out["expires_stream"] = bool(site and site.stream.expires)
+    out["cooldown_until"] = source_cooldown(src)
+    if site:
+        domains = c.store.current.site(src["site"]).domains or site.default_domains
+        out["page_url"] = domains[0] + site.detail_path(src["key"]) if domains else ""
+    return out
+
+
+def _video_view(c, v: dict, sources: list[dict] | None = None) -> dict:
     v = dict(v)
     v["play_url"] = c.writer.play_url(v)
-    v["hls_left"] = max(0, (v.get("hls_expires") or 0) - int(time.time()))
+    ranked = c.resolver.rank(sources or [])
+    order = {s["id"]: i for i, s in enumerate(ranked)}
+    v["sources"] = sorted((_source_view(c, s) for s in sources or []),
+                          key=lambda s: (order.get(s["id"], len(order)), s["id"]))
+    for s in v["sources"]:
+        s["rank"] = order.get(s["id"])
     return v
 
 
@@ -219,10 +256,12 @@ async def list_videos(request: Request, q: str = "", filter: str = "", page: int
     c = _ctx(request)
     size = max(1, min(size, 200))
     items, total = await c.db.search_videos(q, filter, (max(page, 1) - 1) * size, size, library_id)
-    outputs = await c.db.outputs_for([v["id"] for v in items])
+    ids = [v["id"] for v in items]
+    outputs = await c.db.outputs_for(ids)
+    srcs = await c.db.sources_for(ids)
     views = []
     for v in items:
-        view = _video_view(c, v)
+        view = _video_view(c, v, srcs.get(v["id"], []))
         view["outputs"] = outputs.get(v["id"], [])
         views.append(view)
     return {"items": views, "total": total, "page": page, "size": size}
@@ -230,17 +269,17 @@ async def list_videos(request: Request, q: str = "", filter: str = "", page: int
 
 @router.post("/videos/{slug}/refresh")
 async def refresh_video(slug: str, request: Request):
+    """重抓这部影片每个可用源的详情。"""
     c = _ctx(request)
     try:
-        v = await c.engine.fetch_detail(slug.lower(), priority=True)
+        v = await c.engine.refresh_video(slug.lower())
     except (NotFound, VideoGone):
-        await c.db.mark_gone(slug.lower())
         raise HTTPException(404, "站点上已不存在该影片") from None
     except Blocked as err:
         raise HTTPException(503, str(err)) from None
     except (FetchError, ParseError) as err:
         raise HTTPException(502, str(err)) from None
-    view = _video_view(c, v)
+    view = _video_view(c, v, await c.db.get_sources(v["id"]))
     view["outputs"] = await c.db.get_outputs(v["id"])
     return view
 
@@ -325,6 +364,7 @@ async def delete_library(lib_id: int, request: Request, delete_files: bool = Fal
 
 class SubscriptionBody(BaseModel):
     name: str
+    site: str = "jable"
     source: str
     sort: str = ""
     library_id: int = DEFAULT_LIBRARY_ID
@@ -341,9 +381,11 @@ def _subscription_fields(c, body: SubscriptionBody) -> dict:
         raise ValueError("订阅名称不能为空")
     if body.library_id not in c.engine.libs:
         raise ValueError(f"输出库 #{body.library_id} 不存在")
+    site = get_site(body.site)
     return {
         "name": body.name.strip(),
-        "source": sources.normalize_source(body.source),
+        "site": site.name,
+        "source": site.normalize_source(body.source),
         "sort": body.sort,
         "library_id": body.library_id,
         "detail": int(body.detail),
@@ -549,7 +591,9 @@ async def put_settings(patch: dict, request: Request):
 
 @router.get("/meta")
 async def meta():
-    return {"presets": sources.PRESETS, "sorts": sources.SORTS}
+    return {"sites": {name: {"label": s.label, "presets": s.presets, "sorts": s.sorts, "default_sort": s.default_sort,
+                             "hint": s.source_hint, "direct": s.stream.direct}
+                      for name, s in SITES.items()}}
 
 
 # ---- 日志 ----

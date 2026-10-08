@@ -1,5 +1,6 @@
-"""SQLite 存储：设置、影片、输出库、订阅、任务（job）与子任务（task）。
+"""SQLite 存储：设置、作品与源、输出库、订阅、任务（job）与子任务（task）。
 
+作品（videos 表）是一个番号，对应一个 strm；源（sources 表）是某个站点上的一个页面，一部作品可以有多个源。
 单连接 + 自动提交；所有写操作串行（同一把锁），读操作直接执行。
 表结构用 PRAGMA user_version 做版本化迁移，见 MIGRATIONS。
 """
@@ -10,13 +11,15 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
-from .parser import ListItem, VideoDetail
+from .codes import code_key
+from .sites import SourceDetail, SourceItem
 
 log = logging.getLogger(__name__)
 
@@ -211,7 +214,67 @@ async def _migrate_v5(conn: aiosqlite.Connection) -> None:
     await conn.execute("ALTER TABLE libraries ADD COLUMN excludes TEXT NOT NULL DEFAULT '[]'")
 
 
-MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5]
+async def _migrate_v6(conn: aiosqlite.Connection) -> None:
+    """多站点：作品（videos）和源（sources）分开，播放地址搬到源上；每部老影片生成一个 Jable 源。"""
+    for sql in (
+        """CREATE TABLE sources (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          video_id INTEGER NOT NULL,
+          site TEXT NOT NULL,
+          key TEXT NOT NULL,
+          site_vid TEXT NOT NULL DEFAULT '',
+          title TEXT NOT NULL DEFAULT '',
+          subtitle TEXT NOT NULL DEFAULT '',
+          stream_url TEXT NOT NULL DEFAULT '',
+          stream_expires INTEGER,
+          height INTEGER,
+          status TEXT NOT NULL DEFAULT 'active',
+          fail_streak INTEGER NOT NULL DEFAULT 0,
+          last_ok_at INTEGER,
+          last_fail_at INTEGER,
+          last_error TEXT NOT NULL DEFAULT '',
+          detail_at INTEGER,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          UNIQUE(site, key))""",
+        "CREATE INDEX sources_video ON sources(video_id)",
+        "CREATE INDEX sources_site_vid ON sources(site, site_vid)",
+        """CREATE TABLE source_checks (
+          video_id INTEGER NOT NULL,
+          site TEXT NOT NULL,
+          found INTEGER NOT NULL,
+          checked_at INTEGER NOT NULL,
+          PRIMARY KEY (video_id, site))""",
+        "ALTER TABLE videos ADD COLUMN code_key TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE videos ADD COLUMN uncensored INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE videos ADD COLUMN maker TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE videos ADD COLUMN director TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE videos ADD COLUMN series TEXT NOT NULL DEFAULT ''",
+        """INSERT INTO sources(video_id, site, key, site_vid, title, subtitle, stream_url, stream_expires, status,
+                               detail_at, created_at, updated_at)
+           SELECT id, 'jable', slug, CAST(id AS TEXT), title,
+                  CASE WHEN quality LIKE '%中文字幕%' OR categories LIKE '%"chinese-subtitle"%' THEN 'zh' ELSE '' END,
+                  hls_url, hls_expires, status, detail_at, created_at, updated_at FROM videos""",
+        """UPDATE videos SET uncensored=1 WHERE categories LIKE '%"uncensored"%'""",
+        "ALTER TABLE videos DROP COLUMN hls_url",
+        "ALTER TABLE videos DROP COLUMN hls_expires",
+        "ALTER TABLE tasks ADD COLUMN site TEXT NOT NULL DEFAULT ''",
+        "UPDATE tasks SET site='jable' WHERE kind IN ('list', 'detail')",
+        "ALTER TABLE subscriptions ADD COLUMN site TEXT NOT NULL DEFAULT 'jable'",
+    ):
+        await conn.execute(sql)
+    async with conn.execute("SELECT id, code, slug FROM videos") as cur:
+        rows = await cur.fetchall()
+    await conn.executemany("UPDATE videos SET code_key=? WHERE id=?", [(code_key(r[1] or r[2]), r[0]) for r in rows])
+    await conn.execute("CREATE INDEX videos_code_key ON videos(code_key)")
+
+
+MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6]
+WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
+WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
+                      "categories", "tags", "maker", "director", "series")
+SOURCE_FAIL_COOLDOWN = 300
+SOURCE_FAIL_COOLDOWN_MAX = 6 * 3600
 
 
 def now() -> int:
@@ -226,6 +289,28 @@ def _video_row(row: aiosqlite.Row | None) -> dict | None:
         if k in d:
             d[k] = json.loads(d[k] or "[]")
     return d
+
+
+def _empty(x) -> bool:
+    return x is None or x == "" or x == []
+
+
+def _merge(cur: dict, new: dict, primary: bool) -> dict:
+    """作品元数据合并：优先级最高的源覆盖（它没有的字段保留原值），其他源只补空字段。"""
+    out = {}
+    for k, v in new.items():
+        if _empty(v):
+            continue
+        if primary or _empty(cur.get(k)):
+            out[k] = v
+    return out
+
+
+def source_cooldown(src: dict) -> int:
+    """源连续失败后的冷却截止时间（0 表示不在冷却）：5 分钟起，每次翻倍，最长 6 小时。"""
+    if not src.get("fail_streak") or not src.get("last_fail_at"):
+        return 0
+    return src["last_fail_at"] + min(SOURCE_FAIL_COOLDOWN_MAX, SOURCE_FAIL_COOLDOWN * 2 ** (src["fail_streak"] - 1))
 
 
 def _job_row(row: aiosqlite.Row | None) -> dict | None:
@@ -288,6 +373,18 @@ class Database:
         async with self._lock:
             return await self.conn.execute(sql, tuple(params))
 
+    @asynccontextmanager
+    async def _tx(self):
+        """持锁的事务：查找再插入这类需要原子性的写操作用。"""
+        async with self._lock:
+            await self.conn.execute("BEGIN")
+            try:
+                yield self.conn
+                await self.conn.execute("COMMIT")
+            except BaseException:
+                await self.conn.execute("ROLLBACK")
+                raise
+
     async def _write_many(self, sql: str, rows: list[tuple]) -> int:
         async with self._lock:
             await self.conn.execute("BEGIN")
@@ -325,58 +422,204 @@ class Database:
             (key, value),
         )
 
-    # ---- 影片 ----
+    # ---- 作品与源 ----
 
-    async def upsert_list_item(self, it: ListItem) -> bool:
-        """列表页数据入库，返回是否为新影片。"""
-        t = now()
-        exists = await self._one("SELECT 1 FROM videos WHERE id=?", (it.video_id,))
-        await self._write(
-            """
-            INSERT INTO videos(id, slug, code, title, duration, thumb_url, preview_url, views, likes,
-                               created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-              slug=excluded.slug, code=excluded.code, title=excluded.title,
-              duration=COALESCE(excluded.duration, duration),
-              thumb_url=excluded.thumb_url, preview_url=excluded.preview_url,
-              views=COALESCE(excluded.views, views), likes=COALESCE(excluded.likes, likes),
-              status='active', updated_at=excluded.updated_at
-            """,
-            (it.video_id, it.slug, it.code, it.title, it.duration, it.thumb_url, it.preview_url,
-             it.views, it.likes, t, t),
-        )
-        return exists is None
+    async def _attach(self, site: str, key: str, code: str, uncensored: bool, slug: str, site_vid: str,
+                      title: str, subtitle: str) -> tuple[int, int, bool]:
+        """在事务里调用：找到或新建这个源和它所属的作品，返回 (作品 id, 源 id, 是否新作品)。
 
-    async def upsert_detail(self, d: VideoDetail) -> None:
+        已有的源直接用；新源按番号匹配键 + 是否无码流出找作品，找不到就新建（slug 撞了加序号）。
+        """
+        t = now()
+        async with self.conn.execute("SELECT id, video_id FROM sources WHERE site=? AND key=?", (site, key)) as cur:
+            src = await cur.fetchone()
+        if src is not None:
+            await self.conn.execute(
+                """UPDATE sources SET site_vid=CASE WHEN ?!='' THEN ? ELSE site_vid END,
+                          title=CASE WHEN ?!='' THEN ? ELSE title END,
+                          subtitle=CASE WHEN ?!='' THEN ? ELSE subtitle END, status='active', updated_at=?
+                   WHERE id=?""",
+                (site_vid, site_vid, title, title, subtitle, subtitle, t, src["id"]),
+            )
+            return src["video_id"], src["id"], False
+        ck = code_key(code)
+        work = None
+        if ck:
+            async with self.conn.execute(
+                "SELECT id FROM videos WHERE code_key=? AND uncensored=? ORDER BY status='active' DESC, id LIMIT 1",
+                (ck, int(uncensored)),
+            ) as cur:
+                work = await cur.fetchone()
+        created = work is None
+        if created:
+            base, n = slug, 1
+            while True:
+                async with self.conn.execute("SELECT 1 FROM videos WHERE slug=?", (slug,)) as cur:
+                    if await cur.fetchone() is None:
+                        break
+                n += 1
+                slug = f"{base}-{n}"
+            cur = await self.conn.execute(
+                "INSERT INTO videos(slug, code, code_key, uncensored, title, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (slug, code.upper(), ck, int(uncensored), title, t, t),
+            )
+            video_id = cur.lastrowid
+        else:
+            video_id = work["id"]
+        cur = await self.conn.execute(
+            "INSERT INTO sources(video_id, site, key, site_vid, title, subtitle, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            (video_id, site, key, site_vid, title, subtitle, t, t),
+        )
+        return video_id, cur.lastrowid, created
+
+    async def _is_primary(self, video_id: int, site: str, rank: Callable[[str], int]) -> bool:
+        """这个站点是不是作品现有可用源里优先级最高的（元数据以它为准）。"""
+        async with self.conn.execute("SELECT DISTINCT site FROM sources WHERE video_id=? AND status='active'",
+                                     (video_id,)) as cur:
+            sites = [r["site"] for r in await cur.fetchall()]
+        return all(rank(other) >= rank(site) for other in sites)
+
+    async def _update_work(self, video_id: int, fields: dict, code: str = "") -> None:
+        t = now()
+        sets = dict(fields)
+        for k in ("models", "categories", "tags"):
+            if k in sets:
+                sets[k] = json.dumps(sets[k], ensure_ascii=False)
+        if code:
+            sets["code"] = code.upper()
+            sets["code_key"] = code_key(code)
+        sets["status"] = "active"
+        sets["updated_at"] = t
+        cols = ", ".join(f"{k}=?" for k in sets)
+        await self.conn.execute(f"UPDATE videos SET {cols} WHERE id=?", (*sets.values(), video_id))
+
+    async def upsert_item(self, site: str, it: SourceItem, slug: str, rank: Callable[[str], int]) -> tuple[int, bool]:
+        """列表页数据入库：找到或新建作品，记下这个源。返回 (作品 id, 是否新作品)。"""
+        async with self._tx():
+            video_id, _, created = await self._attach(site, it.key, it.code, it.uncensored, slug, it.site_vid,
+                                                      it.title, it.subtitle)
+            primary = await self._is_primary(video_id, site, rank)
+            async with self.conn.execute("SELECT * FROM videos WHERE id=?", (video_id,)) as cur:
+                work = dict(await cur.fetchone())
+            new = {k: getattr(it, k) for k in WORK_LIST_FIELDS}
+            await self._update_work(video_id, _merge(work, new, primary), it.code if primary else "")
+        return video_id, created
+
+    async def upsert_detail(self, site: str, d: SourceDetail, slug: str, rank: Callable[[str], int]) -> int:
+        """详情页数据入库：更新这个源（播放地址等）并合并作品元数据，返回作品 id。"""
+        t = now()
+        async with self._tx():
+            video_id, source_id, _ = await self._attach(site, d.key, d.code, d.uncensored, slug, d.site_vid,
+                                                        d.title, d.subtitle)
+            await self.conn.execute(
+                """UPDATE sources SET stream_url=?, stream_expires=?, subtitle=?, detail_at=?, status='active',
+                          fail_streak=0, last_ok_at=?, last_error='', updated_at=? WHERE id=?""",
+                (d.stream_url, d.stream_expires, d.subtitle, t, t, t, source_id),
+            )
+            primary = await self._is_primary(video_id, site, rank)
+            async with self.conn.execute("SELECT * FROM videos WHERE id=?", (video_id,)) as cur:
+                work = _video_row(await cur.fetchone())
+            new = {k: getattr(d, k) for k in WORK_DETAIL_FIELDS}
+            fields = _merge(work, new, primary)
+            fields["detail_at"] = t
+            await self._update_work(video_id, fields, d.code if primary else "")
+        return video_id
+
+    async def get_video_by_id(self, video_id: int) -> dict | None:
+        return _video_row(await self._one("SELECT * FROM videos WHERE id=?", (video_id,)))
+
+    async def get_sources(self, video_id: int) -> list[dict]:
+        return [dict(r) for r in await self._all("SELECT * FROM sources WHERE video_id=? ORDER BY id", (video_id,))]
+
+    async def sources_for(self, video_ids: list[int]) -> dict[int, list[dict]]:
+        if not video_ids:
+            return {}
+        marks = ",".join("?" * len(video_ids))
+        rows = await self._all(f"SELECT * FROM sources WHERE video_id IN ({marks}) ORDER BY id", video_ids)
+        out: dict[int, list[dict]] = {}
+        for r in rows:
+            out.setdefault(r["video_id"], []).append(dict(r))
+        return out
+
+    async def get_source(self, source_id: int) -> dict | None:
+        row = await self._one("SELECT * FROM sources WHERE id=?", (source_id,))
+        return dict(row) if row else None
+
+    async def find_source(self, site: str, key: str) -> dict | None:
+        row = await self._one("SELECT * FROM sources WHERE site=? AND key=?", (site, key))
+        return dict(row) if row else None
+
+    async def set_stream(self, source_id: int, url: str, expires: int | None) -> None:
         t = now()
         await self._write(
-            """
-            INSERT INTO videos(id, slug, code, title, cover_url, release_date, quality, views, favs,
-                               models, categories, tags, hls_url, hls_expires, detail_at,
-                               created_at, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-              slug=excluded.slug, code=excluded.code, title=excluded.title,
-              cover_url=excluded.cover_url, release_date=excluded.release_date, quality=excluded.quality,
-              views=COALESCE(excluded.views, views), favs=COALESCE(excluded.favs, favs),
-              models=excluded.models, categories=excluded.categories, tags=excluded.tags,
-              hls_url=excluded.hls_url, hls_expires=excluded.hls_expires, detail_at=excluded.detail_at,
-              status='active', updated_at=excluded.updated_at
-            """,
-            (d.video_id, d.slug, d.code, d.title, d.cover_url, d.release_date, d.quality, d.views, d.favs,
-             json.dumps(d.models, ensure_ascii=False), json.dumps(d.categories, ensure_ascii=False),
-             json.dumps(d.tags, ensure_ascii=False), d.hls_url, d.hls_expires, t, t, t),
+            """UPDATE sources SET stream_url=?, stream_expires=?, status='active', fail_streak=0, last_ok_at=?,
+                      last_error='', updated_at=? WHERE id=?""",
+            (url, expires, t, t, source_id),
         )
+
+    async def source_failed(self, source_id: int, error: str) -> None:
+        await self._write(
+            "UPDATE sources SET fail_streak=fail_streak+1, last_fail_at=?, last_error=? WHERE id=?",
+            (now(), error[:500], source_id),
+        )
+
+    async def update_source(self, source_id: int, **fields) -> None:
+        await self._update("sources", source_id, fields)
+
+    async def mark_source_gone(self, site: str, key: str) -> int | None:
+        """源已下架；作品没有其他可用源时也标为下架。返回作品 id。"""
+        async with self._tx():
+            async with self.conn.execute("SELECT id, video_id FROM sources WHERE site=? AND key=?", (site, key)) as cur:
+                src = await cur.fetchone()
+            if src is None:
+                return None
+            t = now()
+            await self.conn.execute("UPDATE sources SET status='gone', updated_at=? WHERE id=?", (t, src["id"]))
+            async with self.conn.execute(
+                "SELECT 1 FROM sources WHERE video_id=? AND status='active' LIMIT 1", (src["video_id"],)
+            ) as cur:
+                if await cur.fetchone() is None:
+                    await self.conn.execute("UPDATE videos SET status='gone', updated_at=? WHERE id=?",
+                                            (t, src["video_id"]))
+            return src["video_id"]
+
+    async def cached_stream_url(self, video_id: int) -> str:
+        """作品任意一个缓存了播放地址的源（直写 CDN 地址的调试模式用）。"""
+        row = await self._one(
+            "SELECT stream_url FROM sources WHERE video_id=? AND status='active' AND stream_url!='' "
+            "ORDER BY stream_expires IS NULL, stream_expires DESC LIMIT 1",
+            (video_id,),
+        )
+        return row["stream_url"] if row else ""
+
+    async def sources_missing_detail(self, rank: Callable[[str], int]) -> list[tuple[str, str]]:
+        """没有详情的作品，各取优先级最高的可用源，返回 [(站点, key)]。"""
+        rows = await self._all(
+            """SELECT s.video_id, s.site, s.key FROM sources s JOIN videos v ON v.id=s.video_id
+               WHERE v.detail_at IS NULL AND v.status='active' AND s.status='active' ORDER BY s.video_id DESC"""
+        )
+        best: dict[int, tuple[str, str]] = {}
+        for r in rows:
+            cur = best.get(r["video_id"])
+            if cur is None or rank(r["site"]) < rank(cur[0]):
+                best[r["video_id"]] = (r["site"], r["key"])
+        return list(best.values())
+
+    async def cdn_video_map(self, site: str = "jable") -> dict[int, str]:
+        """站内数字 id -> 作品 slug（strm 扫描时把 CDN 直链认回作品）。"""
+        rows = await self._all(
+            "SELECT s.site_vid, v.slug FROM sources s JOIN videos v ON v.id=s.video_id WHERE s.site=? AND s.site_vid!=''",
+            (site,),
+        )
+        return {int(r["site_vid"]): r["slug"] for r in rows if r["site_vid"].isdigit()}
 
     async def get_video(self, slug: str) -> dict | None:
         return _video_row(await self._one("SELECT * FROM videos WHERE slug=?", (slug.lower(),)))
 
     async def set_duration(self, video_id: int, duration: int) -> None:
         await self._write("UPDATE videos SET duration=? WHERE id=?", (duration, video_id))
-
-    async def mark_gone(self, slug: str) -> None:
-        await self._write("UPDATE videos SET status='gone', updated_at=? WHERE slug=?", (now(), slug))
 
     async def search_videos(self, q: str = "", flt: str = "", offset: int = 0, limit: int = 50,
                             library_id: int | None = None):
@@ -432,10 +675,6 @@ class Database:
         )
         out["quality"] = [dict(r) for r in rows]
         return out
-
-    async def slugs_missing_detail(self) -> list[str]:
-        rows = await self._all("SELECT slug FROM videos WHERE detail_at IS NULL AND status='active' ORDER BY id DESC")
-        return [r["slug"] for r in rows]
 
     async def video_stats(self) -> dict:
         row = await self._one(
@@ -851,28 +1090,33 @@ class Database:
 
     # ---- task ----
 
-    async def add_tasks(self, job_id: int, kind: str, targets: Iterable[str], priority: int = 0) -> int:
+    async def add_tasks(self, job_id: int, kind: str, targets: Iterable[str], priority: int = 0,
+                        site: str = "") -> int:
         t = now()
-        rows = [(job_id, kind, str(x), priority, t) for x in targets]
+        rows = [(job_id, kind, str(x), priority, site, t) for x in targets]
         if not rows:
             return 0
         return await self._write_many(
-            "INSERT OR IGNORE INTO tasks(job_id, kind, target, priority, updated_at) VALUES(?, ?, ?, ?, ?)", rows
+            "INSERT OR IGNORE INTO tasks(job_id, kind, target, priority, site, updated_at) VALUES(?, ?, ?, ?, ?, ?)",
+            rows,
         )
 
-    async def claim_task(self) -> dict | None:
+    async def claim_task(self, skip_sites: Iterable[str] = ()) -> dict | None:
+        """领一个可执行的子任务；skip_sites 里的站点（被拦截、并发已满、未启用）的任务先不领。"""
         t = now()
+        skip = list(skip_sites)
+        cond = f"AND t.site NOT IN ({','.join('?' * len(skip))})" if skip else ""
         async with self._lock:
             async with self.conn.execute(
-                """
+                f"""
                 UPDATE tasks SET status='running', attempts=attempts+1, updated_at=?
                 WHERE id = (
                   SELECT t.id FROM tasks t JOIN jobs j ON j.id = t.job_id
-                  WHERE t.status='pending' AND t.next_run_at<=? AND j.status='running'
+                  WHERE t.status='pending' AND t.next_run_at<=? AND j.status='running' {cond}
                   ORDER BY t.priority DESC, t.id LIMIT 1)
                 RETURNING *
                 """,
-                (t, t),
+                (t, t, *skip),
             ) as cur:
                 row = await cur.fetchone()
         return dict(row) if row else None
