@@ -1,4 +1,4 @@
-import { FileVideo, Film, FolderTree, LayoutDashboard, ListChecks, LogOut, Menu as MenuIcon, Monitor, Moon, Pause, Play, RotateCw, ScrollText, Settings2, Sun } from "lucide-react";
+import { FileVideo, Film, FolderTree, LayoutDashboard, ListChecks, LogOut, Menu as MenuIcon, Monitor, Moon, PanelLeftClose, PanelLeftOpen, Pause, Play, RotateCw, ScrollText, Settings2, Sun } from "lucide-react";
 import { type ComponentType, lazy, Suspense, useEffect, useState } from "react";
 import { ConfirmHost } from "./components/confirm";
 import { PlayerHost } from "./components/player";
@@ -60,17 +60,33 @@ function Console({ user }: { user: string | null }) {
   const route = useRoute();
   const current = pages.find(p => p.id === route.page) ?? pages[0];
   const [navOpen, setNavOpen] = useState(false);
+  const [navCollapsed, setNavCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem("hls2strm.sidebar-collapsed") === "true";
+    } catch {
+      return false;
+    }
+  });
   const { data: status, isError } = useStatus();
   const meta = useMeta();
   const state = engineState(status, isError, meta.label);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("hls2strm.sidebar-collapsed", String(navCollapsed));
+    } catch {
+      // 存储不可用时仍可在本次页面内折叠。
+    }
+  }, [navCollapsed]);
 
   useEffect(() => {
     document.title = `${current.name} · hls2strm`;
     closeDetail();
   }, [current]);
 
-  const nav = (
+  const nav = (compact = false) => (
     <Nav
+      compact={compact}
       current={current.id}
       status={status}
       user={user}
@@ -82,11 +98,11 @@ function Console({ user }: { user: string | null }) {
   );
 
   return (
-    <div className="min-h-screen lg:grid lg:grid-cols-[212px_minmax(0,1fr)]">
-      <aside className="sticky top-0 hidden h-screen flex-col border-r border-line bg-panel lg:flex">{nav}</aside>
+    <div className={cn("min-h-screen lg:grid", navCollapsed ? "lg:grid-cols-[60px_minmax(0,1fr)]" : "lg:grid-cols-[212px_minmax(0,1fr)]")}>
+      <aside id="main-sidebar" className="sticky top-0 hidden h-screen flex-col border-r border-line bg-panel lg:flex">{nav(navCollapsed)}</aside>
       <Sheet open={navOpen} onOpenChange={setNavOpen}>
         <SheetContent side="left" label="导航" className="flex flex-col">
-          {nav}
+          {nav()}
         </SheetContent>
       </Sheet>
 
@@ -94,6 +110,15 @@ function Console({ user }: { user: string | null }) {
         <header className="sticky top-0 z-30 flex h-12 items-center gap-2 border-b border-line bg-bg/90 px-3 backdrop-blur sm:px-5">
           <Button size="icon" variant="ghost" className="lg:hidden" onClick={() => setNavOpen(true)} aria-label="打开导航">
             <MenuIcon />
+          </Button>
+          <Button
+            size="icon" variant="ghost" className="hidden lg:inline-flex"
+            onClick={() => setNavCollapsed(v => !v)}
+            aria-label={navCollapsed ? "展开侧栏" : "折叠侧栏"}
+            title={navCollapsed ? "展开侧栏" : "折叠侧栏"}
+            aria-expanded={!navCollapsed} aria-controls="main-sidebar"
+          >
+            {navCollapsed ? <PanelLeftOpen /> : <PanelLeftClose />}
           </Button>
           <h1 className="shrink-0 text-base font-semibold">{current.name}</h1>
           <div className="mx-2 hidden h-4 w-px bg-line sm:block" />
@@ -117,20 +142,20 @@ function Console({ user }: { user: string | null }) {
   );
 }
 
-function Nav({ current, status, user, onGo }: { current: string; status: Status | undefined; user: string | null; onGo: (id: string) => void }) {
+function Nav({ current, status, user, onGo, compact = false }: { current: string; status: Status | undefined; user: string | null; onGo: (id: string) => void; compact?: boolean }) {
   const failed = Object.values(status?.queue ?? {}).reduce((a, q) => a + (q.failed ?? 0), 0);
   const run = useRun();
   const paused = status?.engine.paused;
   return (
     <>
-      <div className="flex h-12 items-center gap-2 border-b border-line px-4">
-        <span className="flex size-6 items-center justify-center rounded-md bg-accent text-accent-ink">
+      <div className={cn("flex h-12 items-center gap-2 border-b border-line", compact ? "justify-center" : "px-4")}>
+        <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-accent text-accent-ink" title={compact ? `hls2strm ${status?.version ?? ""}` : undefined}>
           <Play className="size-3.5 fill-current" />
         </span>
-        <span className="font-semibold tracking-tight">hls2strm</span>
-        <span className="ml-auto text-xs text-muted">{status?.version}</span>
+        <span className={compact ? "sr-only" : "font-semibold tracking-tight"}>hls2strm</span>
+        {!compact && <span className="ml-auto text-xs text-muted">{status?.version}</span>}
       </div>
-      <nav className="flex-1 space-y-0.5 overflow-y-auto p-2">
+      <nav className="flex-1 space-y-0.5 overflow-y-auto p-2" aria-label="主导航">
         {pages.map(p => (
           <a
             key={p.id}
@@ -140,42 +165,47 @@ function Nav({ current, status, user, onGo }: { current: string; status: Status 
               onGo(p.id);
             }}
             aria-current={current === p.id ? "page" : undefined}
+            aria-label={p.name}
+            title={compact ? `${p.name}${p.id === "jobs" && failed > 0 ? `（${failed} 个失败子任务）` : ""}` : undefined}
             className={cn(
-              "flex h-9 items-center gap-2.5 rounded-md px-2.5 text-sm text-muted transition-colors hover:bg-panel-2 hover:text-ink",
+              "relative flex h-9 items-center gap-2.5 rounded-md text-sm text-muted transition-colors hover:bg-panel-2 hover:text-ink",
+              compact ? "justify-center" : "px-2.5",
               current === p.id && "bg-accent-soft font-medium text-accent hover:bg-accent-soft hover:text-accent",
             )}
           >
-            <p.icon className="size-4" />
-            {p.name}
+            <p.icon className="size-4 shrink-0" />
+            <span className={compact ? "sr-only" : undefined}>{p.name}</span>
             {p.id === "jobs" && failed > 0 && (
-              <span className="ml-auto rounded bg-err-soft px-1.5 text-xs text-err" title="活动任务里失败的子任务">
-                {failed}
+              <span className={compact ? "absolute right-1 top-1 size-1.5 rounded-full bg-err" : "ml-auto rounded bg-err-soft px-1.5 text-xs text-err"} title={`活动任务里 ${failed} 个失败子任务`}>
+                <span className={compact ? "sr-only" : undefined}>{failed}</span>
               </span>
             )}
           </a>
         ))}
       </nav>
-      <div className="space-y-2 border-t border-line p-3">
+      <div className={cn("space-y-2 border-t border-line", compact ? "p-2" : "p-3")}>
         <Button
           size="sm"
           variant={paused ? "primary" : "outline"}
           className="w-full"
+          aria-label={paused ? "恢复全部任务" : "暂停全部任务"}
+          title={compact ? (paused ? "恢复全部任务" : "暂停全部任务") : undefined}
           onClick={() =>
             run(() => api.post(`/api/engine/${paused ? "resume" : "pause"}`), { success: paused ? "引擎已恢复" : "引擎已暂停" })
           }
         >
           {paused ? <Play /> : <Pause />}
-          {paused ? "恢复全部任务" : "暂停全部任务"}
+          {!compact && (paused ? "恢复全部任务" : "暂停全部任务")}
         </Button>
-        <ThemeSwitch />
+        <ThemeSwitch compact={compact} />
         {user && (
           <div className="flex items-center gap-2 pt-1 text-[13px]">
-            <span className="min-w-0 flex-1 truncate text-muted" title={`已登录：${user}`}>
+            <span className={compact ? "sr-only" : "min-w-0 flex-1 truncate text-muted"} title={`已登录：${user}`}>
               {user}
             </span>
-            <Button size="sm" variant="quiet" onClick={() => logout()}>
+            <Button size="sm" variant="quiet" className={compact ? "w-full" : undefined} onClick={() => logout()} aria-label="退出" title={compact ? `退出（${user}）` : undefined}>
               <LogOut />
-              退出
+              {!compact && "退出"}
             </Button>
           </div>
         )}
@@ -191,7 +221,7 @@ function applyTheme(t: Theme) {
   document.documentElement.classList.toggle("dark", dark);
 }
 
-function ThemeSwitch() {
+function ThemeSwitch({ compact = false }: { compact?: boolean }) {
   const [theme, setTheme] = useState<Theme>(() => {
     try {
       return (localStorage.getItem("hls2strm.theme") as Theme) || "system";
@@ -218,17 +248,19 @@ function ThemeSwitch() {
     { v: "dark", icon: Moon, name: "深色" },
   ];
   return (
-    <div className="flex rounded-md border border-line bg-panel-2 p-0.5" role="radiogroup" aria-label="主题">
+    <div className={cn("flex rounded-md border border-line bg-panel-2 p-0.5", compact && "flex-col")} role="radiogroup" aria-label="主题">
       {opts.map(o => (
         <button
           key={o.v}
           type="button"
           role="radio"
           aria-checked={theme === o.v}
+          aria-label={o.name}
           title={o.name}
           onClick={() => setTheme(o.v)}
           className={cn(
             "flex h-6 flex-1 items-center justify-center rounded-[5px] text-muted hover:text-ink",
+            compact && "h-7 flex-none",
             theme === o.v && "bg-panel text-ink shadow-[0_0_0_1px_var(--line)]",
           )}
         >
