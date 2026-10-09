@@ -41,12 +41,18 @@ const GROUPS: { id: string; title: string; keys: string[] }[] = [
       "resolve_token",
       "resolve_mode",
       "resolve_proxy_url",
+      "continuous_enabled", "continuous_ffmpeg", "continuous_ffprobe", "continuous_height",
+      "continuous_workers", "continuous_cache_mb", "continuous_timeout",
     ],
   },
   { id: "health", title: "连通性", keys: ["health_rank", "health_interval", "health_samples", "health_bytes", "health_slow_kbps"] },
 ];
 
 const LABELS: Record<string, string> = {
+  continuous_enabled: "允许外部连续播放（按需转码）",
+  continuous_ffmpeg: "FFmpeg 路径", continuous_ffprobe: "FFprobe 路径",
+  continuous_height: "连续播放输出高度上限", continuous_workers: "连续播放转码并发",
+  continuous_cache_mb: "连续播放缓存上限（MB）", continuous_timeout: "连续播放单片超时（秒）",
   sites: "各站点",
   site_priority: "站点优先顺序",
   proxy: "抓取代理",
@@ -287,7 +293,7 @@ function SitesEditor({ sites, onChange }: { sites: Record<string, SiteConfig>; o
           <div key={name} className={cn("rounded-md border border-line p-3", !cfg.enabled && "bg-panel-2/60")}>
             <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-2">
               <b className="text-[15px]">{m.label}</b>
-              <Chip>{m.direct ? (m.ip_bound ? "302（直链绑出口 IP，网关不用它）" : "可以 302") : "必须中转"}</Chip>
+              <Chip>{m.lines.length ? "按线路策略播放" : m.direct ? (m.ip_bound ? "302（直链绑出口 IP，网关不用它）" : "可以 302") : "必须中转"}</Chip>
               <label className="ml-auto flex cursor-pointer items-center gap-2 text-[13px]">
                 <Switch checked={cfg.enabled} onCheckedChange={v => update(name, { enabled: v })} />
                 启用
@@ -323,7 +329,7 @@ function LinesTable({ specs, cfg, onChange }: { specs: LineSpecMeta[]; cfg: Site
   const lineCfg = (name: string): LineConfig => cfg.lines[name] ?? { enabled: true, proxy: false };
   const setLine = (name: string, patch: Partial<LineConfig>) => onChange({ lines: { ...cfg.lines, [name]: { ...lineCfg(name), ...patch } }, line_order: order });
   const reorder = useReorder(order, line_order => onChange({ line_order }));
-  const mode = (s: LineSpecMeta, c: LineConfig) => (!s.supported ? "暂不支持" : !s.direct || c.proxy ? "中转" : s.ip_bound ? "302（绑出口 IP）" : "302");
+  const mode = (s: LineSpecMeta, c: LineConfig) => (!s.supported ? "暂不支持" : !s.direct || c.proxy || c.direct_mode === "proxy" ? "中转" : c.direct_mode === "allow" ? "302（允许外部直连）" : s.ip_uncertain ? "IP 限制待验证" : s.ip_bound ? "302（绑出口 IP）" : "302");
   return (
     <div className="mt-3" ref={reorder.root}>
       <div className="mb-1 text-[13px] text-muted">线路（拖动手柄调整尝试顺序，保存后生效）</div>
@@ -335,7 +341,7 @@ function LinesTable({ specs, cfg, onChange }: { specs: LineSpecMeta[]; cfg: Site
             <Th>播放站</Th>
             <Th>方式</Th>
             <Th>启用</Th>
-            <Th>强制中转</Th>
+            <Th>直连策略</Th>
           </tr>
         </thead>
         <tbody>
@@ -360,7 +366,12 @@ function LinesTable({ specs, cfg, onChange }: { specs: LineSpecMeta[]; cfg: Site
                   <Switch checked={c.enabled} disabled={!s.supported} onCheckedChange={v => setLine(name, { enabled: v })} aria-label={`启用线路 ${name}`} />
                 </Td>
                 <Td>
-                  <Switch checked={c.proxy} disabled={!s.direct} onCheckedChange={v => setLine(name, { proxy: v })} aria-label={`线路 ${name} 强制中转`} />
+                  <Select value={c.proxy ? "proxy" : c.direct_mode || "auto"} disabled={!s.direct}
+                    aria-label={`线路 ${name} 直连策略`} onChange={e => setLine(name, {
+                      proxy: e.target.value === "proxy", direct_mode: e.target.value as LineConfig["direct_mode"],
+                    })}>
+                    <option value="auto">自动</option><option value="allow">允许外部直连</option><option value="proxy">强制中转</option>
+                  </Select>
                 </Td>
               </tr>
             );

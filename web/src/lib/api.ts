@@ -152,6 +152,7 @@ export interface LineSpecMeta {
   supported: boolean;
   direct: boolean;
   ip_bound: boolean;
+  ip_uncertain?: boolean;
 }
 
 export interface SiteMeta {
@@ -265,6 +266,7 @@ export interface HealthResponse {
 }
 
 export interface SourceLine extends StreamState {
+  ip_uncertain?: boolean;
   id: number;
   source_id: number;
   line: string;
@@ -434,6 +436,7 @@ export interface SchemaProp {
 }
 
 export interface LineConfig {
+  direct_mode?: "auto" | "allow" | "proxy";
   enabled: boolean;
   proxy: boolean;
 }

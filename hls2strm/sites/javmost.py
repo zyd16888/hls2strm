@@ -53,9 +53,9 @@ class JavMostSite(Site):
     name = "javmost"
     label = "JAVMost"
     default_domains = ["https://www.javmost.ws"]
-    stream = StreamTraits(direct=True, expires=True, ip_bound=True)
+    stream = StreamTraits(direct=True, expires=True, ip_bound=True, ip_uncertain=True)
     line_specs = {
-        "DOO": LineSpec("dooplayer", "mp4，播放器能直连；新片一般只有这一条"),
+        "DOO": LineSpec("dooplayer", "MP4；跨 IP 限制待验证，可按实际环境允许外部直连；新片一般只有这一条"),
         "DOOD": LineSpec("dood", "mp4，要 Referer，只能中转"),
         "TURBO": LineSpec("auto", "emturbovid，没实测过，按页面内容识别"),
         "SB": LineSpec("auto", "playersb，没实测过，按页面内容识别"),

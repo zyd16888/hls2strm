@@ -76,6 +76,7 @@ class LineConfig(BaseModel):
 
     enabled: bool = True
     proxy: bool = False  # 强制由本服务中转（比如直链在外网播放器上打不开时）
+    direct_mode: Literal["auto", "allow", "proxy"] = "auto"
 
 
 class SiteConfig(BaseModel):
@@ -153,9 +154,9 @@ class Settings(BaseModel):
     poster_crop: bool = Field(True, description="从封面裁出竖版 poster")
     # 播放
     public_base_url: str = Field("", description="Emby/Jellyfin 访问本服务的地址，写进 strm；留空使用 HLS2STRM_PUBLIC_BASE_URL")
-    play_mode: Literal["redirect", "proxy", "direct"] = Field(
+    play_mode: Literal["redirect", "proxy", "direct", "continuous"] = Field(
         "redirect",
-        description="redirect：302 到 CDN；proxy：本服务中转视频流；direct：strm 直接写 CDN 地址（约 3 小时失效，仅调试）",
+        description="redirect：302 到 CDN；proxy：本服务中转；continuous：固定 HLS 转码与自动换源（需启用）；direct：strm 写 CDN 地址，仅调试",
     )
     proxy_user_agents: list[str] = Field(
         default_factory=lambda: ["Lavf", "python-requests"],
@@ -211,7 +212,14 @@ class Settings(BaseModel):
     health_samples: int = Field(1, ge=1, le=5, description="每轮每个播放站抽几部片检测（每部最多访问一次源站）")
     health_bytes: int = Field(512, ge=64, le=8192, description="每次检测下载多少（KB）来测速")
     health_slow_kbps: int = Field(1500, ge=0, le=100000, description="检测速度低于它（kbps）算慢；0 不按速度分档")
-    resolve_mode: Literal["auto", "redirect", "proxy"] = Field(
+    continuous_enabled: bool = Field(False, description="允许外部连续播放：服务端按需转码为固定 HLS，可在分片失败时换源，消耗 CPU 和缓存空间")
+    continuous_ffmpeg: str = Field("ffmpeg", description="连续播放使用的 FFmpeg 可执行文件")
+    continuous_ffprobe: str = Field("ffprobe", description="连续播放使用的 FFprobe 可执行文件")
+    continuous_height: int = Field(1080, ge=360, le=2160, description="连续播放统一输出高度上限；宽高统一为 16:9，不足部分补黑边")
+    continuous_workers: int = Field(2, ge=1, le=4, description="连续播放同时运行的转码进程数；修改后重启服务生效")
+    continuous_cache_mb: int = Field(128, ge=32, le=2048, description="连续播放磁盘分片缓存上限（MB）")
+    continuous_timeout: int = Field(45, ge=10, le=120, description="连续播放单个分片生成及换源总超时（秒）")
+    resolve_mode: Literal["auto", "redirect", "proxy", "continuous"] = Field(
         "auto",
         description="网关 resolve 默认给什么地址（网关请求里带 mode 时以它为准）：auto 按上面的偏好挑源，"
                     "能直连给 CDN 地址、要中转给公网中转地址；redirect 只挑能直连的源；proxy 一律给公网中转地址",

@@ -332,7 +332,9 @@ def _line_view(c, site, ln: dict) -> dict:
     spec = site.line_specs.get(ln["line"])
     return {**ln, "host_label": HOST_LABELS.get(ln["host"] or (spec.host if spec else ""), ln["host"]),
             "enabled": cfg.enabled, "supported": spec is None or spec.supported,
-            "direct": t.direct and not cfg.proxy, "ip_bound": t.ip_bound, "expires_stream": t.expires,
+            "direct": t.direct and not cfg.proxy and cfg.direct_mode != "proxy",
+            "ip_bound": t.ip_bound and cfg.direct_mode != "allow",
+            "ip_uncertain": t.ip_uncertain and cfg.direct_mode != "allow", "expires_stream": t.expires,
             "cooldown_until": source_cooldown(ln), "health": c.resolver.health.tier(host_key(site, ln))}
 
 
@@ -852,7 +854,8 @@ def _line_specs(site) -> list[dict]:
     for name, spec in site.line_specs.items():
         t = HOST_TRAITS.get(spec.host)
         out.append({"name": name, "host": spec.host, "host_label": HOST_LABELS.get(spec.host, ""), "note": spec.note,
-                    "supported": spec.supported, "direct": bool(t and t.direct), "ip_bound": bool(t and t.ip_bound)})
+                    "supported": spec.supported, "direct": bool(t and t.direct), "ip_bound": bool(t and t.ip_bound),
+                    "ip_uncertain": bool(t and t.ip_uncertain)})
     return out
 
 

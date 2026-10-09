@@ -72,6 +72,7 @@ class StreamTraits:
     headers: dict[str, str] = field(default_factory=dict)  # 中转时请求 CDN 要带的头
     disguised_segments: bool = False  # 分片伪装成图片（video0.jpeg），中转时改名 .ts
     ip_bound: bool = False  # 直链绑了取地址时的出口 IP：和本服务同一出口的播放器能 302，网关（外网客户端）不行
+    ip_uncertain: bool = False  # 限制未确认；自动策略保守，允许用户按实际环境覆盖。
     ua_block: bool = False  # CDN 拒绝 ffmpeg 默认 UA（Lavf）等，这类客户端改走中转（设置里的「中转 UA 片段」）
     fake_header: bool = False  # 分片前面加了假文件头（比如 PNG），中转时从第一个 TS 同步字节开始转发
 

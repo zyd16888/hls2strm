@@ -82,6 +82,10 @@ def test_play_and_resolve_versions(tmp_path):
 
             assert c.put("/api/settings", json={"variant_mode": "all"}).status_code == 200
             assert c.get("/play/ipzz-983.m3u8", headers=h, follow_redirects=False).headers["location"] == master_url
+            # 原生 HLS 无画质菜单，网页显式要最高档时覆盖全局自动模式。
+            body = c.get("/play/ipzz-983.m3u8", params={"proxy": 1, "variants": "highest"}).text
+            refs = [ln for ln in body.splitlines() if ln and not ln.startswith("#")]
+            assert len(refs) == 1 and "720p/video.m3u8" in refs[0]
 
             assert c.put("/api/settings", json={"resolve_token": "tk", "resolve_proxy_url": "https://pub.example"}
                          ).status_code == 200

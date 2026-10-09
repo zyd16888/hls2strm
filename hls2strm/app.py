@@ -22,6 +22,7 @@ from .observability import Metrics, ring, setup_logging, shutdown_logging
 from .play import Resolver
 from .writer import OutputWriter
 from .runtime import RequestTelemetry, JsonCompression
+from .continuous import ContinuousPlayback, router as continuous_router
 
 log = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
@@ -48,6 +49,7 @@ class Context:
     writer: OutputWriter
     resolver: Resolver
     engine: Engine
+    continuous: ContinuousPlayback | None = None
 
 
 def database_path(data_dir: Path) -> Path:
@@ -78,6 +80,8 @@ def create_app(boot: BootConfig | None = None) -> FastAPI:
         play.set_signing_key(secret)
         auth = Auth(boot, secret)
         app.state.ctx = Context(boot, auth, db, store, metrics, fetcher, writer, resolver, engine)
+        app.state.ctx.continuous = ContinuousPlayback(app.state.ctx)
+        app.state.ctx.continuous.start()
         log.info("启动：数据目录 %s，输出目录 %s，对外地址 %s", boot.data_dir, store.output_dir, store.public_base_url)
         if not boot.ui_password:
             log.warning("未设置 HLS2STRM_UI_PASSWORD，Web 控制台没有登录保护")
@@ -85,6 +89,7 @@ def create_app(boot: BootConfig | None = None) -> FastAPI:
         try:
             yield
         finally:
+            await app.state.ctx.continuous.close()
             await engine.stop()
             await fetcher.close()
             await db.close()
@@ -95,6 +100,7 @@ def create_app(boot: BootConfig | None = None) -> FastAPI:
     app.add_middleware(RequestTelemetry)
     app.add_middleware(JsonCompression)
     app.include_router(play.router)
+    app.include_router(continuous_router)
     app.include_router(api.public)
     app.include_router(api.router)
     app.mount("/static", FrontendFiles(directory=STATIC_DIR, check_dir=False), name="static")

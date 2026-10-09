@@ -70,9 +70,11 @@ class RequestTelemetry:
         if ctx is None:
             return await self.app(scope, receive, send)
         path = scope["path"]
-        playback = path.startswith(("/play/", "/hls/", "/api/resolve/"))
+        playback = path.startswith(("/play/", "/hls/", "/media/", "/continuous/", "/api/resolve/"))
         tokens = (request_id.set(secrets.token_hex(8)), traffic.set("play" if playback else "background"))
         budget = time.monotonic() + ctx.store.current.resolve_timeout if playback else None
+        if path.startswith("/continuous/"):
+            budget = time.monotonic() + ctx.store.current.continuous_timeout
         dt = deadline.set(budget)
         started, status = time.monotonic(), 500
         headers_sent = False
@@ -103,7 +105,7 @@ class RequestTelemetry:
             await JSONResponse({"detail": "播放解析超过总时间预算"}, status_code=504)(scope, receive, observed_send)
         finally:
             ctx.metrics.inc(f"http_{status // 100}xx")
-            if status >= 500 or (time.monotonic()-started > 1 and not path.startswith(("/hls/", "/static/", "/api/logs/stream"))):
+            if status >= 500 or (time.monotonic()-started > 1 and not path.startswith(("/hls/", "/media/", "/static/", "/api/logs/stream"))):
                 logging.getLogger(__name__).info("请求 %s %s %s HTTP %d %.0fms", request_id.get(), scope["method"],
                                                  getattr(scope.get("route"), "path", "other"), status,
                                                  (time.monotonic()-started)*1000)

@@ -77,6 +77,7 @@ export const SUBTITLES: Record<string, string> = { zh: "中文字幕", en: "英�
 export const subtitleTag = (code: string) => (code === "zh" ? "中字" : code === "en" ? "英字" : "");
 
 export const PLAY_MODES: Record<string, string> = {
+  continuous: "连续播放（服务端转码与自动换源）",
   redirect: "302 跳转（ffmpeg 类客户端自动中转）",
   proxy: "全部中转",
   direct: "直写 CDN 地址（仅调试）",
@@ -88,6 +89,7 @@ export const VARIANT_MODES: Record<string, string> = {
 };
 
 export const RESOLVE_MODES: Record<string, string> = {
+  continuous: "固定 HLS 连续播放",
   auto: "按挑源偏好（能直连给 CDN 地址，要中转给中转地址）",
   redirect: "只挑能直连的源",
   proxy: "一律走中转",

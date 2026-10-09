@@ -18,7 +18,7 @@ ENV PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tzdata \
+    && apt-get install -y --no-install-recommends tzdata ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

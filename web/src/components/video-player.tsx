@@ -1,4 +1,4 @@
-// 网页试播的播放器：hls.js 播（不支持 MSE 的退回原生 HLS），控件自己画。控件和菜单都在播放器容器里，全屏时一起全屏。
+// 网页试播：先识别响应类型，HLS 用 hls.js，MP4 用原生 video；控件和菜单随容器全屏。
 // 快捷键由外层（对话框）把按键转给 handleKey，这样焦点在对话框里任何地方都能用。
 
 import type Hls from "hls.js";
@@ -30,6 +30,8 @@ import {
   useState,
 } from "react";
 import { cn } from "@/lib/utils";
+import { sourceLabel, usePlaybackSource } from "./use-playback-source";
+import { Button } from "./ui/button";
 
 export interface PlayerHandle {
   focus(): void;
@@ -106,13 +108,16 @@ export function VideoPlayer({ src, ref }: { src: string; ref?: Ref<PlayerHandle>
   const rootRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
-  const resumeAt = useRef(0); // 重试后接着从这里播
+  const source = usePlaybackSource(videoRef, src);
+  const resumeAt = source.resumeAt;
+  const chosenHeight = useRef<number | null>(null); // null 默认最高；-1 自动；其余为手动档位。
   const [prefs] = useState(loadPrefs);
 
-  const [attempt, setAttempt] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [waiting, setWaiting] = useState(true);
-  const [error, setError] = useState("");
+  const error = source.error;
+  const failRef = useRef(source.fail);
+  failRef.current = source.fail;
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [buffered, setBuffered] = useState<[number, number][]>([]);
@@ -135,56 +140,79 @@ export function VideoPlayer({ src, ref }: { src: string; ref?: Ref<PlayerHandle>
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
-    setError("");
     setWaiting(true);
     setLevels([]);
     setLevel(-1);
     let cancelled = false;
     let hls: Hls | null = null;
-    import("hls.js")
-      .then(({ default: HlsClass }) => {
-        if (cancelled) return;
-        if (!HlsClass.isSupported()) {
-          if (video.canPlayType("application/vnd.apple.mpegurl")) video.src = src;
-          else setError("这个浏览器播不了 HLS");
-          return;
+    const load = async () => {
+      if (!source.prepared) return;
+      const mediaSrc = source.prepared.url;
+      if (source.prepared.media_type !== "hls") {
+        video.src = mediaSrc;
+        video.load();
+        return;
+      }
+      const { default: HlsClass } = await import("hls.js");
+      if (cancelled) return;
+      if (!HlsClass.isSupported()) {
+        if (!video.canPlayType("application/vnd.apple.mpegurl")) throw new Error("这个浏览器播不了 HLS");
+        const nativeSrc = new URL(mediaSrc);
+        nativeSrc.searchParams.set("variants", "highest");
+        video.src = nativeSrc.href;
+        return;
+      }
+      hls = new HlsClass({ autoStartLoad: false });
+      hlsRef.current = hls;
+      let networkRetried = false;
+      let mediaRecovered = false;
+      hls.on(HlsClass.Events.MANIFEST_PARSED, () => {
+        if (!hls) return;
+        const available = hls.levels.map((l, index) => ({ index, height: l.height, bitrate: l.bitrate }));
+        setLevels(available);
+        const ordered = [...available].sort((a, b) => b.height - a.height || b.bitrate - a.bitrate);
+        const preferred = chosenHeight.current;
+        const best = preferred && preferred > 0 ? ordered.find(l => l.height === preferred) || ordered[0] : ordered[0];
+        if (best) {
+          hls.startLevel = best.index;
+          hls.loadLevel = preferred === -1 ? -1 : best.index;
+          setLevel(preferred === -1 ? -1 : best.index);
         }
-        hls = new HlsClass({ autoStartLoad: false });
-        hlsRef.current = hls;
-        let networkRetried = false;
-        let mediaRecovered = false;
-        hls.on(HlsClass.Events.MANIFEST_PARSED, () => {
-          if (!hls) return;
-          setLevels(hls.levels.map((l, index) => ({ index, height: l.height, bitrate: l.bitrate })));
-          hls.startLevel = hls.levels.length - 1; // 和 Emby 一样先给最高档，自动模式下网速不够再降
-          hls.startLoad(resumeAt.current || -1);
-        });
-        hls.on(HlsClass.Events.LEVEL_SWITCHED, (_, d) => setHeight(hls?.levels[d.level]?.height || 0));
-        hls.on(HlsClass.Events.ERROR, (_, d) => {
-          if (!d.fatal || !hls) return;
-          // 清单本身取不到（本服务找源失败、源站拦截）重试也没用，直接显示原因；分片断了再续一次
-          const network = d.type === HlsClass.ErrorTypes.NETWORK_ERROR && d.details !== HlsClass.ErrorDetails.MANIFEST_LOAD_ERROR;
-          if (network && !networkRetried) {
-            networkRetried = true;
-            hls.startLoad();
-          } else if (d.type === HlsClass.ErrorTypes.MEDIA_ERROR && !mediaRecovered) {
-            mediaRecovered = true;
-            hls.recoverMediaError();
-          } else {
-            setError(hlsErrorText(d));
-            setWaiting(false);
-          }
-        });
-        hls.loadSource(src);
-        hls.attachMedia(video);
-      })
-      .catch(e => setError(`播放器加载失败：${e}`));
+        hls.startLoad(resumeAt.current || -1);
+      });
+      hls.on(HlsClass.Events.LEVEL_SWITCHED, (_, d) => setHeight(hls?.levels[d.level]?.height || 0));
+      hls.on(HlsClass.Events.ERROR, (_, d) => {
+        if (!d.fatal || !hls) return;
+        // 清单本身取不到（本服务找源失败、源站拦截）重试也没用，直接显示原因；分片断了再续一次
+        const network = d.type === HlsClass.ErrorTypes.NETWORK_ERROR && !d.details.startsWith("manifest");
+        if (network && !networkRetried) {
+          networkRetried = true;
+          hls.startLoad();
+        } else if (d.type === HlsClass.ErrorTypes.MEDIA_ERROR && !mediaRecovered) {
+          mediaRecovered = true;
+          hls.recoverMediaError();
+        } else {
+          failRef.current(hlsErrorText(d));
+          setWaiting(false);
+        }
+      });
+      hls.loadSource(mediaSrc);
+      hls.attachMedia(video);
+    };
+    void load().catch(e => {
+      if (cancelled) return;
+      failRef.current(e instanceof Error ? e.message : `播放器加载失败：${e}`);
+      setWaiting(false);
+    });
     return () => {
       cancelled = true;
       hls?.destroy();
       hlsRef.current = null;
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
     };
-  }, [src, attempt]);
+  }, [source.prepared]);
 
   // 偏好应用到 video 上（换源会重置倍速，所以 defaultPlaybackRate 也设）
   useEffect(() => {
@@ -309,6 +337,7 @@ export function VideoPlayer({ src, ref }: { src: string; ref?: Ref<PlayerHandle>
     const hls = hlsRef.current;
     if (!hls) return;
     hls.currentLevel = index; // -1 回到自动
+    chosenHeight.current = index === -1 ? -1 : hls.levels[index]?.height || null;
     setLevel(index);
     setMenu(null);
   }, []);
@@ -328,10 +357,7 @@ export function VideoPlayer({ src, ref }: { src: string; ref?: Ref<PlayerHandle>
     else v.requestPictureInPicture().catch(() => {});
   }, []);
 
-  const retry = useCallback(() => {
-    resumeAt.current = videoRef.current?.currentTime || resumeAt.current;
-    setAttempt(a => a + 1);
-  }, []);
+  const retry = () => source.change("重新尝试", false, true);
 
   const handleKey = useCallback(
     (e: KeyboardEvent) => {
@@ -424,6 +450,16 @@ export function VideoPlayer({ src, ref }: { src: string; ref?: Ref<PlayerHandle>
   const pipOk = typeof document !== "undefined" && document.pictureInPictureEnabled;
 
   return (
+    <>
+    <div className="mb-2 flex flex-wrap items-center gap-2 text-xs" aria-live="polite">
+      <span className="min-w-0 flex-1 break-words text-muted">
+        {source.message || (source.current ? `当前源：${sourceLabel(source.current)}` : "尚未起播")}
+      </span>
+      <label className="flex items-center gap-1"><input type="checkbox" checked={source.automatic}
+        onChange={e => source.setAutomatic(e.target.checked)} />自动换源</label>
+      <Button size="sm" disabled={source.preparing} onClick={() => source.change("手动换源")}>换一个源</Button>
+      {source.pinned && <Button size="sm" disabled={source.preparing} onClick={source.useAllSources}>使用全部源</Button>}
+    </div>
     <div
       ref={rootRef}
       tabIndex={-1}
@@ -445,23 +481,22 @@ export function VideoPlayer({ src, ref }: { src: string; ref?: Ref<PlayerHandle>
           else togglePlay();
         }}
         onDoubleClick={toggleFullscreen}
-        onPlay={() => setPlaying(true)}
-        onPause={() => setPlaying(false)}
+        onPlay={() => { setPlaying(true); source.pauseState(false); }}
+        onPause={() => { setPlaying(false); source.pauseState(true); }}
         onEnded={() => setPlaying(false)}
         onWaiting={() => setWaiting(true)}
         onPlaying={() => setWaiting(false)}
         onCanPlay={() => setWaiting(false)}
-        onSeeking={() => setWaiting(true)}
+        onSeeking={() => { setWaiting(true); source.seeking(); }}
         onSeeked={() => setWaiting(false)}
         onLoadedMetadata={e => {
           const el = e.currentTarget;
           setDuration(el.duration);
           setHeight(el.videoHeight);
-          if (resumeAt.current && !hlsRef.current) el.currentTime = resumeAt.current; // 原生 HLS 重试后接着播
-          resumeAt.current = 0;
+          source.restore(el);
         }}
         onDurationChange={e => setDuration(e.currentTarget.duration)}
-        onTimeUpdate={e => setTime(e.currentTarget.currentTime)}
+        onTimeUpdate={e => { setTime(e.currentTarget.currentTime); source.progressed(); }}
         onProgress={e => {
           const el = e.currentTarget;
           const d = el.duration;
@@ -477,10 +512,15 @@ export function VideoPlayer({ src, ref }: { src: string; ref?: Ref<PlayerHandle>
         onRateChange={e => setRate(e.currentTarget.playbackRate)}
         onError={e => {
           if (hlsRef.current) return; // hls.js 自己报
-          setError(`播放失败（${e.currentTarget.error?.message || `错误码 ${e.currentTarget.error?.code ?? "?"}`}）`);
+          source.fail(`播放失败（${e.currentTarget.error?.message || `错误码 ${e.currentTarget.error?.code ?? "?"}`}）`);
           setWaiting(false);
         }}
       />
+
+      {fullscreen && <div className="absolute inset-x-0 top-0 z-20 flex items-center gap-3 bg-black/60 p-3 text-xs">
+        <span className="flex-1">{source.message || (source.current ? `当前源：${sourceLabel(source.current)}` : "正在选源")}</span>
+        <button type="button" disabled={source.preparing} onClick={() => source.change("手动换源")}>换一个源</button>
+      </div>}
 
       {waiting && !error && (
         <div className="pointer-events-none absolute inset-0 grid place-items-center">
@@ -626,6 +666,7 @@ export function VideoPlayer({ src, ref }: { src: string; ref?: Ref<PlayerHandle>
         </div>
       </div>
     </div>
+    </>
   );
 }
 

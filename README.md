@@ -9,6 +9,8 @@ strm 里写的是本服务的地址，播放时才去现取直链：同一部影
 - **可中断、可重试**：所有任务都存在 SQLite，进程被杀也能从断点续跑；失败按指数退避自动重试，也可以在页面上手动重试
 - **可配置**：代理、限速、并发、重试策略、输出路径模板、播放模式等都在网页上改，改完即时生效
 - **影片库**：每部影片可以查看并复制缓存的原站播放地址（CDN，显示剩余有效期）、原站页面链接、本服务地址和 strm 路径，也可以在网页里试播
+- **网页试播与复制**：按响应类型区分 HLS 和 MP4；MP4 拖动固定使用本次播放会话，HLS 默认最高画质，也可手动切档或选自动。线路「上次选用」表示该站上次取址结果，不代表正在播放。HTTP/IP 访问下，弹窗内复制同样支持降级处理。
+- **实际源与换源**：网页显示播放会话的实际站点、线路和格式；整体试播默认允许自动换源，也可手动「换一个源」。持续卡顿或恢复失败后新建会话按时间续播，保留音量、倍速和画质选择。指定源试播默认限定范围，可点「使用全部源」。不同站点剪辑可能有进度偏差，明显时长不一致时停止自动续接。
 
 ## 工作原理
 
@@ -54,7 +56,7 @@ nJAV：`njavtv.com` 就是 MissAV 的镜像，已经加进 MissAV 的默认域�
 | Streamtape | SupJav ST | mp4，约 24 小时 | 302，网关也能用 |
 | VidHide / StreamHG | SupJav EVS、FST，JavGuru SB | m3u8，约 36 小时，带出口 ASN | 302（直链绑出口） |
 | VOE | SupJav VOE，JavGuru VO | m3u8，约 4 小时，带出口 IP 前两段 | 302（直链绑出口） |
-| DooPlayer | JAVMost DOO | mp4，有效期不明（按 2 小时换新） | 302（直链绑出口） |
+| DooPlayer | JAVMost DOO | mp4，有效期不明（按 2 小时换新） | 跨 IP 限制待验证；自动策略保守，可在线路设置允许外部直连 |
 | MaxStream | JavGuru JK | m3u8（AES），约 12 小时 | 中转：CDN 只认浏览器 TLS 指纹和 UA |
 | LuluStream | SupJav LUC，JavGuru LU | m3u8（AES），约 8 小时 | 中转：同上 |
 | Vidara | SupJav VAS，JavGuru VI | m3u8，分片伪装成 .woff2 / .css | 中转（分片改名 .ts） |
@@ -269,6 +271,20 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 
 ## 播放模式
 
+### 自动换源与外部连续播放
+
+起播选源会在总时间预算内检查目标画质清单和少量媒体数据，坏候选临时冷却 5 分钟，成功预检缓存 30 秒；没有更好的源时可重试冷却候选。检测衡量的是服务器到 CDN 的链路，302 后无法得知客户端实际是否卡顿。
+
+网页整体试播默认自动换源，缓冲不足且持续无进度时触发；单次恢复最多 3 次换源、30 秒预算。稳定播放 30 秒后恢复预算。暂停、拖动恢复期、结束和后台挂起不作为卡顿；源用尽时明确报错，允许手动重试。页面显示源信息来自实际播放会话，取址成功后仍显示“正在加载”，有播放进度才显示“当前源”。
+
+外部 Emby/Infuse 可选用 **连续播放**：先开启 `continuous_enabled`，再选择 `play_mode=continuous`，或在单个播放地址上加 `continuous=1`；网关可用 `resolve_mode=continuous`（仍需配置中转地址）。它向客户端提供固定 VOD HLS，6 秒一个独立分片，按需定位与转码，上游失败后按同一时间点尝试其他源。支持请求任意分片，不需要预先转完整部影片。
+
+连续模式统一输出 H.264/AAC、30fps、双声道；当前实现始终转码，以保持跨源格式一致。默认上限 1080p、2 个转码进程、4 个会话、128 MB 分片缓存；排队也有限额，空闲会话 3 分钟后清理。FFmpeg/FFprobe 路径、画质上限、并发、缓存及超时可设置；并发修改后重启生效。Docker 包含 FFmpeg；本地启动时需自行安装。内部媒体回读使用 `127.0.0.1:HLS2STRM_PORT`，启动端口必须一致。
+
+该模式默认关闭，部署前应按 CPU 与带宽容量测试。已做本地生成、拖动和故障切换验证，**真实 Emby/Infuse 客户端兼容性仍待部署环境验收**。不同剪辑不能保证逐帧对齐；备用源明显时长不一致时拒绝续接。会话信息可用 `/continuous/{session}/info` 查看（播放令牌规则相同），响应表示服务端正在提供内容，不等于客户端成功播放。反向代理需转发 `/continuous/` 和 `/media/`。
+
+线路设置提供“自动 / 允许外部直连 / 强制中转”。JAVMost DOO 的 IP 绑定没有完成独立出口对照，因此标为待验证；确认自己的外部客户端能用同一条直链跨 IP 播放后，可选择“允许外部直连”。该设置不改动其他播放站的限制。
+
 | 模式 | 行为 |
 |---|---|
 | `redirect`（默认） | 302 到 CDN；Jable 源遇到 UA 命中「中转 UA 片段」（默认 `Lavf`、`python-requests`）的客户端改走中转；MissAV 源一律中转 |
@@ -279,7 +295,7 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 
 浏览器跨域请求（带 `Origin` 头，比如网页播放器直接读 strm 地址）也会走中转，`/play` 和 `/hls` 会返回 CORS 头，因为 CDN 本身不返回 CORS 头。
 
-中转支持多层播放列表（master → 子清单 → 分片），按站点带上请求头。源目录以外、或者带查询串的地址会签名后放进 `/hls/{源 id}/_x/…`，并带上 `.ts` / `.m3u8` 扩展名（新版 ffmpeg 只收白名单扩展名的分片）。mp4 直链（SupJav 的 ST 线路）中转时原样转发 Range。
+中转支持多层播放列表（master → 子清单 → 分片），按站点带上请求头。源目录以外、或者带查询串的地址会签名后放进 `/hls/{源 id}/_x/…`，并带上 `.ts` / `.m3u8` 扩展名（新版 ffmpeg 只收白名单扩展名的分片）。mp4 直链（如 JAVMost 的 DOO、SupJav 的 ST）中转时原样转发 Range；网页先以 HEAD 探测类型，再使用返回的 `/media/{源 id}?s=…` 会话地址播放。
 
 `/play/{slug}.m3u8?src=missav` 只用某个站点的源（试播、排查用）。
 
@@ -361,7 +377,7 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 
 ## API
 
-所有 `/api/*` 接口都要登录：浏览器用登录页拿到的会话 cookie，脚本直接用 HTTP Basic（`curl -u admin:密码`）；`/play` 和 `/hls` 不需要登录，可用播放令牌保护。`POST /api/login`、`POST /api/logout`、`GET /api/session` 不用登录。
+所有 `/api/*` 接口都要登录：浏览器用登录页拿到的会话 cookie，脚本直接用 HTTP Basic（`curl -u admin:密码`）；`/play`、`/hls` 和 `/media` 不需要登录，可用播放令牌保护；`/media` 另须有效播放会话。`POST /api/login`、`POST /api/logout`、`GET /api/session` 不用登录。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|

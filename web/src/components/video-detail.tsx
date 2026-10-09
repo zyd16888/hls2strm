@@ -277,11 +277,11 @@ function LineRow({ v, src, ln }: { v: Video; src: Source; ln: SourceLine }) {
     <li className={"flex flex-wrap items-center gap-2 text-[13px] " + (ln.enabled ? "" : "opacity-55")}>
       <span className="font-mono">{ln.line}</span>
       <span className="text-muted">{ln.host_label}</span>
-      <Chip>{ln.direct ? (ln.ip_bound ? "302·绑 IP" : "302") : "中转"}</Chip>
+      <Chip>{ln.direct ? (ln.ip_uncertain ? "302·IP 限制待验证" : ln.ip_bound ? "302·绑 IP" : "302") : "中转"}</Chip>
       <QualityChip row={ln} />
       <HealthChip tier={ln.health} />
       <Chip tone={ln.enabled ? state.tone : "neutral"}>{ln.enabled ? state.text : "已停用"}</Chip>
-      {src.line === ln.line && <span className="text-xs text-accent">当前在用</span>}
+      {src.line === ln.line && <span className="text-xs text-muted" title="该站点上次取播放地址时选中的线路，不代表正在播放或已成功起播">上次选用</span>}
       <div className="ml-auto flex items-center gap-1">
         {ln.stream_url && <CopyButton text={ln.stream_url} label="复制地址" size="icon-sm" />}
         {usable && (

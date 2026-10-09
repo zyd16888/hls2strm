@@ -48,7 +48,7 @@ HOST_TRAITS: dict[str, StreamTraits] = {
     "turbovip": StreamTraits(direct=False, expires=True, fake_header=True, headers={"Referer": "https://supjav.com/"}),
     "maxstream": StreamTraits(direct=False, expires=True),
     "dood": StreamTraits(direct=False, expires=True),
-    "dooplayer": StreamTraits(direct=True, expires=True, ip_bound=True),
+    "dooplayer": StreamTraits(direct=True, expires=True, ip_bound=True, ip_uncertain=True),
     "av123": StreamTraits(direct=False, expires=False, disguised_segments=True),
 }
 MP4_HOSTS = {"streamtape", "dood", "dooplayer"}  # 直链是 mp4，读播放列表认不出画质

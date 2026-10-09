@@ -25,6 +25,20 @@ def jpeg(w: int = 800, h: int = 538) -> bytes:
     return buf.getvalue()
 
 
+class FakeMediaSession:
+    async def get(self, url, **kw):
+        class Response:
+            status_code = 206
+            headers = {"content-type": "video/mp2t"}
+
+            async def aiter_content(self):
+                yield b"\x47" + b"\0" * 32767
+
+            async def aclose(self):
+                pass
+        return Response()
+
+
 class FakeFetcher:
     """按路径返回样本页面；详情页按 slug 换掉 videoId，模拟不同影片。"""
 
@@ -36,6 +50,7 @@ class FakeFetcher:
         self.fail: dict[str, Exception] = {}
         self.pages: dict[str, dict[str, str]] = {}  # 其他站点：站点 -> {路径: 页面}
         self.files: dict[str, bytes] = {}  # get_bytes 按地址返回的内容
+        self.session = FakeMediaSession()
 
     async def get_page(self, path: str, *, priority: bool = False) -> Page:
         self.calls.append(path)

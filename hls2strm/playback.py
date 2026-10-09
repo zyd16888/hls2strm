@@ -42,7 +42,7 @@ class PlaybackSessions:
         key = self.create(resolved)
         ttl = self.items[key][0] - time.monotonic()
         data = {"video": resolved.video, "source": resolved.source, "line": resolved.line,
-                "proxy_forced": resolved.proxy_forced}
+                "proxy_forced": resolved.proxy_forced, "allow_direct": resolved.allow_direct}
         await db._write("INSERT INTO play_sessions(id,source_id,data,expires_at) VALUES(?,?,?,?)",
                         (key, resolved.source["id"], json.dumps(data), int(time.time()+ttl)))
         self.created += 1
@@ -61,7 +61,8 @@ class PlaybackSessions:
             from .play import Resolved
             from .sites import get_site
             data = json.loads(row["data"])
-            resolved = Resolved(data["video"], data["source"], get_site(data["source"]["site"]), data["line"], data["proxy_forced"])
+            resolved = Resolved(data["video"], data["source"], get_site(data["source"]["site"]), data["line"],
+                                data["proxy_forced"], data.get("allow_direct", False))
             self.items[key] = (time.monotonic()+row["expires_at"]-time.time(), resolved)
             while len(self.items) > self.capacity:
                 self.items.popitem(last=False)

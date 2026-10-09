@@ -12,7 +12,7 @@ export default defineConfig(({ command }) => ({
   plugins: [react(), tailwindcss()],
   resolve: { alias: { "@": path.resolve(import.meta.dirname, "src") } },
   server: {
-    proxy: Object.fromEntries(["/api", "/play", "/hls", "/healthz"].map(p => [p, { target: backend, changeOrigin: true }])),
+    proxy: Object.fromEntries(["/api", "/play", "/hls", "/media", "/continuous", "/healthz"].map(p => [p, { target: backend, changeOrigin: true }])),
   },
   build: {
     outDir: path.resolve(import.meta.dirname, "../hls2strm/static"),
