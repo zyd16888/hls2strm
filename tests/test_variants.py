@@ -74,6 +74,11 @@ def test_play_and_resolve_versions(tmp_path):
             refs = [ln for ln in body.splitlines() if ln and not ln.startswith("#")]
             assert len(refs) == 1 and refs[0].split("?", 1)[0].endswith("/480p/video.m3u8")
             assert "?s=" in refs[0]  # 中转清单绑定本次播放会话
+            # 网页试播要切画质：variants=all 各档都给，不管设置里的只给最高档
+            body = c.get("/play/ipzz-983.m3u8", params={"proxy": 1}).text
+            assert len([ln for ln in body.splitlines() if ln and not ln.startswith("#")]) == 1
+            body = c.get("/play/ipzz-983.m3u8", params={"proxy": 1, "variants": "all"}).text
+            assert len([ln for ln in body.splitlines() if ln and not ln.startswith("#")]) == 3
 
             assert c.put("/api/settings", json={"variant_mode": "all"}).status_code == 200
             assert c.get("/play/ipzz-983.m3u8", headers=h, follow_redirects=False).headers["location"] == master_url

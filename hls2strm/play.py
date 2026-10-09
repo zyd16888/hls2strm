@@ -630,8 +630,10 @@ async def _pick_variant(ctx, r: Resolved, want: int | None) -> str:
 
 
 @router.api_route("/play/{name}", methods=["GET", "HEAD"])
-async def play(name: str, request: Request, t: str = "", proxy: int = 0, src: str = "", line: str = ""):
+async def play(name: str, request: Request, t: str = "", proxy: int = 0, src: str = "", line: str = "",
+               variants: str = ""):
     """proxy=1 强制中转（网页试播用）；src=站点 只用这个站点的源，line=线路 再限定线路。
+    variants=all 多码率的主播放列表整个给（网页试播要切画质），不管设置里的「只给最高一档」。
     {slug}@720p.m3u8 要指定档位（多画质版本的 strm 用）：有这一档的源优先，多档的主播放列表只给这一档。
     浏览器跨域请求（带 Origin）也走中转并返回 CORS 头。"""
     ctx = _ctx(request)
@@ -652,7 +654,8 @@ async def play(name: str, request: Request, t: str = "", proxy: int = 0, src: st
              "中转" if proxied else "302", _left(r), request.client.host if request.client else "?", ua[:60])
     if proxied:
         ctx.metrics.inc("play_proxy")
-        resp = await (_proxy_playlist(request, r, t, want) if _is_hls(r.url) else _proxy_file(request, r))
+        resp = await (_proxy_playlist(request, r, t, want, all_variants=variants == "all") if _is_hls(r.url)
+                      else _proxy_file(request, r))
     else:
         ctx.metrics.inc("play_redirect")
         resp = RedirectResponse(await _pick_variant(ctx, r, want), status_code=302)
@@ -872,7 +875,8 @@ async def _proxy_file(request: Request, r: Resolved) -> Response:
                              media_type=resp.headers.get("content-type") or "video/mp4")
 
 
-async def _proxy_playlist(request: Request, r: Resolved, t: str, want: int | None = None) -> Response:
+async def _proxy_playlist(request: Request, r: Resolved, t: str, want: int | None = None,
+                          all_variants: bool = False) -> Response:
     ctx = _ctx(request)
     try:
         raw = await _playlist(ctx, r.url, r.traits.headers)
@@ -904,7 +908,8 @@ async def _proxy_playlist(request: Request, r: Resolved, t: str, want: int | Non
     if (found := from_master(body)) is not None and row["heights"] != ",".join(map(str, found.heights)):
         # 元数据/版本文件更新不阻塞清单返回。
         ctx.resolver.quality.spawn(r.source["id"], r.line["id"] if r.line else None, r.url, r.traits.headers)
-    if (want is not None or ctx.store.current.variant_mode == "highest") and (picked := filter_master(body, want)):
+    highest = ctx.store.current.variant_mode == "highest" and not all_variants
+    if (want is not None or highest) and (picked := filter_master(body, want)):
         body = picked[0]  # 只给要的那一档（没指定就最高档）
     # /play/{slug}.m3u8 回到 /hls/{源 id}/：相对地址解析，不依赖对外地址的写法
     text = rewrite_playlist(body, r.url, root, f"../hls/{r.source['id']}/", q, r.traits.disguised_segments)
