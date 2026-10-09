@@ -1,6 +1,6 @@
 """分层抓取器。
 
-每个站点一条抓取通道（SiteFetcher），域名、冷却、限速各管各的；所有通道共用一个 curl_cffi 会话（代理、指纹）。
+每个站点一条抓取通道（SiteFetcher），域名、冷却、限速各管各的；后台、播放解析和媒体中转使用独立会话。
 L1：curl_cffi 模拟浏览器指纹，按顺序试该站的多个域名。
 L2：某个域名被拦（挑战页、403 / 503、只有一段跳转的小页面）时，配置了 Byparr / FlareSolverr 就当场让它过这个域名
     （过盾能力比 curl_cffi 强得多），过了 cookie、UA 注入 L1 接着用，不冷却、不降速；没配或者也没过，才冷却这个域名
@@ -23,6 +23,9 @@ from curl_cffi.requests import AsyncSession
 from .config import Settings, SettingsStore, SiteConfig
 from .errors import Blocked, FetchError, NotFound  # noqa: F401  其他模块仍从这里导入
 from .observability import Metrics
+from .http_resources import ManagedSession
+from .cache import AsyncCache
+from .runtime import traffic, stage, background
 from .sites import SITES, Site
 
 log = logging.getLogger(__name__)
@@ -231,12 +234,16 @@ async def ping_solver(solver_url: str, timeout: int = 10) -> dict:
 
 
 class Fetcher:
-    """共享的会话 + 各站点的抓取通道；CDN、封面、播放器页这些站外请求也走这里。"""
+    """分类复用的会话与各站抓取通道；清单缓存、后台恢复由这里管理。"""
 
     def __init__(self, store: SettingsStore, metrics: Metrics) -> None:
         self.store = store
         self.metrics = metrics
         self._session: AsyncSession | None = None
+        self._pools: dict[str, ManagedSession] = {}
+        self._retiring: set[asyncio.Task] = set()
+        self.playlists = AsyncCache(128)
+        self._solver_tasks: set[asyncio.Task] = set()
         self.sites: dict[str, SiteFetcher] = {name: SiteFetcher(self, site) for name, site in SITES.items()}
         store.on_change(self._on_settings)
 
@@ -256,30 +263,56 @@ class Fetcher:
 
     @property
     def session(self) -> AsyncSession:
+        if traffic.get() == "play":
+            return self._pool("play", 8)
         if self._session is None:
-            s = self.store.current
-            self._session = AsyncSession(
-                impersonate=s.impersonate or "chrome",
-                proxy=s.proxy or None,
-                trust_env=False,
-                max_clients=32,
-            )
+            self._session = self._pool("background", 32)
         return self._session
 
+    def _pool(self, kind: str, capacity: int):
+        if kind not in self._pools:
+            self._pools[kind] = ManagedSession(self.store.current, self.metrics, kind, capacity)
+        return self._pools[kind]
+
+    @property
+    def media_session(self):
+        return self._pool("media", 16)
+
     def _reset_session(self) -> None:
-        old, self._session = self._session, None
-        if old is not None:
-            asyncio.get_running_loop().create_task(self._close_later(old))
+        old, self._pools, self._session = list(self._pools.values()), {}, None
+        self.playlists.clear()
+        for session in old:
+            task = asyncio.create_task(self._close_later(session))
+            self._retiring.add(task)
+            task.add_done_callback(self._retiring.discard)
 
     @staticmethod
     async def _close_later(session: AsyncSession) -> None:
-        await asyncio.sleep(120)  # 等进行中的请求（例如播放中转）结束
-        await session.close()
+        try:
+            await session.idle.wait()
+        finally:
+            await session.close()
 
     async def close(self) -> None:
-        if self._session is not None:
-            await self._session.close()
-            self._session = None
+        await self.playlists.close()
+        pending = list(self._solver_tasks)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in self._retiring:
+            task.cancel()
+        await asyncio.gather(*self._retiring, return_exceptions=True)
+        await asyncio.gather(*(s.close() for s in self._pools.values()), return_exceptions=True)
+        self._pools.clear()
+        self._session = None
+
+    async def get_playlist(self, url: str, headers: dict | None = None) -> bytes:
+        s = self.store.current
+        key = (url, tuple(sorted((headers or {}).items())), s.proxy, s.impersonate)
+        async def load():
+            self.metrics.inc("playlist_fetch")
+            return await self.get_bytes(url, headers=headers)
+        return await self.playlists.get(key, load, 15)
 
     def reset_cooldowns(self, site: str | None = None) -> None:
         for name, sf in self.sites.items():
@@ -340,6 +373,24 @@ class SiteFetcher:
         self.domains = [DomainState(base) for base in cfg.domains]
         self.limiter = RateLimiter(cfg.rate_per_sec)
         self._solver_lock = asyncio.Lock()
+        self._priority_slots = asyncio.Semaphore(2)
+        self._solving: dict[str, asyncio.Task] = {}
+
+    def _schedule_solver(self, dom: DomainState):
+        if not self.parent.store.current.solver_url or not self.cfg.solver or dom.base in self._solving:
+            return
+        async def solve():
+            try:
+                await self._solve(dom, "/", "播放请求后台恢复", time.time())
+            except Exception as error:
+                log.info("后台解题 %s 失败：%s", dom.host, error)
+            finally:
+                self._solving.pop(dom.base, None)
+        with background():
+            task = asyncio.create_task(solve())
+        self._solving[dom.base] = task
+        self.parent._solver_tasks.add(task)
+        task.add_done_callback(self.parent._solver_tasks.discard)
 
     @property
     def cfg(self) -> SiteConfig:
@@ -403,9 +454,14 @@ class SiteFetcher:
 
     async def _get(self, dom: DomainState, path: str):
         """用 curl_cffi 请求这个域名，带上解题服务给的 cookie 和 UA。"""
-        return await self.session.get(dom.base + path, timeout=self.parent.store.current.request_timeout,
-                                      headers={"User-Agent": dom.user_agent} if dom.user_agent else None,
-                                      cookies=dom.cookies or None)
+        async def get():
+            return await self.session.get(dom.base + path, timeout=self.parent.store.current.request_timeout,
+                                          headers={"User-Agent": dom.user_agent} if dom.user_agent else None,
+                                          cookies=dom.cookies or None)
+        if traffic.get() == "play":
+            async with self._priority_slots:
+                return await get()
+        return await get()
 
     @staticmethod
     def _block_reason(resp) -> str:
@@ -452,7 +508,12 @@ class SiteFetcher:
                       "，插队" if priority else "")
             if reason := self._block_reason(resp):
                 # 429 是限流，解题也没用
-                page = await self._solve(dom, path, reason, sent) if reason != "HTTP 429" else None
+                page = None
+                if reason != "HTTP 429":
+                    if traffic.get() == "play":
+                        self._schedule_solver(dom)
+                    else:
+                        page = await self._solve(dom, path, reason, sent)
                 if page is not None:
                     return self._served(page, skipped)
                 self._mark_blocked(dom, reason)
@@ -478,6 +539,9 @@ class SiteFetcher:
             return self._served(Page(resp.text, str(resp.url), dom.base), skipped)
 
         if not candidates and self.domains:
+            if traffic.get() == "play":
+                self._schedule_solver(self.domains[0])
+                raise Blocked(f"{self.site.label} 正在恢复，稍后重试", self.blocked_for())
             page = await self._solve(self.domains[0], path, "域名都在冷却", time.time())
             if page is not None:
                 return page

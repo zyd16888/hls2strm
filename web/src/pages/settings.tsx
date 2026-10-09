@@ -36,6 +36,7 @@ const GROUPS: { id: string; title: string; keys: string[] }[] = [
       "quality_capture",
       "play_discover",
       "resolve_timeout",
+      "resolve_attempt_timeout",
       "resolve_token",
       "resolve_mode",
       "resolve_proxy_url",
@@ -85,6 +86,7 @@ const LABELS: Record<string, string> = {
   quality_capture: "顺手探测画质",
   play_discover: "现场找源",
   resolve_timeout: "取地址总时限（秒）",
+  resolve_attempt_timeout: "单源 / 线路尝试时限（秒）",
   resolve_token: "网关解析令牌",
   resolve_mode: "网关默认给的地址",
   resolve_proxy_url: "公网中转地址",
@@ -97,7 +99,7 @@ const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v));
 export default function Settings() {
   const qc = useQueryClient();
   const run = useRun();
-  const { data } = useQuery({ queryKey: ["settings"], queryFn: () => api.get<SettingsResponse>("/api/settings"), staleTime: Infinity });
+  const { data } = useQuery({ queryKey: ["settings"], queryFn: ({ signal }) => api.get<SettingsResponse>("/api/settings", signal), staleTime: Infinity });
   const [draft, setDraft] = useState<SettingsValues | null>(null);
   const [needRewrite, setNeedRewrite] = useState(false);
   useEffect(() => {

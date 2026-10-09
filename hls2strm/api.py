@@ -108,9 +108,9 @@ async def status(request: Request):
         "sites": [sf.status() for sf in c.fetcher.sites.values()],
         "solver": c.store.current.solver_url,
         "videos": await c.db.video_stats(),
-        "queue": await c.db.queue_stats(),
+        "queue": await c.db.cache.get("queue_stats", c.db.queue_stats, 2),
         "metrics": c.metrics.snapshot(),
-        "failures": await c.db.recent_failures(8),
+        "failures": await c.db.cache.get("recent_failures", lambda: c.db.recent_failures(8), 2),
         "subscriptions": await c.db.list_subscriptions(),
         "missing": sum(c.engine.missing.values()),
         "output_dir": str(c.store.output_dir),
@@ -239,14 +239,14 @@ async def create_job(body: JobCreate, request: Request):
         elif body.kind == "videos":
             job_id = await e.create_videos(_parse_videos(_ctx(request), body.urls, body.site), library_id=lib_id)
         elif body.kind == "backfill":
-            job_id = await e.create_backfill()
+            job_id = await e.create_prepared_job("backfill")
         elif body.kind == "probe":
-            job_id = await e.create_probe(body.site, body.library_id or None)
+            job_id = await e.create_prepared_job("probe", body.library_id or None, body.site)
         elif body.kind == "verify":
             job_id = await e.create_verify(body.library_id or None, repair=body.repair, covers=body.covers,
                                            force_external=body.force_external, details=bool(body.detail))
         elif body.kind == "quality":
-            job_id = await e.create_quality(body.library_id or None)
+            job_id = await e.create_prepared_job("quality", body.library_id or None)
         else:
             job_id = await e.create_rewrite(body.library_id)
     except ValueError as err:
@@ -394,19 +394,42 @@ async def list_videos(
     return {"items": views, "total": total, "page": page, "size": size}
 
 
-@router.post("/videos/{slug}/refresh")
+@router.post("/videos/{slug}/refresh", status_code=202)
 async def refresh_video(slug: str, request: Request):
-    """重抓这部影片每个可用源的详情。"""
+    """排队重抓每个可用源的详情，立即返回任务编号。"""
     c = _ctx(request)
     try:
-        v = await c.engine.refresh_video(slug.lower())
+        v = await c.db.get_video(slug.lower())
+        if v is None:
+            raise NotFound(slug)
+        return {"job_id": await c.engine.create_refresh([v["id"]])}
     except (NotFound, VideoGone):
         raise HTTPException(404, "站点上已不存在该影片") from None
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from None
     except Blocked as err:
         raise HTTPException(503, str(err)) from None
     except (FetchError, ParseError) as err:
         raise HTTPException(502, str(err)) from None
+
+
+@router.get("/videos/{slug}")
+async def video_detail(slug: str, request: Request):
+    c = _ctx(request)
+    v = await c.db.get_video(slug.lower())
+    if v is None:
+        raise HTTPException(404, "影片不存在")
     return await _full_view(c, v)
+
+
+@router.get("/jobs/{job_id}")
+async def job_detail(job_id: int, request: Request):
+    db = _ctx(request).db
+    job = await db.get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "任务不存在")
+    job["tasks"] = await db.task_counts(job_id)
+    return job
 
 
 class VideoBatch(BaseModel):
@@ -415,9 +438,9 @@ class VideoBatch(BaseModel):
     library_id: int | None = None  # add / remove：哪个输出库
 
 
-@router.post("/videos/batch")
+@router.post("/videos/batch", status_code=202)
 async def videos_batch(body: VideoBatch, request: Request):
-    """影片库多选后的批量操作：probe、refresh 排成任务（按站点限速）；add、remove 当场改输出库。"""
+    """影片库多选后的批量操作；抓取与文件变更均持久化为可恢复任务。"""
     e = _ctx(request).engine
     try:
         if body.action == "probe":
@@ -426,9 +449,7 @@ async def videos_batch(body: VideoBatch, request: Request):
             return {"job_id": await e.create_refresh(body.ids)}
         if not body.library_id:
             raise ValueError("要选一个输出库")
-        if body.action == "add":
-            return {"added": await e.add_to_library(body.ids, body.library_id)}
-        return {"removed": await e.remove_from_library(body.ids, body.library_id)}
+        return {"job_id": await e.create_membership(body.ids, body.library_id, remove=body.action == "remove")}
     except ValueError as err:
         raise HTTPException(400, str(err)) from None
 
@@ -440,17 +461,19 @@ async def _full_view(c, v: dict) -> dict:
     return view
 
 
-@router.post("/videos/{slug}/probe")
+@router.post("/videos/{slug}/probe", status_code=202)
 async def probe_video(slug: str, request: Request):
-    """到每个启用、还没有这部影片源的站点按番号找一次。"""
+    """排队到各启用站点查找缺失源，结果随任务执行逐步入库。"""
     c = _ctx(request)
     try:
-        v, results = await c.engine.probe_video(slug.lower())
+        v = await c.db.get_video(slug.lower())
+        if v is None:
+            raise NotFound(slug)
+        return {"job_id": await c.engine.create_probe_videos([v["id"]])}
     except NotFound:
         raise HTTPException(404, "影片不存在") from None
-    view = await _full_view(c, v)
-    view["probe"] = results
-    return view
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from None
 
 
 # ---- 输出库 ----
@@ -814,15 +837,23 @@ async def set_log_level(body: LogLevel, request: Request):
 
 
 @router.get("/logs/stream")
-async def logs_stream(request: Request, after: int = 0):
+async def logs_stream(request: Request, after: int = 0, instance: str = ""):
     async def gen():
+        cursor = after
+        if instance != ring.instance:
+            cursor = 0
+            yield f"event: reset\ndata: {json.dumps({'instance': ring.instance})}\n\n"
         q = ring.subscribe()
         try:
-            for item in ring.since(after, 300):
+            for item in ring.since(cursor, 300):
                 yield f"id: {item['id']}\ndata: {json.dumps(item, ensure_ascii=False)}\n\n"
+                cursor = item["id"]
             while not await request.is_disconnected():
                 try:
                     item = await asyncio.wait_for(q.get(), 15)
+                    if cursor and item["id"] > cursor + 1:
+                        yield 'event: gap\ndata: {"message":"部分日志已超出缓冲，详情请查看日志文件"}\n\n'
+                    cursor = item["id"]
                     yield f"id: {item['id']}\ndata: {json.dumps(item, ensure_ascii=False)}\n\n"
                 except TimeoutError:
                     yield ": ping\n\n"

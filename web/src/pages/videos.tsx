@@ -122,7 +122,7 @@ export default function Videos() {
 
   const { data, isFetching, isError, error } = useQuery({
     queryKey: ["videos", apiQuery],
-    queryFn: () => api.get<Page<Video>>(`/api/videos${apiQuery}`),
+    queryFn: ({ signal }) => api.get<Page<Video>>(`/api/videos${apiQuery}`, signal),
     placeholderData: keepPreviousData,
   });
   const items = data?.items ?? [];
@@ -463,7 +463,7 @@ function BatchBar({ ids, onDone }: { ids: number[]; onDone: () => void }) {
         </MenuTrigger>
         <MenuContent align="start">
           {libraries.map(l => (
-            <MenuItem key={l.id} onSelect={() => batch({ action: "add", library_id: l.id }, r => `加入「${l.name}」${r.added} 部（已在库里、被排除库排除的跳过）`)}>
+            <MenuItem key={l.id} onSelect={() => batch({ action: "add", library_id: l.id }, r => `已排队加入「${l.name}」，任务 #${r.job_id}`)}>
               {l.name}
             </MenuItem>
           ))}
@@ -488,7 +488,7 @@ function BatchBar({ ids, onDone }: { ids: number[]; onDone: () => void }) {
                     : "会删掉它们在这个库里的 strm、nfo 和封面。规则库、有来源库的库之后会按规则把符合的再加回来。",
                   { confirmText: "移出并删除文件", danger: true },
                 );
-                if (ok) batch({ action: "remove", library_id: l.id }, r => `从「${l.name}」移出 ${r.removed} 部`);
+                if (ok) batch({ action: "remove", library_id: l.id }, r => `已排队从「${l.name}」移出，任务 #${r.job_id}`);
               }}
             >
               {l.name}
@@ -618,7 +618,7 @@ function VideoRow({
             </MenuItem>
             <MenuItem
               onSelect={() =>
-                run(() => api.post(`/api/videos/${v.slug}/refresh`), { success: `${v.slug.toUpperCase()} 已刷新` }).then(() =>
+                run(() => api.post(`/api/videos/${v.slug}/refresh`), { success: `${v.slug.toUpperCase()} 已排队刷新` }).then(() =>
                   qc.invalidateQueries({ queryKey: ["videos"] }),
                 )
               }

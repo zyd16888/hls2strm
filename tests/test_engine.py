@@ -52,7 +52,7 @@ def test_list_job_writes_strm_nfo_and_covers(make_store, boot, caplog, monkeypat
         await engine.stop()
 
         counts = await db.task_counts(job_id)
-        assert job["status"] == "done" and counts == {"done": 25}
+        assert job["status"] == "done" and counts == {"done": 49}
         assert job["state"]["last_page"] == 2
         stats = await db.video_stats()
         assert stats["total"] == 24 and stats["with_detail"] == 24 and stats["with_strm"] == 24 and stats["with_cover"] == 24
@@ -66,7 +66,7 @@ def test_list_job_writes_strm_nfo_and_covers(make_store, boot, caplog, monkeypat
         msgs = [r.getMessage() for r in caplog.records if r.name == "hls2strm.engine"]
         assert any(m.startswith(f"任务 #{job_id}「") and m.endswith("开始执行") for m in msgs)
         assert any(f"」进度 " in m and "完成 " in m for m in msgs)
-        assert any(m.startswith(f"任务 #{job_id}「") and "完成，用时 " in m and m.endswith("：完成 25") for m in msgs)
+        assert any(m.startswith(f"任务 #{job_id}「") and "完成，用时 " in m and m.endswith("：完成 49") for m in msgs)
         await db.close()
 
     asyncio.run(run())
@@ -87,7 +87,7 @@ def test_retry_gone_and_blocked(make_store, boot):
         job = await wait_job(db, job_id)
         counts = await db.task_counts(job_id)
         assert job["status"] == "done"
-        assert counts == {"failed": 1, "done": 1, "gone": 1}
+        assert counts == {"failed": 1, "done": 2, "gone": 1}  # 成功详情与封面分别完成
         failed = (await db.list_tasks(job_id, "failed"))[0]
         assert failed["attempts"] == 2 and "boom" in failed["last_error"]
 
@@ -126,7 +126,7 @@ def test_resume_after_crash(make_store, boot):
         await engine.start()  # 启动时把 running 放回队列
         job = await wait_job(db, job_id)
         await engine.stop()
-        assert job["status"] == "done" and await db.task_counts(job_id) == {"done": 3}
+        assert job["status"] == "done" and await db.task_counts(job_id) == {"done": 3}  # 没有输出库，不排封面
         # 指定影片没有列表页时长：从 m3u8 补齐
         v = await db.get_video(list(ids)[0])
         assert v["duration"] == 5400
@@ -207,7 +207,7 @@ def test_libraries_and_subscription(make_store, boot):
 
         # 同一批影片再进默认库：已有详情，直接带 nfo，封面硬链接，不再下载
         job = await wait_job(db, await engine.create_crawl("/models/abc/", end_page=1))
-        assert await db.task_counts(job["id"]) == {"done": 1}
+        assert await db.task_counts(job["id"]) == {"done": 25}  # 列表无需重抓详情，封面在新库独立复用
         assert len(cover_calls) == 24
         slug = next(iter(ids))
         v = await db.get_video(slug)
@@ -218,10 +218,10 @@ def test_libraries_and_subscription(make_store, boot):
         job = await wait_job(db, await engine.run_subscription(sub_id))
         assert job["kind"] == "incremental" and job["state"]["known_streak"] >= 48
         assert await db.task_counts(job["id"]) == {"done": 2}
-        with pytest.raises(ValueError):  # 同一订阅不能并发
-            await db.update_job(job["id"], status="running")
+        with pytest.raises(ValueError):  # 同一订阅尚未完成列表时不能并发
+            await db.update_job(job["id"], status="running", state={**job["state"], "list_complete": False})
             await engine.run_subscription(sub_id)
-        await db.update_job(job["id"], status="done")
+        await db.update_job(job["id"], status="done", state=job["state"])
 
         # 改库目录：自动重写，文件搬到新目录
         jobs = await engine.update_library(lib_id, "中文字幕", "zh/中文字幕")

@@ -1,7 +1,7 @@
 """SQLite 存储：设置、作品与源、输出库、订阅、任务（job）与子任务（task）。
 
 作品（videos 表）是一个番号，对应一个 strm；源（sources 表）是某个站点上的一个页面，一部作品可以有多个源。
-单连接 + 自动提交；所有写操作串行（同一把锁），读操作直接执行。
+写入、快速读取、批量查询分连接；写操作串行，事务内读取使用原连接。
 表结构用 PRAGMA user_version 做版本化迁移，见 MIGRATIONS。
 """
 
@@ -13,13 +13,16 @@ import logging
 import time
 from collections.abc import Callable, Iterable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
 
 from .codes import code_key
+from .queries import FACET_FIELDS, VIDEO_SORTS, VideoQuery  # API 和旧调用方保持导入兼容
+from .cache import AsyncCache
+from .database_indexes import migrate_v12 as _migrate_v12
+from .runtime import stage
 from .quality import TRUST, Quality, parse_heights
 from .sites import SourceDetail, SourceItem
 
@@ -324,121 +327,12 @@ async def _migrate_v11(conn: aiosqlite.Connection) -> None:
 
 
 MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
-              _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11]
+              _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11, _migrate_v12]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")
 SOURCE_FAIL_COOLDOWN = 300
 SOURCE_FAIL_COOLDOWN_MAX = 6 * 3600
-
-
-VIDEO_SORTS = {  # 影片库排序：参数 -> 列
-    "created": "id",
-    "release": "release_date",
-    "duration": "duration",
-    "code": "code_key",
-    "views": "views",
-    "updated": "updated_at",
-}
-FACET_FIELDS = {"categories": "slug", "tags": "slug", "models": "id"}  # JSON 列 -> 元素里当 id 用的字段
-
-
-@dataclass
-class VideoQuery:
-    """影片库的筛选和排序。列表类条件组内任一满足即可，不同条件之间都要满足。"""
-
-    q: str = ""
-    status: str = ""  # no_detail / no_output / gone
-    library_id: int | None = None
-    has_site: list[str] = field(default_factory=list)  # 有其中任一站点的可用源
-    lacks_site: list[str] = field(default_factory=list)  # 这些站点都没有源
-    sources: str = ""  # single / multi / failing（有源最近取地址失败）/ none（没有可用源）
-    subtitle: str = ""  # zh / en / none（按可用源的字幕）
-    uncensored: bool | None = None
-    models: list[str] = field(default_factory=list)  # 女优 id
-    categories: list[str] = field(default_factory=list)  # 分类 slug
-    tags: list[str] = field(default_factory=list)
-    makers: list[str] = field(default_factory=list)
-    quality: list[str] = field(default_factory=list)
-    release_from: str = ""  # YYYY-MM-DD
-    release_to: str = ""
-    added_from: int | None = None  # 入库时间（unix 秒）
-    added_to: int | None = None
-    duration_min: int | None = None  # 秒
-    duration_max: int | None = None
-    sort: str = "created"
-    desc: bool = True
-
-    def where(self) -> tuple[str, list[Any]]:
-        where, params = ["1=1"], []
-
-        def marks(values: list) -> str:
-            params.extend(values)
-            return ",".join("?" * len(values))
-
-        if self.q.strip():
-            like = f"%{self.q.strip()}%"
-            where.append("(slug LIKE ? OR code LIKE ? OR title LIKE ? OR models LIKE ? OR tags LIKE ?)")
-            params += [like] * 5
-        if self.library_id:
-            where.append("EXISTS (SELECT 1 FROM outputs o WHERE o.video_id=videos.id AND o.library_id=?)")
-            params.append(self.library_id)
-        if self.status == "no_detail":
-            where.append("detail_at IS NULL AND status='active'")
-        elif self.status == "no_output":
-            where.append("status='active' AND NOT EXISTS "
-                         "(SELECT 1 FROM outputs o WHERE o.video_id=videos.id AND o.strm_path!='')")
-        elif self.status == "gone":
-            where.append("status='gone'")
-        elif self.status == "active":
-            where.append("status='active'")
-        active = "s.video_id=videos.id AND s.status='active'"
-        if self.has_site:
-            where.append(f"EXISTS (SELECT 1 FROM sources s WHERE {active} AND s.site IN ({marks(self.has_site)}))")
-        for site in self.lacks_site:
-            where.append("NOT EXISTS (SELECT 1 FROM sources s WHERE s.video_id=videos.id AND s.site=?)")
-            params.append(site)
-        n_active = f"(SELECT COUNT(*) FROM sources s WHERE {active})"
-        if self.sources == "single":
-            where.append(f"{n_active}=1")
-        elif self.sources == "multi":
-            where.append(f"{n_active}>=2")
-        elif self.sources == "none":
-            where.append(f"{n_active}=0")
-        elif self.sources == "failing":
-            where.append(f"EXISTS (SELECT 1 FROM sources s WHERE {active} AND s.fail_streak>0)")
-        if self.subtitle in ("zh", "en"):
-            where.append(f"EXISTS (SELECT 1 FROM sources s WHERE {active} AND s.subtitle=?)")
-            params.append(self.subtitle)
-        elif self.subtitle == "none":
-            where.append(f"NOT EXISTS (SELECT 1 FROM sources s WHERE {active} AND s.subtitle IN ('zh', 'en'))")
-        if self.uncensored is not None:
-            where.append("uncensored=?")
-            params.append(int(self.uncensored))
-        for col, values in (("models", self.models), ("categories", self.categories), ("tags", self.tags)):
-            if values:
-                where.append(f"EXISTS (SELECT 1 FROM json_each(videos.{col}) j "
-                             f"WHERE json_extract(j.value, '$.{FACET_FIELDS[col]}') IN ({marks(values)}))")
-        if self.makers:
-            where.append(f"maker IN ({marks(self.makers)})")
-        if self.quality:
-            where.append(f"quality IN ({marks(self.quality)})")
-        for cond, value in (("release_date!='' AND release_date>=?", self.release_from),
-                            ("release_date!='' AND release_date<=?", self.release_to),
-                            ("created_at>=?", self.added_from), ("created_at<=?", self.added_to),
-                            ("duration>=?", self.duration_min), ("duration<=?", self.duration_max)):
-            if value not in (None, ""):
-                where.append(cond)
-                params.append(value)
-        return " AND ".join(where), params
-
-    def order(self) -> str:
-        col = VIDEO_SORTS.get(self.sort, "id")
-        d = "DESC" if self.desc else "ASC"
-        if col == "id":
-            return f"id {d}"
-        # 没有值的（没抓详情、没日期）总排在最后
-        return f"({col} IS NULL OR {col}='') ASC, {col} {d}, id {d}"
 
 
 def now() -> int:
@@ -500,6 +394,11 @@ class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.conn: aiosqlite.Connection | None = None
+        self.reader: aiosqlite.Connection | None = None
+        self.bulk_reader: aiosqlite.Connection | None = None
+        self._transaction_owner = None
+        self.cache = AsyncCache()
+        self.metrics = None
         self._lock = asyncio.Lock()
 
     async def open(self) -> None:
@@ -509,6 +408,11 @@ class Database:
         await self.conn.execute("PRAGMA journal_mode=WAL")
         await self.conn.execute("PRAGMA synchronous=NORMAL")
         await self._migrate()
+        for attr in ("reader", "bulk_reader"):
+            conn = await aiosqlite.connect(self.path, isolation_level=None)
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("PRAGMA query_only=ON")
+            setattr(self, attr, conn)
 
     async def _migrate(self) -> None:
         version = (await self._one("PRAGMA user_version"))[0]
@@ -527,6 +431,12 @@ class Database:
             log.info("数据库已迁移到 v%d", target)
 
     async def close(self) -> None:
+        await self.cache.close()
+        for attr in ("reader", "bulk_reader"):
+            conn = getattr(self, attr)
+            if conn is not None:
+                await conn.close()
+                setattr(self, attr, None)
         if self.conn is not None:
             await self.conn.close()
             self.conn = None
@@ -535,40 +445,58 @@ class Database:
 
     async def _write(self, sql: str, params: Iterable[Any] = ()) -> aiosqlite.Cursor:
         async with self._lock:
-            return await self.conn.execute(sql, tuple(params))
+            result = await self.conn.execute(sql, tuple(params))
+            if any(name in sql.lower() for name in ("videos", "outputs", "sources")):
+                self.cache.clear()
+            return result
 
     @asynccontextmanager
     async def _tx(self):
         """持锁的事务：查找再插入这类需要原子性的写操作用。"""
         async with self._lock:
-            await self.conn.execute("BEGIN")
+            self._transaction_owner = asyncio.current_task()
             try:
+                await self.conn.execute("BEGIN")
                 yield self.conn
                 await self.conn.execute("COMMIT")
+                self.cache.clear()
             except BaseException:
-                await self.conn.execute("ROLLBACK")
+                try:
+                    await self.conn.execute("ROLLBACK")
+                except aiosqlite.OperationalError:
+                    pass  # BEGIN 尚未执行或 COMMIT 已完成时可能没有活动事务。
                 raise
+            finally:
+                self._transaction_owner = None
+                self.cache.clear()
 
     async def _write_many(self, sql: str, rows: list[tuple]) -> int:
         async with self._lock:
-            await self.conn.execute("BEGIN")
             try:
+                await self.conn.execute("BEGIN")
                 before = self.conn.total_changes
                 await self.conn.executemany(sql, rows)
                 await self.conn.execute("COMMIT")
                 return self.conn.total_changes - before
             except BaseException:
-                await self.conn.execute("ROLLBACK")
+                try:
+                    await self.conn.execute("ROLLBACK")
+                except aiosqlite.OperationalError:
+                    pass
                 raise
 
-    async def _one(self, sql: str, params: Iterable[Any] = ()) -> aiosqlite.Row | None:
-        async with self.conn.execute(sql, tuple(params)) as cur:
-            return await cur.fetchone()
+    async def _one(self, sql: str, params: Iterable[Any] = (), *, bulk: bool = False) -> aiosqlite.Row | None:
+        rows = await self._all(sql, params, bulk=bulk)
+        return rows[0] if rows else None
 
-    async def _all(self, sql: str, params: Iterable[Any] = ()) -> list[aiosqlite.Row]:
+    async def _all(self, sql: str, params: Iterable[Any] = (), *, bulk: bool = False) -> list[aiosqlite.Row]:
         # 执行和取结果放在同一次线程调用里：分两步的话，中间别的协程在同一连接上改了表（比如 worker 领子任务），
         # 读到一半的 GROUP BY 会把挪了位置的行数两次
-        return list(await self.conn.execute_fetchall(sql, tuple(params)))
+        conn = self.conn if self._transaction_owner is asyncio.current_task() else ((self.bulk_reader if bulk else self.reader) or self.conn)
+        if self.metrics is None:
+            return list(await conn.execute_fetchall(sql, tuple(params)))
+        with stage(self.metrics, "db.bulk" if bulk else "db.read"):
+            return list(await conn.execute_fetchall(sql, tuple(params)))
 
     async def _update(self, table: str, row_id: int, fields: dict) -> None:
         if fields:
@@ -883,7 +811,7 @@ class Database:
         if library_ids:
             sql += (" AND EXISTS (SELECT 1 FROM outputs o WHERE o.video_id=v.id AND o.library_id IN (%s))"
                     % ",".join("?" * len(library_ids)))
-        rows = await self._all(sql + " ORDER BY s.video_id DESC", library_ids or ())
+        rows = await self._all(sql + " ORDER BY s.video_id DESC", library_ids or (), bulk=True)
         best: dict[int, tuple[str, str]] = {}
         for r in rows:
             cur = best.get(r["video_id"])
@@ -934,7 +862,7 @@ class Database:
         if library_id:
             sql += " AND EXISTS (SELECT 1 FROM outputs o WHERE o.video_id=v.id AND o.library_id=?)"
             params.append(library_id)
-        return [dict(r) for r in await self._all(sql + " ORDER BY s.video_id DESC", params)]
+        return [dict(r) for r in await self._all(sql + " ORDER BY s.video_id DESC", params, bulk=True)]
 
     async def set_source_check(self, video_id: int, site: str, found: bool) -> None:
         await self._write(
@@ -956,7 +884,7 @@ class Database:
         if library_id:
             sql += " AND EXISTS (SELECT 1 FROM outputs o WHERE o.video_id=v.id AND o.library_id=?)"
             params.append(library_id)
-        return [r["id"] for r in await self._all(sql + " ORDER BY v.id DESC", params)]
+        return [r["id"] for r in await self._all(sql + " ORDER BY v.id DESC", params, bulk=True)]
 
     async def cdn_video_map(self, site: str = "jable") -> dict[int, str]:
         """站内数字 id -> 作品 slug（strm 扫描时把 CDN 直链认回作品）。"""
@@ -974,14 +902,14 @@ class Database:
 
     async def search_videos(self, query: VideoQuery, offset: int = 0, limit: int = 50):
         cond, params = query.where()
-        total = (await self._one(f"SELECT COUNT(*) AS n FROM videos WHERE {cond}", params))["n"]
+        total = (await self._one(f"SELECT COUNT(*) AS n FROM videos WHERE {cond}", params, bulk=True))["n"]
         rows = await self._all(
-            f"SELECT * FROM videos WHERE {cond} ORDER BY {query.order()} LIMIT ? OFFSET ?", params + [limit, offset]
+            f"SELECT * FROM videos WHERE {cond} ORDER BY {query.order()} LIMIT ? OFFSET ?", params + [limit, offset], bulk=True
         )
         return [_video_row(r) for r in rows], total
 
-    async def iter_videos(self, batch: int = 500):
-        last = -1
+    async def iter_videos(self, batch: int = 500, *, after: int = -1):
+        last = after
         while True:
             rows = await self._all(
                 "SELECT * FROM videos WHERE status='active' AND id>? ORDER BY id LIMIT ?", (last, batch)
@@ -997,37 +925,42 @@ class Database:
         return {f: await self.facet(f, limit=limit) for f in (*FACET_FIELDS, "makers", "quality")}
 
     async def facet(self, name: str, q: str = "", limit: int = 300) -> list[dict]:
+        return await self.cache.get(("facet", name, q, limit), lambda: self._facet(name, q, limit), 30)
+
+    async def _facet(self, name: str, q: str = "", limit: int = 300) -> list[dict]:
         """一种候选：[{item, name, n}]，按影片数排；q 按名称或 id 筛。"""
         like = f"%{q.strip()}%"
         if name in FACET_FIELDS:
-            key = FACET_FIELDS[name]
-            # 别名不能叫 key：json_each 自带 key 列（数组下标），GROUP BY 会按它分组
+            # 在覆盖索引内汇总，不再逐条随机读取影片 JSON 和状态。
             rows = await self._all(
-                f"""SELECT json_extract(j.value, '$.{key}') AS item, MAX(json_extract(j.value, '$.name')) AS name,
+                """SELECT j.item AS item, MAX(j.name) AS name,
                            COUNT(*) AS n
-                    FROM videos v, json_each(v.{name}) j WHERE v.status='active'
+                    FROM video_facets j WHERE j.active=1 AND j.kind=?
                     GROUP BY item HAVING ?='%%' OR item LIKE ? OR name LIKE ? ORDER BY n DESC LIMIT ?""",
-                (like, like, like, limit),
+                (name, like, like, like, limit), bulk=True,
             )
         elif name in ("makers", "quality"):
             col = "maker" if name == "makers" else "quality"
             rows = await self._all(
                 f"""SELECT {col} AS item, {col} AS name, COUNT(*) AS n FROM videos
                     WHERE status='active' AND {col}!='' AND {col} LIKE ? GROUP BY {col} ORDER BY n DESC LIMIT ?""",
-                (like, limit),
+                (like, limit), bulk=True,
             )
         else:
             raise ValueError(f"没有这种候选：{name}")
         return [dict(r) for r in rows]
 
     async def video_stats(self) -> dict:
+        return await self.cache.get("video_stats", self._video_stats, 3)
+
+    async def _video_stats(self) -> dict:
         row = await self._one(
             """SELECT COUNT(*) AS total,
                       COALESCE(SUM(detail_at IS NOT NULL), 0) AS with_detail,
                       COALESCE(SUM(status='gone'), 0) AS gone,
                       (SELECT COUNT(DISTINCT video_id) FROM outputs WHERE strm_path != '') AS with_strm,
                       (SELECT COUNT(DISTINCT video_id) FROM outputs WHERE cover_done) AS with_cover
-               FROM videos"""
+               FROM videos""", bulk=True
         )
         return dict(row)
 
@@ -1131,9 +1064,9 @@ class Database:
     async def delete_output(self, video_id: int, library_id: int) -> None:
         await self._write("DELETE FROM outputs WHERE video_id=? AND library_id=?", (video_id, library_id))
 
-    async def iter_outputs(self, library_id: int | None = None, batch: int = 500):
+    async def iter_outputs(self, library_id: int | None = None, batch: int = 500, *, after: int = -1):
         """逐批产出 (影片, 输出)。"""
-        last = -1
+        last = after
         cond = "AND o.library_id=?" if library_id else ""
         while True:
             params: list = [last] + ([library_id] if library_id else []) + [batch]
@@ -1150,7 +1083,7 @@ class Database:
                 v = _video_row(r)
                 out = {"library_id": v.pop("out_library_id"), "strm_path": v.pop("out_strm_path"),
                        "cover_done": v.pop("out_cover_done")}
-                v.pop("output_rowid")
+                out["rowid"] = v.pop("output_rowid")
                 yield v, out
             last = rows[-1]["output_rowid"]
 
@@ -1211,8 +1144,9 @@ class Database:
     async def subscription_last_done(self) -> dict[int, int]:
         """每个订阅最近一次跑完的任务的开始时间。"""
         rows = await self._all(
-            """SELECT json_extract(params, '$.subscription_id') AS sub_id, MAX(created_at) AS t FROM jobs
-               WHERE status='done' AND json_extract(params, '$.subscription_id') IS NOT NULL GROUP BY sub_id"""
+            """SELECT json_extract(params, '$.subscription_id') AS sub_id, MAX(COALESCE(started_at,created_at)) AS t FROM jobs
+               WHERE json_extract(state, '$.list_complete')=1
+                 AND json_extract(params, '$.subscription_id') IS NOT NULL GROUP BY sub_id"""
         )
         return {r["sub_id"]: r["t"] for r in rows}
 
@@ -1370,7 +1304,10 @@ class Database:
         rows = await self._all(
             """SELECT s.*, l.name AS library_name,
                       (SELECT j.id FROM jobs j WHERE j.status IN ('running', 'paused')
-                         AND json_extract(j.params, '$.subscription_id')=s.id ORDER BY j.id DESC LIMIT 1) AS active_job_id
+                         AND json_extract(j.params, '$.subscription_id')=s.id ORDER BY j.id DESC LIMIT 1) AS active_job_id,
+                      (SELECT j.id FROM jobs j WHERE j.status IN ('running', 'paused')
+                         AND COALESCE(json_extract(j.state,'$.list_complete'),0)=0
+                         AND json_extract(j.params,'$.subscription_id')=s.id ORDER BY j.id DESC LIMIT 1) AS listing_job_id
                FROM subscriptions s LEFT JOIN libraries l ON l.id=s.library_id ORDER BY s.id"""
         )
         return [dict(r) for r in rows]
@@ -1392,10 +1329,11 @@ class Database:
     async def delete_subscription(self, sub_id: int) -> None:
         await self._write("DELETE FROM subscriptions WHERE id=?", (sub_id,))
 
-    async def subscription_active_job(self, sub_id: int) -> dict | None:
+    async def subscription_active_job(self, sub_id: int, *, listing_only: bool = False) -> dict | None:
+        cond = "AND COALESCE(json_extract(state,'$.list_complete'),0)=0 " if listing_only else ""
         return _job_row(await self._one(
             "SELECT * FROM jobs WHERE status IN ('running', 'paused') "
-            "AND json_extract(params, '$.subscription_id')=? ORDER BY id DESC LIMIT 1",
+            + cond + "AND json_extract(params, '$.subscription_id')=? ORDER BY id DESC LIMIT 1",
             (sub_id,),
         ))
 
@@ -1440,6 +1378,7 @@ class Database:
 
     async def delete_job(self, job_id: int) -> None:
         async with self._lock:
+            await self.conn.execute("DELETE FROM scan_staging WHERE scan_id=?", (job_id,))
             await self.conn.execute("DELETE FROM tasks WHERE job_id=?", (job_id,))
             await self.conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
 

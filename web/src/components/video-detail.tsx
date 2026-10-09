@@ -1,7 +1,7 @@
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ExternalLink, Play, RefreshCw, Search, X } from "lucide-react";
-import { useState } from "react";
-import { api, type ProbeResult, type Source, type SourceLine, type Video } from "@/lib/api";
+import { useEffect, useState } from "react";
+import { api, type Job, type ProbeResult, type Source, type SourceLine, type Video } from "@/lib/api";
 import { fmtClockDur, fmtNum, fmtTime } from "@/lib/format";
 import { PROBE_STATUS, qualityChip, SUBTITLES } from "@/lib/labels";
 import { useRun } from "@/lib/queries";
@@ -44,24 +44,37 @@ function Detail({ v, probe }: { v: Video; probe: ProbeResult[] | null }) {
   const run = useRun();
   const qc = useQueryClient();
   const [busy, setBusy] = useState<"" | "refresh" | "probe">("");
-
-  const update = (nv: Video & { probe?: ProbeResult[] }) => {
-    const { probe: results, ...video } = nv;
-    store.set(prev => (prev ? { video: video as Video, probe: results ?? prev.probe } : prev));
-    qc.invalidateQueries({ queryKey: ["videos"] });
-  };
+  const [jobId, setJobId] = useState(0);
+  const { data: job } = useQuery({
+    queryKey: ["detail-job", jobId],
+    queryFn: ({ signal }) => api.get<Job>(`/api/jobs/${jobId}`, signal),
+    enabled: !!jobId,
+    refetchInterval: q => q.state.data?.status === "done" || q.state.data?.status === "cancelled" ? false : 1000,
+  });
+  useEffect(() => {
+    if (!job) return;
+    const controller = new AbortController();
+    api.get<Video>(`/api/videos/${v.slug}`, controller.signal).then(nv => {
+      store.set(prev => prev?.video.slug === nv.slug ? { ...prev, video: nv } : prev);
+      if (job.status === "done" || job.status === "cancelled") {
+        setBusy("");
+        qc.invalidateQueries({ queryKey: ["videos"] });
+      }
+    }).catch(() => {});
+    return () => controller.abort();
+  }, [job?.tasks.done, job?.tasks.failed, job?.status, v.slug, qc]);
 
   const refresh = async () => {
     setBusy("refresh");
-    const nv = await run(() => api.post<Video>(`/api/videos/${v.slug}/refresh`), { success: `${v.slug.toUpperCase()} 已刷新` });
-    setBusy("");
-    if (nv) update(nv);
+    const result = await run(() => api.post<{ job_id: number }>(`/api/videos/${v.slug}/refresh`), { success: "已排队刷新，可离开此页面", invalidate: [["jobs"]] });
+    if (result) setJobId(result.job_id);
+    else setBusy("");
   };
   const findSources = async () => {
     setBusy("probe");
-    const nv = await run(() => api.post<Video & { probe: ProbeResult[] }>(`/api/videos/${v.slug}/probe`));
-    setBusy("");
-    if (nv) update({ ...nv, probe: nv.probe ?? [] });
+    const result = await run(() => api.post<{ job_id: number }>(`/api/videos/${v.slug}/probe`), { success: "已排队查找，结果会逐步更新", invalidate: [["jobs"]] });
+    if (result) setJobId(result.job_id);
+    else setBusy("");
   };
 
   const people = v.models.map(m => m.name).join("、");
@@ -91,6 +104,7 @@ function Detail({ v, probe }: { v: Video; probe: ProbeResult[] | null }) {
       </header>
 
       <div className="scroll-thin min-h-0 flex-1 space-y-6 overflow-y-auto px-5 py-4">
+        {jobId > 0 && <p className="text-xs text-muted">任务 #{jobId} · {busy ? `已处理 ${(job?.tasks.done ?? 0) + (job?.tasks.failed ?? 0)} 项，可离开页面` : job?.state.partial_failure ? "完成，部分步骤失败，请在任务页重试" : "已完成"}</p>}
         <div className="grid gap-4 sm:grid-cols-[240px_1fr]">
           {v.cover_url || v.thumb_url ? (
             <img referrerPolicy="no-referrer" src={v.cover_url || v.thumb_url} alt="" className="w-full rounded-md border border-line bg-panel-2 object-cover" />

@@ -18,9 +18,10 @@ from .config import BootConfig, SettingsStore
 from .db import Database
 from .engine import Engine
 from .fetcher import Fetcher
-from .observability import Metrics, ring, setup_logging
+from .observability import Metrics, ring, setup_logging, shutdown_logging
 from .play import Resolver
 from .writer import OutputWriter
+from .runtime import RequestTelemetry, JsonCompression
 
 log = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
@@ -68,11 +69,14 @@ def create_app(boot: BootConfig | None = None) -> FastAPI:
         store = SettingsStore(boot, db)
         await store.load()
         metrics = Metrics()
+        db.metrics = metrics
         fetcher = Fetcher(store, metrics)
         writer = OutputWriter(store)
         engine = Engine(db, fetcher, writer, store, metrics, boot)
         resolver = engine.resolver
-        auth = Auth(boot, await load_secret(db))
+        secret = await load_secret(db)
+        play.set_signing_key(secret)
+        auth = Auth(boot, secret)
         app.state.ctx = Context(boot, auth, db, store, metrics, fetcher, writer, resolver, engine)
         log.info("启动：数据目录 %s，输出目录 %s，对外地址 %s", boot.data_dir, store.output_dir, store.public_base_url)
         if not boot.ui_password:
@@ -85,8 +89,11 @@ def create_app(boot: BootConfig | None = None) -> FastAPI:
             await fetcher.close()
             await db.close()
             log.info("已退出")
+            shutdown_logging()
 
     app = FastAPI(title="hls2strm", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(RequestTelemetry)
+    app.add_middleware(JsonCompression)
     app.include_router(play.router)
     app.include_router(api.public)
     app.include_router(api.router)
@@ -104,5 +111,20 @@ def create_app(boot: BootConfig | None = None) -> FastAPI:
     @app.get("/healthz", include_in_schema=False)
     async def healthz():
         return {"ok": True}
+
+    @app.get("/readyz", include_in_schema=False)
+    async def readyz():
+        ctx = getattr(app.state, "ctx", None)
+        if ctx is None:
+            return PlainTextResponse("starting", status_code=503)
+        try:
+            async with asyncio.timeout(2):
+                await ctx.db._one("SELECT 1")
+            engine = ctx.engine
+            ready = (not engine._stopping and engine._scheduler is not None and not engine._scheduler.done()
+                     and sum(not t.done() for t in engine._workers) >= engine._worker_count())
+            return PlainTextResponse("ready" if ready else "background service unavailable", status_code=200 if ready else 503)
+        except Exception:
+            return PlainTextResponse("database unavailable", status_code=503)
 
     return app

@@ -15,7 +15,8 @@ import { navigate } from "@/lib/route";
 import { cn } from "@/lib/utils";
 
 export function subState(sub: Subscription): { text: string; tone: "warn" | "neutral" | "ok" } {
-  if (sub.active_job_id) return { text: "执行中", tone: "warn" };
+  if (sub.listing_job_id) return { text: "扫描中", tone: "warn" };
+  if (sub.active_job_id) return { text: "补充元数据", tone: "neutral" };
   if (!sub.enabled) return { text: "已停用", tone: "neutral" };
   if (!sub.initialized) return { text: "未跑首轮全量", tone: "neutral" };
   return { text: sub.interval ? "定时增量" : "仅手动", tone: "ok" };
@@ -66,6 +67,7 @@ export default function Overview() {
       )}
 
       <Metrics s={s} queueSum={queueSum} c={c} />
+      <RequestTimings s={s} />
 
       <div className="grid gap-4 xl:grid-cols-2">
         <Panel
@@ -155,7 +157,7 @@ export default function Overview() {
                     </Td>
                     <Td className="whitespace-nowrap text-[13px] text-muted">{sub.last_run_at ? fmtTime(sub.last_run_at) : "-"}</Td>
                     <Td className="text-right">
-                      {!sub.active_job_id &&
+                      {!sub.listing_job_id &&
                         (sub.initialized ? (
                           <Button size="sm" onClick={() => runSubscription(run, sub, "incremental")}>
                             立即增量
@@ -242,6 +244,23 @@ export default function Overview() {
   );
 }
 
+function RequestTimings({ s }: { s: Status }) {
+  const labels: Record<string, string> = {
+    "play.resolve": "播放选源与刷新", "play.refresh_wait": "同源刷新排队", "play.playlist": "播放清单", "pool.play.wait": "播放连接排队",
+    "pool.media.wait": "中转连接排队", "upstream.play": "源站响应", "relay.ttfb": "中转首字节",
+    "db.read": "数据读取", "db.bulk": "列表与统计查询", "task.output": "文件输出",
+  };
+  const rows = Object.entries(s.metrics.timings ?? {}).filter(([key]) => labels[key]);
+  const gauges = s.metrics.gauges ?? {};
+  return <Panel title="请求耗时">
+    <p className="mb-2 text-xs text-muted">最近 15 分钟的服务端样本；302 后播放器的首帧时间由客户端网络决定。</p>
+    <p className="mb-3 text-xs text-muted">活动中转 {gauges.http_active_media ?? 0} · 缓冲 {((gauges.relay_buffer_bytes ?? 0)/1024).toFixed(0)} KB · 上游断流 {s.metrics.counters.relay_aborted ?? 0} · 日志缺口 {s.metrics.log_dropped ?? 0}</p>
+    <Table><thead><tr><Th>阶段</Th><Th>样本</Th><Th>P50</Th><Th>P95</Th><Th>最大</Th></tr></thead><tbody>
+      {rows.length ? rows.map(([key, v]) => <tr key={key}><Td>{labels[key]}</Td><Td>{v.count}</Td><Td>{v.p50_ms}ms</Td><Td>{v.p95_ms}ms</Td><Td>{v.max_ms}ms</Td></tr>) : <tr><Td colSpan={5}>还没有请求样本</Td></tr>}
+    </tbody></Table>
+  </Panel>;
+}
+
 function Metrics({ s, queueSum, c }: { s: Status; queueSum: (k: "pending" | "running" | "failed") => number; c: (k: string) => number }) {
   const rate = s.sites
     .filter(x => x.enabled)
@@ -253,7 +272,7 @@ function Metrics({ s, queueSum, c }: { s: Status; queueSum: (k: "pending" | "run
     { label: "已写 strm", value: fmtNum(s.videos.with_strm), sub: `有封面 ${fmtNum(s.videos.with_cover)}` },
     { label: "待处理子任务", value: fmtNum(queueSum("pending")), sub: `运行中 ${queueSum("running")}` },
     { label: "失败子任务", value: fmtNum(queueSum("failed")), sub: "活动任务里", tone: queueSum("failed") ? "text-err" : "" },
-    { label: "请求 / 分钟", value: fmtNum(s.metrics.requests_per_minute), sub: "当前限速 次/秒", title: rate },
+    { label: "源站响应 / 分钟", value: fmtNum(s.metrics.requests_per_minute), sub: "当前限速 次/秒", title: rate },
     { label: "被拦截", value: fmtNum(c("fetch_blocked")), sub: `网络错误 ${fmtNum(c("fetch_error"))}` },
     {
       label: "播放请求",

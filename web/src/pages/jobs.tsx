@@ -32,6 +32,7 @@ export const jobFinished = (j: Job) => (j.tasks.done ?? 0) + (j.tasks.failed ?? 
 function progressText(j: Job): string {
   let text = `${fmtNum(jobFinished(j))} / ${fmtNum(jobTotal(j))}`;
   const st = j.state;
+  if (st.queued != null) text += `，已排队 ${fmtNum(Number(st.queued))} 项`;
   const n = (k: string) => fmtNum(Number(st[k] ?? 0));
   if (st.last_page) text += `，共 ${st.last_page} 页`;
   if (j.kind === "locate" && st.checked != null) text += `，更新 ${n("updated")}，找不到 ${n("missing")}`;
@@ -96,7 +97,7 @@ export default function Jobs() {
                     <div className="text-xs text-muted">{kindName(j.kind)}</div>
                   </Td>
                   <Td>
-                    <Chip tone={stTone}>{stText}</Chip>
+                    <Chip tone={j.status === "done" && j.state.partial_failure ? "warn" : stTone}>{j.status === "done" && j.state.partial_failure ? "完成 · 部分失败" : stText}</Chip>
                   </Td>
                   <Td>
                     <Progress value={total ? (jobFinished(j) * 100) / total : 0} tone={j.tasks.failed ? "warn" : "accent"} />
@@ -275,7 +276,7 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
   const [filter, setFilter] = useState<"" | TaskStatus>(job.tasks.failed ? "failed" : "");
   const { data: tasks = [] } = useQuery({
     queryKey: ["tasks", job.id, filter],
-    queryFn: () => api.get<Task[]>(`/api/jobs/${job.id}/tasks?status=${filter}&limit=300`),
+    queryFn: ({ signal }) => api.get<Task[]>(`/api/jobs/${job.id}/tasks?status=${filter}&limit=300`, signal),
     refetchInterval: job.status === "running" ? 3000 : false,
   });
   const [stText, stTone] = JOB_STATUS[job.status];

@@ -210,7 +210,7 @@ function LibraryForm({ lib, libs, onDone }: { lib: Library | null; libs: Library
   });
   const { data: facets } = useQuery({
     queryKey: ["facets-all"],
-    queryFn: () => api.get<Record<FacetField, FacetItem[]>>("/api/facets"),
+    queryFn: ({ signal }) => api.get<Record<FacetField, FacetItem[]>>("/api/facets", signal),
     enabled: useRule,
     staleTime: 60_000,
   });
@@ -400,7 +400,7 @@ function SubscriptionsPanel() {
                 </Td>
                 <Td className="whitespace-nowrap text-[13px] text-muted">{sub.last_run_at ? fmtTime(sub.last_run_at) : "-"}</Td>
                 <Td className="whitespace-nowrap text-right">
-                  {!sub.active_job_id &&
+                  {!sub.listing_job_id &&
                     (sub.initialized ? (
                       <Button size="sm" onClick={() => runSubscription(run, sub, "incremental")}>
                         立即增量
@@ -418,8 +418,8 @@ function SubscriptionsPanel() {
                     </MenuTrigger>
                     <MenuContent>
                       <MenuItem onSelect={() => setEditing(sub)}>编辑</MenuItem>
-                      {!sub.active_job_id && sub.initialized ? <MenuItem onSelect={() => runSubscription(run, sub, "full")}>重跑全量</MenuItem> : null}
-                      {!sub.active_job_id && !sub.initialized ? (
+                      {!sub.listing_job_id && sub.initialized ? <MenuItem onSelect={() => runSubscription(run, sub, "full")}>重跑全量</MenuItem> : null}
+                      {!sub.listing_job_id && !sub.initialized ? (
                         <MenuItem
                           onSelect={async () => {
                             if (await ask(`订阅「${sub.name}」不跑首轮全量？`, "直接改为定时增量。库里已经用别的任务抓全时用它。", { confirmText: "标记首轮已完成" }))

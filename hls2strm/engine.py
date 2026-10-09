@@ -24,6 +24,7 @@ import time
 from collections import Counter
 from pathlib import Path
 from urllib.parse import urljoin
+from weakref import WeakValueDictionary
 
 from .codes import work_slug
 from .config import BootConfig, SettingsStore, check_path_template
@@ -56,6 +57,11 @@ TASK_STATUS_NAMES = {"done": "完成", "failed": "失败", "gone": "下架", "ca
 PROBE_STATUS_NAMES = {"found": "找到", "none": "没有", "failed": "失败", "timeout": "超时"}
 DEFAULT_MAX_PAGES = 20
 SETTLE_INTERVAL = 600
+
+
+class TaskStopped(Exception):
+    def __init__(self, status: str):
+        self.status = status
 
 
 class Engine:
@@ -94,6 +100,7 @@ class Engine:
         self._progress_at: dict[int, float] = {}  # 任务 id -> 上次在日志里报进度的时间
         self._health_task: asyncio.Task | None = None
         self._health_at = 0.0  # 上次定时检测连通性的时间
+        self._output_locks = WeakValueDictionary()
 
     # ---- 生命周期 ----
 
@@ -106,6 +113,7 @@ class Engine:
             log.info("上次退出时有 %d 个子任务未完成，已放回队列", n)
         for job in await self.db.list_jobs(limit=1000):
             if job["status"] == "running":
+                await self._update_list_completion(job["id"])
                 await self._maybe_finish_job(job["id"])
         self._resize_workers()
         self.store.on_change(lambda old, new: self._on_settings())
@@ -125,6 +133,7 @@ class Engine:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await self.resolver.quality.close()
         await self._save_health()
 
     def _worker_count(self) -> int:
@@ -200,8 +209,13 @@ class Engine:
                 await self._idle(2)
                 continue
             async with self._claim_lock:  # 算可领站点和登记 running 要原子，否则并发会超出站点上限
+                if self.paused:
+                    continue
                 task = await self.db.claim_task(self._skip_sites())
                 if task is not None:
+                    if self.paused:
+                        await self.db.finish_task(task["id"], "pending", refund_attempt=True)
+                        continue
                     self.running[task["id"]] = {
                         "id": task["id"], "job_id": task["job_id"], "kind": task["kind"], "site": task["site"],
                         "target": task["target"], "attempt": task["attempts"], "started": time.time()}
@@ -216,7 +230,7 @@ class Engine:
         finished = False
         try:
             job = await self.db.get_job(task["job_id"])
-            if job is None or job["status"] != "running":
+            if self.paused or job is None or job["status"] != "running":
                 await self.db.finish_task(tid, "pending", refund_attempt=True)
                 return
             if job["started_at"] is None and await self.db.mark_job_started(job["id"]):
@@ -229,7 +243,8 @@ class Engine:
                        "purge": self._do_purge, "reclassify": self._do_reclassify,
                        "scan": self.strm.do_scan, "adopt": self.strm.do_adopt,
                        "prefix": self.strm.do_prefix, "revert": self.strm.do_revert,
-                       "locate": self.strm.do_locate, "quality": self._do_quality}[task["kind"]]
+                       "locate": self.strm.do_locate, "quality": self._do_quality, "prepare": self._do_prepare,
+                       "membership": self._do_membership}[task["kind"]]
             await handler(job, task)
             await self.db.finish_task(tid, "done", duration_ms=int((time.monotonic() - t0) * 1000))
             log.debug("子任务 #%d %s %s 完成（%.1fs）", tid, task["kind"], task["target"], time.monotonic() - t0)
@@ -238,6 +253,8 @@ class Engine:
         except asyncio.CancelledError:
             await self.db.finish_task(tid, "pending", "进程退出时中断", refund_attempt=True)
             raise
+        except TaskStopped as e:
+            await self.db.finish_task(tid, e.status, "任务暂停后恢复" if e.status == "pending" else "任务已取消", refund_attempt=True)
         except (NotFound, VideoGone) as e:
             await self.db.finish_task(tid, "gone", f"已下架：{e}")
             if task["kind"] == "detail":
@@ -263,8 +280,25 @@ class Engine:
             finished = await self._retry_or_fail(task, e)
         finally:
             self.running.pop(tid, None)
+            self.metrics.observe(f"task.{task['kind']}", (time.monotonic()-t0)*1000)
         if finished:
+            if task["kind"] == "list":
+                await self._update_list_completion(task["job_id"])
             await self._maybe_finish_job(task["job_id"])
+
+    async def _update_list_completion(self, job_id: int) -> None:
+        job = await self.db.get_job(job_id)
+        if job is None or job["status"] == "cancelled" or job["kind"] not in ("crawl", "incremental"):
+            return
+        if not job["state"].get("list_complete"):
+            row = await self.db._one("SELECT COUNT(*) AS n, SUM(status!='done') AS bad FROM tasks WHERE job_id=? AND kind='list'", (job_id,))
+            if not row["n"] or row["bad"]:
+                return
+            await self.db._write("UPDATE jobs SET state=json_set(state,'$.list_complete',json('true')) WHERE id=?", (job_id,))
+        if (sub_id := job["params"].get("subscription_id")) and not job["params"].get("incremental"):
+            await self.db.update_subscription(sub_id, initialized=1)
+        self._settle_wanted = True
+        log.info("任务 #%d 列表扫描完整，元数据和封面继续在后台补充", job_id)
 
     async def _retry_or_fail(self, task: dict, e: Exception) -> bool:
         s = self.store.current
@@ -301,11 +335,21 @@ class Engine:
             return
         counts = await self.db.task_counts(job_id)
         finished = int(time.time())
-        await self.db.update_job(job_id, status="done", finished_at=finished)
+        state = job["state"]
+        if counts.get("failed") or counts.get("cancelled"):
+            state["partial_failure"] = True
+        else:
+            state.pop("partial_failure", None)
+        if job["kind"] in ("crawl", "incremental"):
+            row = await self.db._one("SELECT COUNT(*) AS n, SUM(status!='done') AS bad FROM tasks WHERE job_id=? AND kind='list'", (job_id,))
+            state["list_complete"] = bool(row["n"] and not row["bad"])
+            if not state["list_complete"]:
+                state["partial_failure"] = True
+        await self.db.update_job(job_id, status="done", finished_at=finished, state=state)
         self._progress_at.pop(job_id, None)
         self._settle_wanted = True
         p = job["params"]
-        if p.get("subscription_id") and not p.get("incremental"):
+        if p.get("subscription_id") and not p.get("incremental") and state.get("list_complete"):
             await self.db.update_subscription(p["subscription_id"], initialized=1)
             log.info("订阅 #%d 首轮全量完成，之后按周期增量", p["subscription_id"])
         log.info("任务 #%d「%s」完成，用时 %s：%s", job_id, job["name"],
@@ -341,6 +385,14 @@ class Engine:
 
     async def _output_one(self, v: dict, library_id: int, *, cover: bool, old_strm: str | None = None,
                           settle: bool = False, versions: bool | None = None) -> None:
+        from .runtime import stage
+        lock = self._output_locks.setdefault(v["id"], asyncio.Lock())
+        async with lock:
+            with stage(self.metrics, "task.output"):
+                await self._write_output_one(v, library_id, cover=cover, old_strm=old_strm, settle=settle, versions=versions)
+
+    async def _write_output_one(self, v: dict, library_id: int, *, cover: bool, old_strm: str | None = None,
+                                settle: bool = False, versions: bool | None = None) -> None:
         """写一部影片在某个库里的输出。versions：要不要对齐多画质版本文件，默认库开了才对齐；
         重写输出时传 True，库关了也清掉以前写的。"""
         lib = self._library(library_id)
@@ -441,9 +493,13 @@ class Engine:
         restored: Counter = Counter()
         detail_keys = []
         state = (await self.db.get_job(job["id"]))["state"]
+        resumed = task["attempts"] > 1 or bool(task["last_error"])
+        if resumed:
+            state["known_streak"] = 0
         probe_sites = [n for n in self.store.current.auto_probe_sites
                        if n in SITES and n != site.name and SITES[n].can_lookup]
         for it in lp.items:
+            await self.checkpoint(job["id"])
             v, created = await self.upsert_item(site, it)
             for n in probe_sites if created else ():
                 await self.db.add_tasks(job["id"], "probe", [f"{n}:{v['id']}"], PRIORITY_DETAIL, n)
@@ -458,11 +514,15 @@ class Engine:
                 restored[await self.restore_lost(v, lib)] += 1
             elif added or not strm_path:
                 # 已有详情的影片（别的库抓过）直接带上 nfo 和封面
-                await self._output_one(v, lib_id, cover=bool(v["detail_at"]))
+                await self._output_one(v, lib_id, cover=False)
+                if v["detail_at"]:
+                    await self._queue_covers(job["id"], v)
             if p.get("detail", True) and v["detail_at"] is None:
                 detail_keys.append(it.key)
             added_count += added
             state["known_streak"] = 0 if added else state.get("known_streak", 0) + 1
+        if resumed:
+            state["known_streak"] = 0  # 重跑本页已写入的片不能提前触发增量停止。
         if restored["rewritten"] and self.missing.get(lib_id):  # 补回的不再算缺失
             self.missing[lib_id] = max(0, self.missing[lib_id] - restored["rewritten"])
         if detail_keys:
@@ -489,10 +549,17 @@ class Engine:
                  _restore_text(restored))
 
     async def _do_detail(self, job: dict, task: dict) -> None:
-        await self.fetch_detail(task["site"] or "jable", task["target"], library_id=job["params"].get("library_id"))
+        if job["kind"] in ("crawl", "incremental"):
+            src = await self.db.find_source(task["site"] or "jable", task["target"])
+            if src and src["detail_at"]:
+                video = await self.db.get_video_by_id(src["video_id"])
+                await self._output_all(video, cover=False)
+                await self._queue_covers(job["id"], video)
+                return
+        await self.fetch_detail(task["site"] or "jable", task["target"], library_id=job["params"].get("library_id"), job_id=job["id"])
 
     async def fetch_detail(self, site_name: str, key: str, *, library_id: int | None = None,
-                           priority: bool = False) -> dict:
+                            priority: bool = False, job_id: int | None = None) -> dict:
         """抓某个源的详情、合并作品元数据；library_id 不为空时把作品加入该库。作品所在的每个库都会重写输出。"""
         if library_id:
             self._library(library_id)
@@ -508,12 +575,21 @@ class Engine:
                 self.resolver.quality.spawn(src["id"], None, d.stream_url, site.stream.headers)
         if library_id:
             await self.db.ensure_output(v["id"], library_id)
-        await self._output_all(v, cover=True)
-        await self.apply_rules(v)
+        await self._output_all(v, cover=job_id is None)
+        await self.apply_rules(v, cover=job_id is None)
+        if job_id is not None:
+            await self._queue_covers(job_id, v)
         self.metrics.inc("videos_detail")
         log.info("详情 %s %s：%s，女优 %s，%d 个标签", site.label, key, v["release_date"] or "无日期",
                  "、".join(m["name"] for m in v["models"]) or "无", len(v["tags"]))
         return await self.db.get_video_by_id(v["id"])
+
+    async def _queue_covers(self, job_id: int, v: dict) -> None:
+        if not self.store.current.download_cover or not v.get("cover_url"):
+            return
+        targets = [f"{out['library_id']}:{v['id']}" for out in await self.db.get_outputs(v["id"])
+                   if out["strm_path"] and not out["cover_done"] and not self._library(out["library_id"])["external_dir"]]
+        await self.db.add_tasks(job_id, "cover", targets, PRIORITY_DETAIL)
 
     async def _do_probe(self, job: dict, task: dict) -> None:
         site, _, vid = task["target"].partition(":")
@@ -690,6 +766,31 @@ class Engine:
         log.info("输出库「%s」：手动加入 %d 部", lib["name"], added)
         return added
 
+    async def create_membership(self, video_ids: list[int], library_id: int, *, remove: bool = False) -> int:
+        lib = self._library(library_id)
+        ids = list(dict.fromkeys(video_ids))
+        kind = "library_remove" if remove else "library_add"
+        job = await self.db.create_job(kind, f"{'移出' if remove else '加入'}「{lib['name']}」：{len(ids)} 部",
+                                       {"library_id": library_id, "remove": remove})
+        await self.db.add_tasks(job, "membership", ids, PRIORITY_USER)
+        self.notify()
+        return job
+
+    async def _do_membership(self, job: dict, task: dict) -> None:
+        library_id, video_id = job["params"]["library_id"], int(task["target"])
+        if job["params"]["remove"]:
+            await self.remove_from_library([video_id], library_id)
+            return
+        lib = self._library(library_id)
+        video = await self.db.get_video_by_id(video_id)
+        if video is None or video["status"] != "active" or await self.db.in_libraries(video_id, lib["excludes"]):
+            return
+        old = await self.db.get_output(video_id, library_id)
+        await self.db.ensure_output(video_id, library_id)
+        if old is None or not old["strm_path"]:
+            await self._output_one(video, library_id, cover=False)
+        await self._queue_covers(job["id"], video)
+
     async def remove_from_library(self, video_ids: list[int], library_id: int) -> int:
         """选中的影片移出输出库并删掉文件（外部整理库只删 strm）。规则库、来源库之后会按规则再把符合的加回来。"""
         lib = self._library(library_id)
@@ -748,16 +849,32 @@ class Engine:
         for lib in list(self.libs.values()):
             if lib["external_dir"] and lib_id in (None, lib["id"]):
                 await self.strm.locate(lib)  # 外部整理库先找回文件的新位置，再原地改内容
-        n = 0
-        async for v, out in self.db.iter_outputs(lib_id):
+        n = job["state"].get("written", 0)
+        async for v, out in self.db.iter_outputs(lib_id, after=job["state"].get("cursor", -1)):
+            await self.checkpoint(job["id"])
             if v["status"] != "active" or out["library_id"] not in self.libs:
                 continue
             await self._output_one(v, out["library_id"], cover=False, old_strm=out["strm_path"], versions=True)
             n += 1
+            await self.db.update_job(job["id"], state={"cursor": out["rowid"], "written": n})
             if n % 1000 == 0:
                 log.info("重写输出：已完成 %d 个", n)
         log.info("重写输出完成：共 %d 个", n)
         await self.count_missing()
+
+    async def checkpoint(self, job_id: int) -> None:
+        job = await self.db.get_job(job_id)
+        if job is None or job["status"] == "cancelled":
+            raise TaskStopped("cancelled")
+        if self.paused or job["status"] != "running":
+            raise TaskStopped("pending")
+
+    async def checked_outputs(self, job: dict, counts: Counter):
+        """核对任务在条目之间响应暂停；文件副作用之后才推进持久化游标。"""
+        async for v, out in self.db.iter_outputs(job["params"].get("library_id"), after=job["state"].get("_cursor", -1)):
+            await self.checkpoint(job["id"])
+            yield v, out
+            await self.db.update_job(job["id"], state={**dict(counts), "_cursor": out["rowid"]})
 
     # ---- 核对输出 ----
 
@@ -833,12 +950,12 @@ class Engine:
         p = job["params"]
         lib_id, repair, covers = p.get("library_id"), p.get("repair", True), p.get("covers", True)
         force_external, details = p.get("force_external", False), p.get("details", False)
-        st = Counter()
+        st = Counter({k: v for k, v in job["state"].items() if not k.startswith("_")})
         for lib in list(self.libs.values()):
             if lib["external_dir"] and lib_id in (None, lib["id"]):
                 await self.strm.locate(lib)  # 外部整理库先找回被外部工具移走的文件
         cover_targets = []
-        async for v, out in self.db.iter_outputs(lib_id):
+        async for v, out in self.checked_outputs(job, st):
             lib = self.libs.get(out["library_id"])
             if lib is None or v["status"] != "active" or not out["strm_path"]:
                 continue
@@ -864,7 +981,7 @@ class Engine:
                 st["repaired"] += 1
             if "cover" in problems:
                 if covers:
-                    cover_targets.append(f"{lib['id']}:{v['id']}")
+                    st["covers_queued"] += await self.db.add_tasks(job["id"], "cover", [f"{lib['id']}:{v['id']}"], PRIORITY_DETAIL)
                 else:
                     await self.db.set_cover_done(v["id"], lib["id"], False)
             if st["checked"] % 2000 == 0:
@@ -909,7 +1026,7 @@ class Engine:
         self.notify()
         return job_id
 
-    async def apply_rules(self, v: dict, only_library: int | None = None) -> tuple[int, int]:
+    async def apply_rules(self, v: dict, only_library: int | None = None, *, cover: bool = True) -> tuple[int, int]:
         """按规则库调整影片归属：命中就加入（via=rule），不再命中就移除规则加入的输出。返回 (加入, 移除)。"""
         added = removed = 0
         for lib in list(self.libs.values()):
@@ -920,7 +1037,7 @@ class Engine:
             out = await self.db.get_output(v["id"], lib["id"])
             if should and out is None:
                 await self.db.ensure_output(v["id"], lib["id"], via="rule")
-                await self._output_one(v, lib["id"], cover=bool(v["detail_at"]), old_strm="")
+                await self._output_one(v, lib["id"], cover=cover and bool(v["detail_at"]), old_strm="")
                 added += 1
             elif not should and out is not None and out["via"] == "rule":
                 if out["strm_path"]:
@@ -932,11 +1049,13 @@ class Engine:
 
     async def _do_reclassify(self, job: dict, task: dict) -> None:
         lib_id = job["params"].get("library_id")
-        n = added = removed = 0
+        n, added, removed = (job["state"].get(k, 0) for k in ("checked", "added", "removed"))
         if any(lib["rule"] for lib in self.libs.values() if lib_id in (None, lib["id"])):
-            async for v in self.db.iter_videos():
+            async for v in self.db.iter_videos(after=job["state"].get("_cursor", -1)):
+                await self.checkpoint(job["id"])
                 a, r = await self.apply_rules(v, only_library=lib_id)
                 added, removed, n = added + a, removed + r, n + 1
+                await self.db.update_job(job["id"], state={"checked": n, "added": added, "removed": removed, "_cursor": v["id"]})
                 if n % 2000 == 0:
                     log.info("重新归库：已检查 %d 部，加入 %d，移除 %d", n, added, removed)
             log.info("重新归库完成：检查 %d 部，加入 %d，移除 %d", n, added, removed)
@@ -1155,6 +1274,45 @@ class Engine:
         return await self.create_videos(items, library_id=None, name=f"补全缺失详情（{len(items)} 部）",
                                         priority=PRIORITY_DETAIL)
 
+    async def create_prepared_job(self, kind: str, library_id: int | None = None, site: str = "jable") -> int:
+        """先持久化操作，后台枚举并分批入队；大库不阻塞 HTTP 提交。"""
+        if library_id:
+            self._library(library_id)
+        if kind == "probe" and not get_site(site).can_lookup:
+            raise ValueError("这个站点不支持按番号查找")
+        labels = {"backfill": "补全缺失详情", "quality": "画质探测", "probe": "补源"}
+        job = await self.db.create_job("videos" if kind == "backfill" else kind, labels[kind],
+                                       {"prepare": kind, "library_id": library_id, "site": site})
+        await self.db.add_tasks(job, "prepare", ["all"], PRIORITY_USER)
+        self.notify()
+        return job
+
+    async def _do_prepare(self, job: dict, task: dict) -> None:
+        from itertools import islice
+        p, cfg = job["params"], self.store.current.sites
+        kind = p["prepare"]
+        if kind == "backfill":
+            rows = ((site, key) for site, key in await self.db.sources_missing_detail(self._rank))
+            task_kind = "detail"
+        elif kind == "quality":
+            rows = ((r["site"], str(r["id"])) for r in await self.db.sources_needing_quality(int(time.time())-QUALITY_RETRY_AFTER, p.get("library_id"))
+                    if r["site"] in cfg and cfg[r["site"]].enabled)
+            task_kind = "quality"
+        else:
+            site = p["site"]
+            ids = await self.db.works_to_probe(site, int(time.time())-self.store.current.probe_recheck_days*86400, p.get("library_id"))
+            rows = ((site, f"{site}:{vid}") for vid in ids)
+            task_kind = "probe"
+        queued = job["state"].get("queued", 0)
+        while chunk := list(islice(rows, 256)):
+            await self.checkpoint(job["id"])
+            by_site = {}
+            for site, target in chunk:
+                by_site.setdefault(site, []).append(target)
+            for site, targets in by_site.items():
+                queued += await self.db.add_tasks(job["id"], task_kind, targets, PRIORITY_DETAIL, site)
+            await self.db.update_job(job["id"], state={"queued": queued})
+
     # ---- 画质探测 ----
 
     async def create_quality(self, library_id: int | None = None) -> int:
@@ -1299,6 +1457,7 @@ class Engine:
             await self.db.update_job(job_id, status="paused")
         elif action == "resume" and job["status"] == "paused":
             await self.db.update_job(job_id, status="running")
+            await self._update_list_completion(job_id)
         elif action == "cancel" and job["status"] in ("running", "paused"):
             await self.db.cancel_open_tasks(job_id)
             await self.db.update_job(job_id, status="cancelled", finished_at=int(time.time()))
@@ -1415,7 +1574,7 @@ class Engine:
         sub = await self.db.get_subscription(sub_id)
         if sub is None:
             raise KeyError(sub_id)
-        active = await self.db.subscription_active_job(sub_id)
+        active = await self.db.subscription_active_job(sub_id, listing_only=True)
         if active:
             raise ValueError(f"订阅「{sub['name']}」已有任务在执行：#{active['id']}")
         full = mode == "full" or (mode == "auto" and not sub["initialized"])
@@ -1453,7 +1612,7 @@ class Engine:
             return
         t = time.time()
         for sub in await self.db.list_subscriptions():
-            if not (sub["enabled"] and sub["initialized"] and sub["interval"] > 0) or sub["active_job_id"]:
+            if not (sub["enabled"] and sub["initialized"] and sub["interval"] > 0) or sub["listing_job_id"]:
                 continue
             if sub["last_run_at"] and t - sub["last_run_at"] < sub["interval"] * 60:
                 continue

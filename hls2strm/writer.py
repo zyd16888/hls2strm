@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -38,9 +39,13 @@ def write_atomic(path: Path, data: bytes) -> bool:
             return False
     except FileNotFoundError:
         pass
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False) as stream:
+        tmp = Path(stream.name)
+        stream.write(data)
+    try:
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return True
 
 

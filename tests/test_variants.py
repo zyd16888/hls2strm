@@ -72,7 +72,8 @@ def test_play_and_resolve_versions(tmp_path):
 
             body = c.get("/play/ipzz-983@480p.m3u8", headers={"User-Agent": "Lavf/61"}).text  # 中转
             refs = [ln for ln in body.splitlines() if ln and not ln.startswith("#")]
-            assert len(refs) == 1 and refs[0].endswith("/480p/video.m3u8")
+            assert len(refs) == 1 and refs[0].split("?", 1)[0].endswith("/480p/video.m3u8")
+            assert "?s=" in refs[0]  # 中转清单绑定本次播放会话
 
             assert c.put("/api/settings", json={"variant_mode": "all"}).status_code == 200
             assert c.get("/play/ipzz-983.m3u8", headers=h, follow_redirects=False).headers["location"] == master_url

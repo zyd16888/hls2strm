@@ -96,8 +96,9 @@ def classify(path: Path, content: str, now: float) -> StrmInfo:
 
 def iter_strm(root: Path, now: float):
     """遍历目录下的 .strm，产出 (路径, 修改时间, 分类结果)。"""
-    for dirpath, _, files in os.walk(root):
-        for name in files:
+    for dirpath, dirs, files in os.walk(root):
+        dirs.sort()
+        for name in sorted(files):
             if not name.lower().endswith(".strm"):
                 continue
             p = os.path.join(dirpath, name)
@@ -127,17 +128,22 @@ def scan_directory(
     id_by_slug: dict[str, int],
     scan_id: int,
 ) -> list[tuple]:
+    return list(iter_scan_rows(root, library_roots, managed, slug_by_id, id_by_slug, scan_id))
+
+
+def iter_scan_rows(root, library_roots, managed, slug_by_id, id_by_slug, scan_id, after=""):
     """遍历目录，返回 strm_files 的行。同步函数，放到线程里跑。"""
     now = time.time()
     roots = sorted(((os.path.normcase(str(r)) + os.sep, lid) for lid, r in library_roots), key=lambda x: -len(x[0]))
-    rows = []
+    cursor = (Path(after).parent.parts, Path(after).name) if after else None
     for p, mtime, info in iter_strm(root, now):
+        if cursor and (Path(p).parent.parts, Path(p).name) <= cursor:
+            continue
         slug, vid = video_of(info, slug_by_id, id_by_slug)
         key = os.path.normcase(p)
         lib_id = next((lid for r, lid in roots if key.startswith(r)), None)
-        rows.append((p, scan_id, info.url, info.prefix, info.kind, slug, vid, int(info.expired),
-                     int(key in managed), lib_id, mtime, "", int(now)))
-    return rows
+        yield (p, scan_id, info.url, info.prefix, info.kind, slug, vid, int(info.expired),
+               int(key in managed), lib_id, mtime, "", int(now))
 
 
 def find_by_video(roots: list[Path], slug_by_id: dict[int, str],
@@ -276,17 +282,27 @@ class StrmManager:
         lib_roots += [(lid, r) for lid, lib in self.e.libs.items() if (r := self.e.writer.external_root(lib))]
         managed = {os.path.normcase(p) for p in await self.db.all_output_paths()}
         keys = await self.db.video_keys()
-        rows = await asyncio.to_thread(
-            scan_directory, root, lib_roots, managed, await self.db.cdn_video_map(), {s: i for i, s in keys}, job["id"]
-        )
+        iterator = iter_scan_rows(root, lib_roots, managed, await self.db.cdn_video_map(), {s: i for i, s in keys}, job["id"], job["state"].get("scan_cursor", ""))
+        from itertools import islice
+        while True:
+            await self.e.checkpoint(job["id"])
+            rows = await asyncio.to_thread(lambda: list(islice(iterator, 128)))
+            if not rows:
+                break
+            await self.db._write_many("INSERT OR REPLACE INTO scan_staging VALUES(" + ",".join("?" * 13) + ")", rows)
+            await self.db.update_job(job["id"], state={"scan_cursor": rows[-1][0]})
         dir_prefix = str(root) + os.sep
-        await self.db.replace_strm_files(dir_prefix, rows)
+        async with self.db._tx():
+            await self.db.conn.execute("DELETE FROM strm_files WHERE path>=? AND path<?", (dir_prefix, dir_prefix + "\U0010ffff"))
+            await self.db.conn.execute("INSERT OR REPLACE INTO strm_files SELECT * FROM scan_staging WHERE scan_id=?", (job["id"],))
+            await self.db.conn.execute("DELETE FROM scan_staging WHERE scan_id=?", (job["id"],))
         summary = await self.db.strm_summary(job["id"])
         _, missing = await self.db.missing_outputs(dir_prefix, 0, 1)
-        state = {"dir": str(root), "files": len(rows), "missing": missing, "adoptable": summary["adoptable"],
+        nfiles = sum(v["total"] for v in summary["kinds"].values())
+        state = {"dir": str(root), "files": nfiles, "missing": missing, "adoptable": summary["adoptable"],
                  "kinds": {k: v["total"] for k, v in summary["kinds"].items()}}
         await self.db.update_job(job["id"], state=state)
-        log.info("扫描 %s：%d 个 strm，%s，可纳管 %d，库里有记录但文件缺失 %d", root, len(rows),
+        log.info("扫描 %s：%d 个 strm，%s，可纳管 %d，库里有记录但文件缺失 %d", root, nfiles,
                  "、".join(f"{k} {v}" for k, v in state["kinds"].items()) or "无", summary["adoptable"], missing)
 
     # ---- 纳管 ----

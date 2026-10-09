@@ -5,15 +5,67 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import re
+import secrets
+import queue
 import sys
 import time
 from collections import Counter, deque
-from logging.handlers import RotatingFileHandler
+from logging.handlers import RotatingFileHandler, QueueHandler, QueueListener
+from urllib.parse import urlsplit
 from pathlib import Path
 
 from .errors import RelayAborted
+from .runtime import request_id
 
-LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s [%(request_id)s]: %(message)s"
+_listener = None
+
+
+def redact(message: str) -> str:
+    def safe(match):
+        try:
+            url = urlsplit(match.group(0))
+            host = url.hostname or "?"
+            if ":" in host:
+                host = f"[{host}]"
+            return f"{url.scheme}://{host}{':' + str(url.port) if url.port else ''}/…"
+        except ValueError:
+            return "[URL]"
+    return re.sub(r"https?://[^\s）)]+", safe, message)
+
+
+class SafeQueueHandler(QueueHandler):
+    def prepare(self, record):
+        record.request_id = request_id.get() or "-"
+        rec = super().prepare(record)
+        rec.msg = redact(rec.msg)
+        return rec
+
+    def enqueue(self, record):
+        try:
+            self.queue.put_nowait(record)
+        except queue.Full:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                pass
+            ring.dropped += 1
+            self.queue.put_nowait(record)
+
+
+def shutdown_logging():
+    global _listener
+    if _listener is not None:
+        while _listener.queue.full():
+            try:
+                _listener.queue.get_nowait()
+            except queue.Empty:
+                break
+        _listener.stop()
+        for handler in _listener.handlers:
+            handler.close()
+        _listener = None
 
 
 class RingHandler(logging.Handler):
@@ -23,6 +75,8 @@ class RingHandler(logging.Handler):
         super().__init__()
         self.records: deque[dict] = deque(maxlen=capacity)
         self._ids = itertools.count(1)
+        self.instance = secrets.token_hex(8)
+        self.dropped = 0
         self._subscribers: set[asyncio.Queue] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -31,7 +85,7 @@ class RingHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            msg = record.getMessage()
+            msg = redact(record.getMessage())
             if record.exc_info:
                 msg += "\n" + logging.Formatter().formatException(record.exc_info)
             item = {
@@ -40,6 +94,7 @@ class RingHandler(logging.Handler):
                 "level": record.levelname,
                 "name": record.name.removeprefix("hls2strm."),
                 "msg": msg,
+                "request_id": request_id.get(),
             }
             self.records.append(item)
             if self._loop is not None and self._subscribers:
@@ -48,10 +103,10 @@ class RingHandler(logging.Handler):
         except Exception:
             self.handleError(record)
 
-    @staticmethod
-    def _offer(q: asyncio.Queue, item: dict) -> None:
+    def _offer(self, q: asyncio.Queue, item: dict) -> None:
         if q.full():
-            return
+            q.get_nowait()
+            self.dropped += 1
         q.put_nowait(item)
 
     def subscribe(self) -> asyncio.Queue:
@@ -80,6 +135,8 @@ class UvicornFilter(logging.Filter):
 
 
 def setup_logging(data_dir: Path, level: str = "INFO") -> None:
+    global _listener
+    shutdown_logging()
     log_dir = data_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter(LOG_FORMAT)
@@ -91,7 +148,10 @@ def setup_logging(data_dir: Path, level: str = "INFO") -> None:
     root = logging.getLogger()
     root.handlers.clear()
     root.setLevel(logging.WARNING)
-    for h in (stdout, file, ring):
+    pending = queue.Queue(maxsize=2048)
+    _listener = QueueListener(pending, stdout, file)
+    _listener.start()
+    for h in (SafeQueueHandler(pending), ring):
         root.addHandler(h)
     set_level(level)
     for name in ("uvicorn", "uvicorn.error"):
@@ -117,6 +177,22 @@ class Metrics:
         self.counters: Counter[str] = Counter()
         self.started_at = time.time()
         self._requests: deque[float] = deque(maxlen=10000)
+        self.timings: dict[str, deque] = {}
+        self.gauges: Counter[str] = Counter()
+
+    def observe(self, key: str, milliseconds: float) -> None:
+        if key not in self.timings and len(self.timings) >= 128:
+            return
+        self.timings.setdefault(key, deque(maxlen=512)).append((time.time(), milliseconds))
+
+    def timing_snapshot(self) -> dict:
+        out = {}
+        for key, samples in self.timings.items():
+            vals = sorted(v for ts, v in samples if ts >= time.time() - 900)
+            if vals:
+                out[key] = {"count": len(vals), "p50_ms": round(vals[(len(vals)-1)//2], 1),
+                            "p95_ms": round(vals[min(len(vals)-1, int(len(vals)*.95))], 1), "max_ms": round(vals[-1], 1)}
+        return out
 
     def inc(self, key: str, n: int = 1) -> None:
         self.counters[key] += n
@@ -133,4 +209,7 @@ class Metrics:
             "uptime": int(time.time() - self.started_at),
             "requests_per_minute": self.requests_per_minute(),
             "counters": dict(self.counters),
+            "timings": self.timing_snapshot(),
+            "gauges": dict(self.gauges),
+            "log_dropped": ring.dropped,
         }

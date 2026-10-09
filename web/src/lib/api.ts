@@ -13,8 +13,8 @@ export function setUnauthorizedHandler(fn: () => void) {
   onUnauthorized = fn;
 }
 
-async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
-  const init: RequestInit = { method, headers: {} };
+async function req<T>(method: string, url: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+  const init: RequestInit = { method, headers: {}, signal };
   if (body !== undefined) {
     init.headers = { "Content-Type": "application/json" };
     init.body = JSON.stringify(body);
@@ -37,7 +37,7 @@ async function req<T>(method: string, url: string, body?: unknown): Promise<T> {
 }
 
 export const api = {
-  get: <T>(url: string) => req<T>("GET", url),
+  get: <T>(url: string, signal?: AbortSignal) => req<T>("GET", url, undefined, signal),
   post: <T = { ok: boolean }>(url: string, body: unknown = {}) => req<T>("POST", url, body),
   put: <T = { ok: boolean }>(url: string, body: unknown) => req<T>("PUT", url, body),
   del: <T = { ok: boolean }>(url: string) => req<T>("DELETE", url),
@@ -109,6 +109,7 @@ export interface Subscription {
   last_run_at: number | null;
   last_job_id: number | null;
   active_job_id: number | null;
+  listing_job_id: number | null;
   created_at: number;
 }
 
@@ -130,7 +131,8 @@ export interface Status {
   solver: string;
   videos: { total: number; with_detail: number; gone: number; with_strm: number; with_cover: number };
   queue: Record<string, QueueCounts>;
-  metrics: { uptime: number; requests_per_minute: number; counters: Record<string, number> };
+  metrics: { uptime: number; requests_per_minute: number; counters: Record<string, number>; gauges: Record<string, number>;
+    timings: Record<string, { count: number; p50_ms: number; p95_ms: number; max_ms: number }>; log_dropped: number };
   failures: Failure[];
   subscriptions: Subscription[];
   missing: number;

@@ -216,7 +216,8 @@ class Settings(BaseModel):
         description="网关 resolve 默认给什么地址（网关请求里带 mode 时以它为准）：auto 按上面的偏好挑源，"
                     "能直连给 CDN 地址、要中转给公网中转地址；redirect 只挑能直连的源；proxy 一律给公网中转地址",
     )
-    resolve_timeout: int = Field(20, ge=5, le=120, description="一次播放请求挑源、取地址的总时限（秒），超时不再试后面的源")
+    resolve_timeout: int = Field(20, ge=5, le=120, description="播放解析与首份清单返回的总时限（秒），包含找源、排队和 CDN 请求；媒体传输另按停滞超时判断")
+    resolve_attempt_timeout: int = Field(6, ge=1, le=120, description="每个源或线路单次尝试最多等待几秒；仍受播放总时限约束，给备用源保留机会")
     play_discover: bool = Field(
         True, description="现场找源：影片已知的源都不能用（或库里没有这部影片）时，按番号到其他启用的站点找一次"
     )

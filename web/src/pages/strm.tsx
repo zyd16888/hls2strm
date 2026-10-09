@@ -21,7 +21,7 @@ export default function Strm() {
   const [scanId, setScanId] = useState<number | null>(null);
   const { data: scans = [] } = useQuery({
     queryKey: ["scans"],
-    queryFn: () => api.get<Job[]>("/api/strm/scans"),
+    queryFn: ({ signal }) => api.get<Job[]>("/api/strm/scans", signal),
     refetchInterval: q => ((q.state.data ?? []).some(j => j.status === "running") ? 2000 : false),
   });
   useEffect(() => {
@@ -30,7 +30,7 @@ export default function Strm() {
   const scan = scans.find(j => j.id === scanId);
   const { data: summary } = useQuery({
     queryKey: ["scan-summary", scanId, scan?.status],
-    queryFn: () => api.get<ScanSummary>(`/api/strm/scans/${scanId}/summary`),
+    queryFn: ({ signal }) => api.get<ScanSummary>(`/api/strm/scans/${scanId}/summary`, signal),
     enabled: !!scanId,
   });
 
@@ -95,7 +95,7 @@ function Summary({ summary, onPrefix, onFilter }: { summary: ScanSummary; onPref
   const missingCount = Number(summary.job.state.missing ?? 0);
   const { data: missing } = useQuery({
     queryKey: ["strm-missing", summary.job.id],
-    queryFn: () => api.get<Page<MissingOutput>>(`/api/strm/scans/${summary.job.id}/missing?size=200`),
+    queryFn: ({ signal }) => api.get<Page<MissingOutput>>(`/api/strm/scans/${summary.job.id}/missing?size=200`, signal),
     enabled: showMissing,
   });
   return (
@@ -254,7 +254,7 @@ function PrefixChange({ scanId, old, setOld, onApplied }: { scanId: number; old:
   const [next, setNext] = useState("");
   const [preview, setPreview] = useState<PrefixPreview | null>(null);
   useEffect(() => setPreview(null), [old, next, scanId]);
-  const { data: changes = [] } = useQuery({ queryKey: ["strm-changes"], queryFn: () => api.get<ChangeSet[]>("/api/strm/changes") });
+  const { data: changes = [] } = useQuery({ queryKey: ["strm-changes"], queryFn: ({ signal }) => api.get<ChangeSet[]>("/api/strm/changes", signal) });
 
   const doPreview = async () => {
     const r = await run(() => api.post<PrefixPreview>("/api/strm/prefix/preview", { scan_id: scanId, old, new: next }), { invalidate: [] });
@@ -376,7 +376,7 @@ function Files({ scanId, dir, prefix, setPrefix }: { scanId: number; dir: string
   const params = new URLSearchParams({ kind: f.kind, managed: f.managed, prefix, q: f.q, page: String(f.page), size: String(f.size) });
   const { data } = useQuery({
     queryKey: ["strm-files", scanId, params.toString()],
-    queryFn: () => api.get<Page<StrmFile>>(`/api/strm/scans/${scanId}/files?${params}`),
+    queryFn: ({ signal }) => api.get<Page<StrmFile>>(`/api/strm/scans/${scanId}/files?${params}`, signal),
     placeholderData: keepPreviousData,
   });
   return (

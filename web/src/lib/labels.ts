@@ -21,6 +21,10 @@ export const KIND_NAMES: Record<string, string> = {
   verify: "核对输出",
   cover: "补封面",
   quality: "画质探测",
+  prepare: "准备与分批入队",
+  membership: "调整影片归属",
+  library_add: "加入输出库",
+  library_remove: "移出输出库",
 };
 export const kindName = (k: string) => KIND_NAMES[k] || k;
 

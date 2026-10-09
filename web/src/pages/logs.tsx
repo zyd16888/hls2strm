@@ -21,7 +21,7 @@ export default function Logs() {
   const [follow, setFollow] = useState(true);
   const run = useRun();
   const qc = useQueryClient();
-  const { data: level } = useQuery({ queryKey: ["log-level"], queryFn: () => api.get<Level>("/api/logs/level") });
+  const { data: level } = useQuery({ queryKey: ["log-level"], queryFn: ({ signal }) => api.get<Level>("/api/logs/level", signal) });
 
   const setLevel = async (lv: string) => {
     const r = await run(() => api.put<Level>("/api/logs/level", { level: lv }), { invalidate: [] });

@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urljoin
 
 from .errors import FetchError, NotFound
+from .runtime import background
 
 if TYPE_CHECKING:
     from .db import Database
@@ -148,7 +149,7 @@ async def probe(fetcher: Fetcher, url: str, headers: dict | None = None, samples
     """读播放列表认出画质；单档媒体播放列表抽几个分片按码率估。不是 HLS（mp4 等）返回 None。"""
     if not url.split("?", 1)[0].lower().endswith(".m3u8"):
         return None
-    text = (await fetcher.get_bytes(url, headers=headers)).decode("utf-8", "replace")
+    text = (await getattr(fetcher, "get_playlist", fetcher.get_bytes)(url, headers=headers)).decode("utf-8", "replace")
     if (q := from_master(text)) is not None:
         return q
     segs: list[tuple[float, str, int]] = []  # (时长, 地址, 字节数：EXT-X-BYTERANGE 给了就不用再问)
@@ -230,7 +231,8 @@ class QualityProber:
         """放到后台探测，不耽误调用方（比如 302）。"""
         if (source_id, line_id) in self._busy or len(self._tasks) >= MAX_PENDING:
             return
-        task = asyncio.create_task(self.probe_and_save(source_id, line_id, url, headers))
+        with background():
+            task = asyncio.create_task(self.probe_and_save(source_id, line_id, url, headers))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
@@ -238,3 +240,7 @@ class QualityProber:
         """停止服务时取消还在后台排队的探测。"""
         for task in list(self._tasks):
             task.cancel()
+
+    async def close(self) -> None:
+        self.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)

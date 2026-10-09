@@ -16,6 +16,8 @@ let snapshot: Snapshot = { items, connected };
 let source: EventSource | null = null;
 let retry: ReturnType<typeof setTimeout> | null = null;
 let scheduled = false;
+let instance = "";
+let cursor = 0;
 const listeners = new Set<() => void>();
 
 function emit() {
@@ -33,8 +35,8 @@ function emit() {
 
 function connect() {
   retry = null;
-  const after = items.length ? items[items.length - 1].id : 0;
-  const es = new EventSource(`/api/logs/stream?after=${after}`);
+  const after = cursor;
+  const es = new EventSource(`/api/logs/stream?after=${after}&instance=${instance}`);
   source = es;
   es.onopen = () => {
     connected = true;
@@ -42,11 +44,22 @@ function connect() {
   };
   es.onmessage = ev => {
     const item = JSON.parse(ev.data) as LogItem;
-    if (items.length && item.id <= items[items.length - 1].id) return;
+    if (item.id <= cursor) return;
+    cursor = item.id;
     items.push(item);
     if (items.length > MAX) items.splice(0, items.length - MAX);
     emit();
   };
+  es.addEventListener("reset", ev => {
+    instance = JSON.parse((ev as MessageEvent).data).instance;
+    cursor = 0;
+    items = [];
+    emit();
+  });
+  es.addEventListener("gap", () => {
+    items.push({ id: -Date.now(), ts: Date.now()/1000, level: "WARNING", name: "logs", msg: "部分日志已超出缓冲，详情请查看服务日志文件。" });
+    emit();
+  });
   es.onerror = () => {
     connected = false;
     es.close();
