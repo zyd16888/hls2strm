@@ -1,6 +1,6 @@
 # hls2strm
 
-把在线视频站（目前支持 Jable、MissAV、SupJav、JavGuru、JAVMost）的影片抓成 Emby / Jellyfin 可以直接播放的 `.strm`（附带 nfo 和封面），带 Web 控制台。
+把在线视频站（目前支持 Jable、MissAV、SupJav、JavGuru、JAVMost、123AV）的影片抓成 Emby / Jellyfin 可以直接播放的 `.strm`（附带 nfo 和封面），带 Web 控制台。
 strm 里写的是本服务的地址，播放时才去现取直链：同一部影片可以挂多个站点、多条线路的源，哪个不能用就自动换下一个。
 
 - **多站点、多源择优**：同一番号在不同站点的影片并成一部作品、一个 strm；播放时按字幕偏好、画质、站点优先级挑源（画质读播放列表就知道，不用播放），挑中的源不能用自动换下一个，都不行时现场按番号去别的站找
@@ -35,6 +35,7 @@ Emby/Jellyfin ──►│ /play ──► 按字幕偏好、站点优先级挑�
 | SupJav（默认不启用） | 整站在 CF 挑战后面，**要配解题服务**：解一次拿到 cookie，之后 curl_cffi 带同一个 UA 就能抓 | 多线路，见下表 | 按线路 |
 | JavGuru | 直接抓（挂在 CF 后面，目前不挑战） | 多线路，见下表 | 按线路 |
 | JAVMost | 直接抓 | 多线路，见下表；新片一般只有 DooPlayer | 按线路 |
+| 123AV（原 nJAV） | `123av.com` 直接抓 | 自家播放器，m3u8 不过期；分成多集的片子跳过 | **只能中转**：CDN 要嵌入站（一次性域名，跟着详情页走）的 Referer；分片扩展名在 .css / .svg / .vtt 等之间轮换，实际是 TS，中转时改名 `.ts` |
 
 Jable 的几个实测事实决定了最初的设计：
 
@@ -44,7 +45,7 @@ Jable 的几个实测事实决定了最初的设计：
    所以这类请求会自动改由本服务中转；其余客户端照常 302。中转时分片遇到 403 会自动换新地址重试，播到一半地址过期也不会断。
 4. 列表页使用 KVS 的异步块接口（`?mode=async&function=get_block…`），每页 24 部。最新更新约 1641 页，约 3.9 万部。
 
-nJAV：`njavtv.com` 就是 MissAV 的镜像，已经加进 MissAV 的默认域名（老配置要在「设置 → 站点」里手动加上）；`njav.tv` 已经跳到 123av，只有一条只能中转的线路，没接。
+nJAV：`njavtv.com` 就是 MissAV 的镜像，已经加进 MissAV 的默认域名（老配置要在「设置 → 站点」里手动加上）；`njav.tv` 已经并到 123AV（`123av.com`），只剩跳转提示页，不抓取，但粘贴 `njav.tv` 的影片网址能认出来。
 
 **线路**：多线路站点一部影片有好几个播放服务器，背后是不同的播放站（按页面内容识别，各站共用）：
 
@@ -242,6 +243,7 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
   - SupJav：`/zh/category/chinese-subtitles`、女优 `/zh/category/cast/xxx`、标签 `/zh/tag/xxx`、搜索 `/zh/search/关键词`
   - JavGuru：最新 `/`、英文字幕 `/category/english-subbed`、无码破解 `/category/decensored`、女优 `/actress/xxx`、搜索 `/search/关键词`
   - JAVMost：最新 `/category/all`、女优 `/star/名字`、发行商 `/maker/名称`、搜索 `/search/关键词`
+  - 123AV：`/cn/new`、`/cn/recent`、`/cn/uncensored-leaked`、女优 `/cn/actresses/xxx`、发行商 `/cn/makers/xxx`、类型 `/cn/genres/xxx`、搜索 `/cn/search/关键词`，可带 `?year=2024&type=censored` 筛选；每页 12 部，最多 5000 页
   - 直接粘贴站点网址也行；同一番号已经在库里（别的站抓过）的只加一个源
 - **指定影片**：粘贴影片网址（按域名认站点）或站内 key（用所选站点），每行一个，加入所选的输出库
 - **补源**：见「多源择优和补源」
@@ -403,7 +405,7 @@ npm run build      # 类型检查并构建到 hls2strm/static/
 | 模块 | 职责 |
 |---|---|
 | `fetcher.py` | 分层抓取：每个站点一条通道（多域名轮换、冷却、自适应限速、拦截判定、Byparr/FlareSolverr），共用一个会话 |
-| `sites/` | 站点适配器：`jable.py`、`missav.py`、`supjav.py`、`javguru.py`、`javmost.py`，各自负责列表/详情地址、解析、按番号查找、线路、取播放地址；`hosts.py` 是各站共用的嵌入播放站解析 |
+| `sites/` | 站点适配器：`jable.py`、`missav.py`、`supjav.py`、`javguru.py`、`javmost.py`、`av123.py`，各自负责列表/详情地址、解析、按番号查找、线路、取播放地址；`hosts.py` 是各站共用的嵌入播放站解析 |
 | `codes.py` | 番号规范化和跨站匹配键 |
 | `parser.py`、`sources.py` | Jable 的列表页和详情页解析、列表地址规范化、分页 URL 构造 |
 | `engine.py` | 持久化队列、worker、重试策略、暂停/恢复、定时增量 |

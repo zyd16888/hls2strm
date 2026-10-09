@@ -205,7 +205,7 @@ def _site_of_url(c, url: str) -> str | None:
     host = (urlsplit(url).hostname or "").lower()
     for name, site in SITES.items():
         bases = c.store.current.site(name).domains + site.default_domains
-        if any(host == (urlsplit(b).hostname or "").lower() for b in bases):
+        if host in site.url_hosts or any(host == (urlsplit(b).hostname or "").lower() for b in bases):
             return name
     return None
 

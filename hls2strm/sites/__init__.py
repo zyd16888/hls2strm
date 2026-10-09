@@ -5,13 +5,15 @@ from __future__ import annotations
 from ..codes import code_key
 from ..errors import NotFound, VideoGone
 from .base import LineSpec, ListPage, Site, SourceDetail, SourceItem, Stream, StreamTraits
+from .av123 import AV123Site
 from .jable import JableSite
 from .missav import MissAVSite
 from .javguru import JavGuruSite
 from .javmost import JavMostSite
 from .supjav import SupJavSite
 
-SITES: dict[str, Site] = {s.name: s for s in (JableSite(), MissAVSite(), SupJavSite(), JavGuruSite(), JavMostSite())}
+SITES: dict[str, Site] = {s.name: s for s in (JableSite(), MissAVSite(), SupJavSite(), JavGuruSite(), JavMostSite(),
+                                              AV123Site())}
 
 
 def get_site(name: str) -> Site:

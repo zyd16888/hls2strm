@@ -15,6 +15,7 @@
               CDN 要 Referer 是嵌入页，只能中转
   dooplayer   JAVMost：嵌入页（要 Sec-Fetch-Dest: iframe）meta 里的 x-embed-token / api / et / sig，
               POST {api}{token} 拿 mp4 地址，播放器能直连；有效期不明，按 2 小时算
+  av123       123AV 自家的播放器（解析在 av123.py）：m3u8 不过期，CDN 只认嵌入站的 Referer，分片扩展名伪装，只能中转
 """
 
 from __future__ import annotations
@@ -48,11 +49,12 @@ HOST_TRAITS: dict[str, StreamTraits] = {
     "maxstream": StreamTraits(direct=False, expires=True),
     "dood": StreamTraits(direct=False, expires=True),
     "dooplayer": StreamTraits(direct=True, expires=True, ip_bound=True),
+    "av123": StreamTraits(direct=False, expires=False, disguised_segments=True),
 }
 MP4_HOSTS = {"streamtape", "dood", "dooplayer"}  # 直链是 mp4，读播放列表认不出画质
 HOST_LABELS = {"vidhide": "VidHide", "voe": "VOE", "streamtape": "Streamtape", "vidara": "Vidara",
                "lulustream": "LuluStream", "turbovip": "TurboVip", "maxstream": "MaxStream", "dood": "Dood",
-               "dooplayer": "DooPlayer"}
+               "dooplayer": "DooPlayer", "av123": "123AV"}
 EMBED_HEADERS = {"Sec-Fetch-Dest": "iframe", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "cross-site"}
 
 _HLS2_RE = re.compile(r'"?hls2"?\s*:\s*"([^"]+)"')
@@ -83,7 +85,7 @@ def ts_start(data: bytes) -> int:
 @dataclass
 class HostStream:
     url: str
-    expires: int
+    expires: int | None  # None：不过期
     host: str
     referer: str = ""  # 中转请求直链时要带的 Referer（取决于这次的嵌入页，所以不能写死在播放站特性里）
     quality: Quality | None = None  # 嵌入页里标注的各档画质（vidhide 的 qualityLabels）

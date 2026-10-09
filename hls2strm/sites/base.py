@@ -100,6 +100,7 @@ class Site:
     name = ""
     label = ""
     default_domains: list[str] = []
+    url_hosts: list[str] = []  # 只用来认粘贴的影片网址、不抓取的域名（已停用、只剩跳转页的旧域名）
     default_enabled = True
     lookup_verified = False  # lookup 返回的是搜索结果（带番号），按列表项核对就行，不用再抓详情确认
     line_specs: dict[str, LineSpec] = {}  # 多线路站点的已知线路（按默认优先顺序）；单线路站点为空

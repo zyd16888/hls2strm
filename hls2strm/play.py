@@ -45,7 +45,8 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
 HLS_PATH_RE = re.compile(
     r"^(?:_x/[0-9a-f]{16}/[A-Za-z0-9_-]+(?:\.[a-z0-9]{1,5})?|[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+){0,5})$")
 _EXT_RE = re.compile(r"\.([a-z0-9]{1,5})$")
-DISGUISE_EXTS = (".jpeg", ".jpg", ".png", ".gif", ".webp", ".html", ".txt", ".js", ".css", ".woff2", ".woff")
+DISGUISE_EXTS = (".jpeg", ".jpg", ".png", ".gif", ".webp", ".html", ".txt", ".js", ".css", ".woff2", ".woff", ".svg",
+                 ".xml", ".json", ".vtt", ".srt")
 SUBTITLE_CODES = {"zh": "zh", "none": "", "en": "en"}
 _SIGN_KEY = secrets.token_bytes(16)  # 独立使用时的后备密钥；应用启动时从数据库的持久密钥派生。
 

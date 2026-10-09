@@ -1,6 +1,14 @@
 import asyncio
 import json
+import re
+from types import SimpleNamespace
 
+import pytest
+
+from hls2strm.api import _parse_videos
+from hls2strm.config import Settings
+from hls2strm.errors import NotFound, ParseError, VideoGone
+from hls2strm.play import Resolved, _upstream, rewrite_playlist
 from hls2strm.sites import SITES, find_by_code
 from hls2strm.sites.hosts import detect, resolve_embed
 from hls2strm.sites.javguru import parse_title
@@ -10,6 +18,9 @@ from .test_supjav import FakeHttp, FakeSiteFetcher, Resp
 
 GURU = SITES["javguru"]
 MOST = SITES["javmost"]
+AV = SITES["123av"]
+AV_EMBED = ("https://sadie-shop.site/e/1RD82N?poster=https%3A%2F%2Ficdn.123av.me%2Fimg2%2Fs500%2F73%2F"
+            "abf-392-uncensored-leaked%2Fcover.jpg%3F6ac862c6")
 
 
 def test_javguru_pages():
@@ -103,3 +114,81 @@ def test_hosts_detect_and_dood():
     hs = asyncio.run(resolve_embed(http, "https://dood.pm/e/abc", "https://www.javmost.ws/x/"))
     assert hs.host == "dood" and hs.url.startswith("https://xx.cloudatacdn.com/u5kj/") and "?token=" in hs.url
     assert hs.referer == "https://playmogo.com/e/abc"
+
+
+def test_av123_pages():
+    lp = AV.parse_list(fixture("av123_list.html"))
+    assert len(lp.items) == 12 and lp.last_page == 5000
+    it = lp.items[0]
+    assert (it.key, it.code, it.duration) == ("fc2-ppv-4988898", "FC2-PPV-4988898", 1901)
+    assert it.title.startswith("FC2-PPV-4988898 *着床") and it.thumb_url.startswith("https://icdn.123av.me/")
+    leak = next(x for x in lp.items if x.uncensored)
+    assert leak.key == "abf-392-uncensored-leaked" and leak.code == "ABF-392" and leak.title.startswith("ABF-392 ")
+
+    html = fixture("av123_detail.html")
+    d = AV.parse_detail(html, "abf-392-uncensored-leaked")
+    assert (d.code, d.uncensored, d.release_date, d.duration) == ("ABF-392", True, "2026-10-08", 7981)
+    assert (d.maker, d.series, d.title) == ("Prestige", "极致滑溜高潮", "ABF-392 极致滑腻的高潮——泷本静叶")
+    assert d.models == [{"id": "shizukuha-takimoto", "name": "Shizukuha Takimoto"}]
+    assert d.categories[1] == {"slug": "big-tits", "name": "大胸部"} and d.tags == [{"slug": "abf", "name": "ABF"}]
+    assert d.cover_url == "https://icdn.123av.me/img2/s500/73/abf-392-uncensored-leaked/cover.jpg?6ac862c6"
+    assert d.lines == [("123AV", AV_EMBED)]
+
+    # 播放器里没有分集是没有源；分成多集的拼不成一个流
+    def with_episodes(js: str) -> str:
+        return re.sub(r"JSON\.parse\('.*?'\)", lambda m: f"JSON.parse('{js}')", html, count=1)
+
+    with pytest.raises(VideoGone):
+        AV.parse_detail(with_episodes("[]"), "x")
+    q, sl = "\\" + "u0022", "\\" * 3 + "/"  # 页面里 JSON 套在 JS 字符串里：引号写成 Unicode 转义，斜杠写成三个反斜杠加斜杠
+    ep = '{"number":%d,"name":"%d","url":"https:||a.site|e|X%d"}'.replace('"', q).replace("|", sl)
+    with pytest.raises(ParseError, match="2 集"):
+        AV.parse_detail(with_episodes(f"[{ep % (1, 1, 1)},{ep % (2, 2, 2)}]"), "x")
+    with pytest.raises(ParseError):
+        AV.parse_detail("<html><main><section class='moved'>We have moved to 123av.com</section></main></html>", "x")
+
+    assert AV.key_for("ABF-392") == "abf-392" and AV.key_for("FC2PPV-4981211") == "fc2-ppv-4981211"
+    assert AV.key_for("SSIS-001", uncensored=True) == "ssis-001-uncensored-leaked"
+    assert AV.variant_of("ssis-001-uncensored-leaked") == ("", True)
+    assert AV.key_from_url("https://njav.tv/en/v/HBAD-742") == "hbad-742"
+    assert AV.key_from_url("https://123av.com/cn/actresses/yua-mikami") is None
+    assert AV.normalize_source("https://123av.com/en/censored?year=2024&page=3&sort=views") == "/cn/censored?year=2024"
+    assert AV.normalize_source("/cn/search/三上") == "/cn/search?keyword=%E4%B8%89%E4%B8%8A"
+    assert AV.normalize_source("hot") == "/cn/hot"
+    for bad in ("https://123av.com/cn/v/ssis-001", "/cn/genres", "/cn/me/feed", "/cn/search"):
+        with pytest.raises(ValueError):
+            AV.normalize_source(bad)
+    assert AV.page_url("/cn/new", 1) == "/cn/new"
+    assert AV.page_url("/cn/search?keyword=SSIS%20001", 3, "week") == "/cn/search?keyword=SSIS%20001&sort=week&page=3"
+
+    sf = FakeSiteFetcher({"/cn/v/abf-392-uncensored-leaked": html}, FakeHttp({}))
+    found = asyncio.run(find_by_code(AV, sf, "ABF-392", uncensored=True))
+    assert [x.key for x in found] == ["abf-392-uncensored-leaked"]
+
+    # 旧域名 njav.tv 只剩跳转页，不抓取，但粘贴的旧网址要认得
+    c = SimpleNamespace(store=SimpleNamespace(current=Settings()))
+    assert _parse_videos(c, "https://njav.tv/en/v/HBAD-742 https://123av.com/cn/v/abf-392", "jable") == [
+        ("123av", "hbad-742"), ("123av", "abf-392")]
+
+
+def test_av123_line_and_relay():
+    m3u8 = "https://8qx3.landon-blog.site/oo5/XEn0ez/video.m3u8"
+    http = FakeHttp({"https://sadie-shop.site/stream?id=1RD82N": Resp(200, json.dumps(
+        {"status": "ok", "media": {"stream": m3u8, "vtt": "https://8qx3.landon-blog.site/oo5/XEn0ez/preview.vtt"}}))})
+    hs = asyncio.run(AV.resolve_line(http, "123AV", AV_EMBED))
+    assert (hs.url, hs.expires, hs.host, hs.referer) == (m3u8, None, "av123", "https://sadie-shop.site/")
+    assert http.calls == [("https://sadie-shop.site/stream?id=1RD82N", AV_EMBED)]
+    with pytest.raises(NotFound):
+        asyncio.run(AV.resolve_line(FakeHttp({}), "123AV", AV_EMBED))
+
+    # 中转：Referer 跟着线路（嵌入站会换域名），不过期；分片扩展名轮换（.css、.svg、.vtt…），一律改名 .ts
+    line = {"line": "123AV", "host": "av123", "referer": hs.referer, "stream_url": m3u8, "stream_expires": None}
+    r = Resolved({}, {"id": 9}, AV, line)
+    assert r.traits.headers == {"Referer": "https://sadie-shop.site/"} and not r.traits.direct
+    assert not r.traits.expires and r.traits.disguised_segments
+    root = m3u8.rsplit("/", 1)[0] + "/"
+    sub = "#EXTM3U\n#EXTINF:3,\nMzAwLXYw.css\n#EXTINF:3,\nMzAwLXYx.svg\n#EXTINF:3,\nMzAwLXY4.vtt\n"
+    out = rewrite_playlist(sub, root + "qc/v.m3u8", root, "../", "", True)
+    segs = [ln for ln in out.splitlines() if ln and not ln.startswith("#")]
+    assert segs == ["../qc/MzAwLXYw.css.ts", "../qc/MzAwLXYx.svg.ts", "../qc/MzAwLXY4.vtt.ts"]
+    assert _upstream(r, "qc/MzAwLXY4.vtt.ts") == root + "qc/MzAwLXY4.vtt"
