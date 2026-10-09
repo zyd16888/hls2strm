@@ -256,7 +256,30 @@ async def create_job(body: JobCreate, request: Request):
 
 @router.get("/jobs")
 async def list_jobs(request: Request, limit: int = 50, offset: int = 0):
-    return await _ctx(request).db.list_jobs(limit=min(limit, 200), offset=offset)
+    db = _ctx(request).db
+    jobs = await db.list_jobs(limit=min(limit, 200), offset=offset)
+    counts = await db.history.counts([j["id"] for j in jobs])
+    for job in jobs:
+        job["crawl"] = counts.get(job["id"])
+    return jobs
+
+
+@router.get("/jobs/{job_id}/logs")
+async def job_logs(job_id: int, request: Request, task_id: int | None = None,
+                   before: int = Query(0, ge=0), limit: int = Query(200, ge=1, le=500)):
+    db = _ctx(request).db
+    if await db.get_job(job_id) is None:
+        raise HTTPException(404, "任务不存在")
+    return await db.history.logs(job_id, task_id, before, limit)
+
+
+@router.get("/jobs/{job_id}/items")
+async def job_items(job_id: int, request: Request, status: Literal["", "new", "existing", "excluded"] = "",
+                    limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
+    db = _ctx(request).db
+    if await db.get_job(job_id) is None:
+        raise HTTPException(404, "任务不存在")
+    return await db.history.items(job_id, status, limit, offset)
 
 
 @router.get("/jobs/{job_id}/tasks")
@@ -283,6 +306,8 @@ async def delete_job(job_id: int, request: Request):
         raise HTTPException(404, "任务不存在")
     if job["status"] in ("running", "paused"):
         raise HTTPException(400, "先取消任务再删除")
+    if (await db.task_counts(job_id)).get("running"):
+        raise HTTPException(400, "子任务正在停止，请稍后再删除")
     await db.delete_job(job_id)
     return {"ok": True}
 
@@ -429,6 +454,7 @@ async def job_detail(job_id: int, request: Request):
     if job is None:
         raise HTTPException(404, "任务不存在")
     job["tasks"] = await db.task_counts(job_id)
+    job["crawl"] = (await db.history.counts([job_id])).get(job_id)
     return job
 
 

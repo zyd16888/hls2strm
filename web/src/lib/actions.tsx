@@ -1,6 +1,7 @@
 // 几个页面都会用到的操作
 
 import { ask } from "@/components/confirm";
+import { defaultVerifyOptions, verifyParams, VerifyPrompt } from "@/components/verify-options";
 import { api, type Library } from "./api";
 import type { useRun } from "./queries";
 
@@ -8,17 +9,14 @@ type Run = ReturnType<typeof useRun>;
 
 export async function verifyLibrary(run: Run, lib: Library | null) {
   const name = lib ? `「${lib.name}」` : "全部库";
+  let options = { ...defaultVerifyOptions };
   const ok = await ask(
     `核对${name}`,
-    <>
-      <p>检查数据库里的每条输出在磁盘上还在不在（strm、nfo、封面），缺的补回。</p>
-      <p>strm 和 nfo 在本地重写，封面先从别的库硬链接，没有再下载。</p>
-      <p>外部整理库按内容找文件（外部工具改名、加后缀也认得出），找到只更新路径；两边都找不到才写回收件目录；外部整理目录不存在或是空的不补。</p>
-    </>,
+    <VerifyPrompt onChange={v => { options = v; }} />,
     { confirmText: "开始核对" },
   );
   if (!ok) return;
-  await run(() => api.post<{ id: number }>("/api/jobs", { kind: "verify", library_id: lib?.id ?? null, repair: true, covers: true }), {
+  await run(() => api.post<{ id: number }>("/api/jobs", { kind: "verify", library_id: lib?.id ?? null, ...verifyParams(options) }), {
     success: r => `已创建核对任务 #${r.id}`,
     invalidate: [["status"], ["jobs"]],
   });

@@ -3,6 +3,8 @@ import { Pause, Play, RotateCw, Trash2, X, XCircle } from "lucide-react";
 import { type ReactNode, useState } from "react";
 import { ErrorText } from "@/components/common";
 import { ask } from "@/components/confirm";
+import { CrawlResults, JobLogs } from "@/components/job-history";
+import { defaultVerifyOptions, verifyHint, VerifyOptions, verifyParams } from "@/components/verify-options";
 import { Button } from "@/components/ui/button";
 import { Chip, EmptyRow, KV, Mono, Panel, Progress, Table, Td, Th } from "@/components/ui/data";
 import { Check, Field, Input, Segmented, Select, Textarea } from "@/components/ui/form";
@@ -35,6 +37,7 @@ function progressText(j: Job): string {
   if (st.queued != null) text += `，已排队 ${fmtNum(Number(st.queued))} 项`;
   const n = (k: string) => fmtNum(Number(st[k] ?? 0));
   if (st.last_page) text += `，共 ${st.last_page} 页`;
+  if (j.crawl) text += `，已识别 ${fmtNum(j.crawl.seen)} 部，新增 ${fmtNum(j.crawl.new)}，重复 ${fmtNum(j.crawl.existing)}`;
   if (j.kind === "locate" && st.checked != null) text += `，更新 ${n("updated")}，找不到 ${n("missing")}`;
   if (j.kind === "verify" && st.checked != null) {
     text += `，检查 ${n("checked")}，正常 ${n("ok")}，strm 缺 ${n("strm")}，nfo 缺 ${n("nfo")}，封面缺 ${n("cover")}`;
@@ -124,7 +127,7 @@ export default function Jobs() {
       <Sheet open={!!open} onOpenChange={o => !o && setOpen(null)}>
         {open && (
           <SheetContent label={`任务 #${open.id}`} className="sm:max-w-3xl">
-            <JobDetail job={open} now={now} onDeleted={() => setOpen(null)} />
+            <JobDetail key={open.id} job={open} now={now} onDeleted={() => setOpen(null)} />
           </SheetContent>
         )}
       </Sheet>
@@ -138,7 +141,7 @@ function NewJob() {
   const run = useRun();
   const [kind, setKind] = useState<Kind>("list");
   const [f, setF] = useState({ site: "jable", source: "", sort: "post_date", start_page: 1, end_page: 0, detail: true, urls: "", library_id: 1 });
-  const [verify, setVerify] = useState({ repair: true, covers: true, details: false, force_external: false });
+  const [verify, setVerify] = useState(defaultVerifyOptions);
   const set = (patch: Partial<typeof f>) => setF(prev => ({ ...prev, ...patch }));
   const site = meta.site(f.site);
   const allLibs = kind === "rewrite" || kind === "probe" || kind === "verify" || kind === "quality";
@@ -148,13 +151,7 @@ function NewJob() {
     if (kind === "list") Object.assign(body, { site: f.site, source: f.source, sort: f.sort, start_page: f.start_page || 1, end_page: f.end_page || 0, detail: f.detail });
     if (kind === "videos") Object.assign(body, { site: f.site, urls: f.urls });
     if (kind === "probe") body.site = f.site;
-    if (kind === "verify")
-      Object.assign(body, {
-        repair: verify.repair,
-        covers: verify.repair && verify.covers,
-        detail: verify.repair && verify.details,
-        force_external: verify.repair && verify.force_external,
-      });
+    if (kind === "verify") Object.assign(body, verifyParams(verify));
     if (kind !== "backfill" && f.library_id) body.library_id = f.library_id;
     await run(() => api.post<{ id: number }>("/api/jobs", body), { success: r => `已创建任务 #${r.id}`, invalidate: [["jobs"], ["status"]] });
   };
@@ -166,8 +163,7 @@ function NewJob() {
     probe: "给库里的影片找备用源：按番号到所选站点逐部查找（每部一次请求），找到就挂成这部影片的另一个源，播放时原来的源不能用会自动换过去。某个站没有的影片，在「补源重查间隔」内不再重复查。",
     quality:
       "给还不知道画质的源认出分辨率：取播放地址、读一次播放列表（多码率的直接写着各档分辨率，Jable 这种单档的抽几个分片按码率估）。多线路的源每条线路各探一次，mp4 线路认不出、跳过。地址过期的要重新访问源站（详情页、播放页），按站点限速排队，影片多时要跑很久；平时抓详情、播放时已经会顺手探测（只请求 CDN），一般不用跑全库。",
-    verify:
-      "检查数据库里每条输出在磁盘上还在不在：strm 有没有、内容是不是当前的播放地址，nfo 和封面有没有。勾上「补回」会重新写 strm 和 nfo（不联网），封面先从别的库硬链接，没有再下载。没详情的影片不写 nfo，勾「抓详情」会给它们排队抓（按站点限速，外部整理库不抓）。外部整理库按 strm 内容在收件目录和外部整理目录里找，找到只更新记录的路径；两边都找不到才写回收件目录；外部整理目录不存在或是空的不补（多半是挂载出了问题）。",
+    verify: verifyHint,
     rewrite: "改了对外地址、播放模式、令牌或路径模板以后，用它重写已有的 strm 和 nfo（不联网），路径变了会搬动文件。",
   };
 
@@ -231,20 +227,7 @@ function NewJob() {
           </>
         )}
         {kind === "verify" && (
-          <div className="flex min-h-8 flex-wrap items-center gap-x-4 gap-y-1">
-            <Check checked={verify.repair} onChange={v => setVerify(p => ({ ...p, repair: v }))}>
-              发现问题就补回
-            </Check>
-            <Check checked={verify.covers} disabled={!verify.repair} onChange={v => setVerify(p => ({ ...p, covers: v }))}>
-              补封面（要下载）
-            </Check>
-            <Check checked={verify.details} disabled={!verify.repair} onChange={v => setVerify(p => ({ ...p, details: v }))}>
-              没详情的抓详情（要联网）
-            </Check>
-            <Check checked={verify.force_external} disabled={!verify.repair} onChange={v => setVerify(p => ({ ...p, force_external: v }))}>
-              外部整理目录不在或是空的也写回
-            </Check>
-          </div>
+          <VerifyOptions value={verify} onChange={setVerify} />
         )}
         <Button variant="primary" onClick={create}>
           创建任务
@@ -274,8 +257,9 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
   const run = useRun();
   const meta = useMeta();
   const [filter, setFilter] = useState<"" | TaskStatus>(job.tasks.failed ? "failed" : "");
+  const [logTask, setLogTask] = useState<number | null>(null);
   const { data: tasks = [] } = useQuery({
-    queryKey: ["tasks", job.id, filter],
+    queryKey: ["tasks", job.id, filter, job.status],
     queryFn: ({ signal }) => api.get<Task[]>(`/api/jobs/${job.id}/tasks?status=${filter}&limit=300`, signal),
     refetchInterval: job.status === "running" ? 3000 : false,
   });
@@ -360,6 +344,9 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
           ]}
         />
 
+        {(job.kind === "crawl" || job.kind === "incremental") && <CrawlResults job={job} />}
+        <JobLogs key={`${job.id}-${logTask}`} job={job} taskId={logTask} onClear={() => setLogTask(null)} />
+
         <section>
           <div className="mb-2 flex flex-wrap items-center gap-2">
             <h4 className="text-sm font-semibold">子任务</h4>
@@ -378,7 +365,7 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
             <tbody>
               {tasks.map(t => (
                 <tr key={t.id}>
-                  <Td className="align-top text-muted">{t.id}</Td>
+                  <Td className="align-top text-muted">{t.id}<Button size="sm" variant="ghost" onClick={() => setLogTask(t.id)}>日志</Button></Td>
                   <Td className="align-top">
                     <div className="text-xs text-muted">
                       {kindName(t.kind)}

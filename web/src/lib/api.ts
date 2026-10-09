@@ -186,6 +186,19 @@ export interface Job {
   started_at: number | null;
   finished_at: number | null;
   tasks: QueueCounts;
+  crawl?: { seen: number; new: number; existing: number; added: number; excluded: number } | null;
+}
+
+export interface CrawlItem {
+  video_id: number;
+  slug: string;
+  title: string;
+  site: string;
+  source_key: string;
+  page: number;
+  is_new: number;
+  added: number;
+  excluded: number;
 }
 
 export interface Task {

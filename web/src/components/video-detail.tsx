@@ -40,11 +40,17 @@ export function DetailHost() {
   );
 }
 
-function Detail({ v, probe }: { v: Video; probe: ProbeResult[] | null }) {
+function Detail({ v: initial, probe }: { v: Video; probe: ProbeResult[] | null }) {
   const run = useRun();
   const qc = useQueryClient();
   const [busy, setBusy] = useState<"" | "refresh" | "probe">("");
   const [jobId, setJobId] = useState(0);
+  const { data: v = initial, error: videoError } = useQuery({
+    queryKey: ["video", initial.slug],
+    queryFn: ({ signal }) => api.get<Video>(`/api/videos/${initial.slug}`, signal),
+    refetchOnMount: "always",
+    refetchInterval: busy ? 1000 : false,
+  });
   const { data: job } = useQuery({
     queryKey: ["detail-job", jobId],
     queryFn: ({ signal }) => api.get<Job>(`/api/jobs/${jobId}`, signal),
@@ -53,16 +59,12 @@ function Detail({ v, probe }: { v: Video; probe: ProbeResult[] | null }) {
   });
   useEffect(() => {
     if (!job) return;
-    const controller = new AbortController();
-    api.get<Video>(`/api/videos/${v.slug}`, controller.signal).then(nv => {
-      store.set(prev => prev?.video.slug === nv.slug ? { ...prev, video: nv } : prev);
-      if (job.status === "done" || job.status === "cancelled") {
-        setBusy("");
-        qc.invalidateQueries({ queryKey: ["videos"] });
-      }
-    }).catch(() => {});
-    return () => controller.abort();
-  }, [job?.tasks.done, job?.tasks.failed, job?.status, v.slug, qc]);
+    qc.invalidateQueries({ queryKey: ["video", initial.slug] });
+    if (job.status === "done" || job.status === "cancelled") {
+      setBusy("");
+      qc.invalidateQueries({ queryKey: ["videos"] });
+    }
+  }, [job?.id, job?.tasks.done, job?.tasks.failed, job?.tasks.gone, job?.status, initial.slug, qc]);
 
   const refresh = async () => {
     setBusy("refresh");
@@ -80,7 +82,7 @@ function Detail({ v, probe }: { v: Video; probe: ProbeResult[] | null }) {
   const people = v.models.map(m => m.name).join("、");
   return (
     <>
-      <header className="flex items-center gap-2 border-b border-line px-5 py-3">
+      <header className="flex flex-wrap items-center gap-2 border-b border-line px-5 py-3">
         <Code className="text-xl">{v.slug}</Code>
         {v.status === "gone" && <Chip tone="err">已下架</Chip>}
         {!!v.uncensored && <Chip tone="info">无码流出</Chip>}
@@ -104,7 +106,8 @@ function Detail({ v, probe }: { v: Video; probe: ProbeResult[] | null }) {
       </header>
 
       <div className="scroll-thin min-h-0 flex-1 space-y-6 overflow-y-auto px-5 py-4">
-        {jobId > 0 && <p className="text-xs text-muted">任务 #{jobId} · {busy ? `已处理 ${(job?.tasks.done ?? 0) + (job?.tasks.failed ?? 0)} 项，可离开页面` : job?.state.partial_failure ? "完成，部分步骤失败，请在任务页重试" : "已完成"}</p>}
+        {videoError && <p role="alert" className="text-xs text-err">影片信息更新失败：{videoError.message}</p>}
+        {jobId > 0 && <p className="text-xs text-muted">任务 #{jobId} · {busy ? `已处理 ${(job?.tasks.done ?? 0) + (job?.tasks.failed ?? 0) + (job?.tasks.gone ?? 0)} 项，可离开页面` : job?.status === "cancelled" ? "已取消" : job?.state.partial_failure ? "完成，部分步骤失败，请在任务页重试" : "已完成"}</p>}
         <div className="grid gap-4 sm:grid-cols-[240px_1fr]">
           {v.cover_url || v.thumb_url ? (
             <img referrerPolicy="no-referrer" src={v.cover_url || v.thumb_url} alt="" className="w-full rounded-md border border-line bg-panel-2 object-cover" />

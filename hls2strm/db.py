@@ -22,6 +22,7 @@ from .codes import code_key
 from .queries import FACET_FIELDS, VIDEO_SORTS, VideoQuery  # API 和旧调用方保持导入兼容
 from .cache import AsyncCache
 from .database_indexes import migrate_v12 as _migrate_v12
+from .job_history import JobHistory, migrate_v13 as _migrate_v13
 from .runtime import stage
 from .quality import TRUST, Quality, parse_heights
 from .sites import SourceDetail, SourceItem
@@ -327,7 +328,7 @@ async def _migrate_v11(conn: aiosqlite.Connection) -> None:
 
 
 MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
-              _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11, _migrate_v12]
+              _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11, _migrate_v12, _migrate_v13]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")
@@ -451,7 +452,7 @@ class Database:
             return result
 
     @asynccontextmanager
-    async def _tx(self):
+    async def _tx(self, *, invalidate=True):
         """持锁的事务：查找再插入这类需要原子性的写操作用。"""
         async with self._lock:
             self._transaction_owner = asyncio.current_task()
@@ -459,7 +460,8 @@ class Database:
                 await self.conn.execute("BEGIN")
                 yield self.conn
                 await self.conn.execute("COMMIT")
-                self.cache.clear()
+                if invalidate:
+                    self.cache.clear()
             except BaseException:
                 try:
                     await self.conn.execute("ROLLBACK")
@@ -468,7 +470,8 @@ class Database:
                 raise
             finally:
                 self._transaction_owner = None
-                self.cache.clear()
+                if invalidate:
+                    self.cache.clear()
 
     async def _write_many(self, sql: str, rows: list[tuple]) -> int:
         async with self._lock:
@@ -590,7 +593,7 @@ class Database:
         await self.conn.execute(f"UPDATE videos SET {cols} WHERE id=?", (*sets.values(), video_id))
 
     async def upsert_item(self, site: str, it: SourceItem, slug: str, rank: Callable[[str], int],
-                          video_id: int | None = None) -> tuple[int, bool]:
+                          video_id: int | None = None, *, crawl: tuple[int, int, int] | None = None) -> tuple[int, bool]:
         """列表页数据入库：找到或新建作品，记下这个源。返回 (作品 id, 是否新作品)。video_id 见 _attach。"""
         async with self._tx():
             video_id, _, created = await self._attach(site, it.key, it.code, it.uncensored, slug, it.site_vid,
@@ -600,6 +603,13 @@ class Database:
                 work = dict(await cur.fetchone())
             new = {k: getattr(it, k) for k in WORK_LIST_FIELDS}
             await self._update_work(video_id, _merge(work, new, primary), it.code if primary else "")
+            if crawl is not None:
+                job_id, task_id, page = crawl
+                await self.conn.execute(
+                    "INSERT OR IGNORE INTO crawl_items(job_id,video_id,task_id,site,source_key,page,slug,title,is_new) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (job_id, video_id, task_id, site, it.key, page, work["slug"], it.title, int(created)),
+                )
         return video_id, created
 
     async def upsert_detail(self, site: str, d: SourceDetail, slug: str, rank: Callable[[str], int],
@@ -1031,11 +1041,19 @@ class Database:
         row = await self._one("SELECT * FROM outputs WHERE video_id=? AND library_id=?", (video_id, library_id))
         return dict(row) if row else None
 
-    async def ensure_output(self, video_id: int, library_id: int, via: str = "job") -> bool:
+    async def ensure_output(self, video_id: int, library_id: int, via: str = "job", *, crawl_job: int | None = None) -> bool:
         """影片加入输出库，返回是否新加入。"""
-        cur = await self._write(
-            "INSERT OR IGNORE INTO outputs(video_id, library_id, via) VALUES(?, ?, ?)", (video_id, library_id, via)
-        )
+        sql = "INSERT OR IGNORE INTO outputs(video_id, library_id, via) VALUES(?, ?, ?)"
+        if crawl_job is not None:
+            async with self._tx() as conn:
+                cur = await conn.execute(sql, (video_id, library_id, via))
+                added = cur.rowcount > 0
+                await conn.execute(
+                    "UPDATE crawl_items SET added=MAX(added,?),excluded=0 WHERE job_id=? AND video_id=?",
+                    (int(added), crawl_job, video_id),
+                )
+            return added
+        cur = await self._write(sql, (video_id, library_id, via))
         return cur.rowcount > 0
 
     async def set_output(self, video_id: int, library_id: int, strm_path: str, cover_done: bool | None = None) -> None:
@@ -1377,12 +1395,18 @@ class Database:
         return jobs
 
     async def delete_job(self, job_id: int) -> None:
-        async with self._lock:
+        async with self._tx(invalidate=False):
+            await self.conn.execute("DELETE FROM job_logs WHERE job_id=?", (job_id,))
+            await self.conn.execute("DELETE FROM crawl_items WHERE job_id=?", (job_id,))
             await self.conn.execute("DELETE FROM scan_staging WHERE scan_id=?", (job_id,))
             await self.conn.execute("DELETE FROM tasks WHERE job_id=?", (job_id,))
             await self.conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
 
     # ---- task ----
+
+    @property
+    def history(self) -> JobHistory:
+        return JobHistory(self)
 
     async def add_tasks(self, job_id: int, kind: str, targets: Iterable[str], priority: int = 0,
                         site: str = "") -> int:

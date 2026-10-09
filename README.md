@@ -206,7 +206,8 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 - **现场找源**：已知的源都不能用、或者库里没有这部影片（比如别的工具生成的 strm）时，按番号到其他启用的站点找一次，找到就加成源再播。某个站最近查过没有的，「补源重查间隔」（默认 30 天）内不再查。
 - **补源任务**：「任务 → 补源」，选站点和输出库，逐部按番号去找备用源（每部一次请求；MissAV 页面上有中字版的话一并加上）。现有约 3.9 万部按每秒 1 次大约 11 小时。
 - **新片自动补源**：设置里「新片自动补源」填站点名（如 `missav`），列表任务、订阅收进新影片时顺手去这些站点找。
-- 影片库的详情里按播放顺序列出所有源（多线路站点的源下面再列出各条线路），可以试播指定的源或线路，也可以点「查找其他源」立即找一次。
+- 影片库的详情里按播放顺序列出所有源（多线路站点的源下面再列出各条线路），可以试播指定的源或线路，也可以点「查找其他源」立即找一次。补源和刷新任务执行中、结束后，抽屉会自动更新。
+- 设置里的站点、字幕和线路优先顺序可拖动手柄调整，也可聚焦手柄后用上下方向键移动；保存后生效，「放弃改动」恢复已保存的顺序。
 - **线路**：「设置 → 站点」里每个多线路站点列出它的线路，可以调顺序、停用、强制中转。播放时按顺序找有新鲜直链的线路，
   没有就逐条现取；取不到的线路进冷却、换下一条；全都不行时重抓一次详情（线路数据可能换了）再试。中转播到一半只认当前线路。
 - 中转：MissAV 的视频流量全部经过本服务（720p 每路约 2–3 Mbps）。
@@ -217,6 +218,7 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 
 - 启动时会在后台统计每个库有记录、但找不到 strm 的影片数，「输出库与订阅」里显示「文件缺失 N」，概览页也会提醒。
 - **核对**（输出库列表里的按钮，或者「任务 → 核对输出」）：检查每条输出的 strm 在不在、内容是不是当前的播放地址，nfo 和封面在不在。
+  两个入口提供相同的补回、补封面、抓详情和外部整理目录强制写回选项；关闭补回时只检查，其他修复选项不生效。
   可以只检查不改；勾上「补回」会在本地重写 strm 和 nfo，封面先从别的库硬链接，没有再下载。
   没详情的影片不写 nfo、也不算缺；勾上「没详情的抓详情」会给范围内普通库里这些影片排队抓详情（联网、按站点限速，外部整理库不抓）。
 - **订阅增量、列表任务**翻到「有记录、文件不在了」的影片时也会顺手补回，不用等核对。
@@ -229,6 +231,10 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
     确认要补，核对时勾「外部整理目录不在或是空的也写回」。
 
 ### 其他任务类型（「任务」页）
+
+点开任务可查看执行日志，再点子任务的「日志」可单独筛选。每个任务保留最近 10,000 条，支持翻阅更早记录，重启后仍可查看；删除任务时一并清理。日志遵循当前日志级别，升级前未保存的日志无法补录。
+
+列表任务显示已识别、新增、重复、新加入输出库和排除跳过的数量，并可筛选、分页查看影片明细。同一影片在一个任务中只计一次，重试和跨页重复不会累加；「新增」是本任务首次创建的影片，「重复」是影片库里已有的作品，与是否新加入目标输出库分别统计。升级前未记录的明细不追溯。
 
 - **列表地址**：先选站点，再填列表地址，可以指定排序、页码范围和输出库。
   - Jable：分类 `/categories/x/`、标签 `/tags/x/`、女优 `/models/x/`、搜索 `/search/关键词/`、热门 `/hot/`
@@ -357,6 +363,8 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 | GET | `/api/status` | 引擎、各站点的域名和拦截状态、队列、计数、最近失败 |
 | POST | `/api/jobs` | 新建任务：`{"kind": "list\|videos\|backfill\|rewrite\|probe", "site": "jable", "library_id": 1, ...}` |
 | GET | `/api/jobs`、`/api/jobs/{id}/tasks?status=failed` | 任务列表、子任务列表 |
+| GET | `/api/jobs/{id}/logs?task_id=&before=&limit=200` | 持久化执行日志，按子任务筛选；响应的 `next_before` 用于向前翻页 |
+| GET | `/api/jobs/{id}/items?status=new&limit=50&offset=0` | 列表识别明细；状态为空、`new`、`existing` 或 `excluded`，响应含总数 |
 | POST | `/api/jobs/{id}/pause\|resume\|cancel\|retry` | 控制任务 |
 | GET | `/api/videos?q=&filter=no_detail&library_id=&page=` | 影片库（每部影片带各个源、所在的库和 strm 路径）。还能按 `has_site`、`lacks_site`、`sources=single\|multi\|failing\|none`、`subtitle=zh\|en\|none`、`uncensored`、`model`、`category`、`tag`、`maker`、`quality`（列表参数可以重复，组内任一满足）、`release_from/to`、`added_from/to`、`duration_min/max` 筛，`sort=created\|release\|duration\|code\|views\|updated&order=asc\|desc` 排序 |
 | POST | `/api/videos/batch` | 批量：`{"action": "probe\|refresh\|add\|remove", "ids": [...], "library_id": 2}`；probe、refresh 排成任务，add、remove 当场改输出库 |

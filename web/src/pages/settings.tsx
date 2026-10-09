@@ -1,7 +1,8 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowDown, ArrowUp, Save, Undo2 } from "lucide-react";
+import { Save, Undo2 } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { useReorder } from "@/components/use-reorder";
 import { Chip, Mono, Notice, Panel, Table, Td, Th } from "@/components/ui/data";
 import { Check, Field, Input, Select, Switch, Textarea } from "@/components/ui/form";
 import { rewriteAll } from "@/lib/actions";
@@ -256,28 +257,22 @@ function Lines({ value, onChange, className }: { value: string[]; onChange: (v: 
   );
 }
 
-/** 可以上下调顺序的列表。 */
+/** 优先顺序在保存设置前只修改本地草稿。 */
 function OrderList({ items, label, onChange }: { items: string[]; label: (x: string) => string; onChange: (v: string[]) => void }) {
-  const move = (i: number, d: number) => {
-    const next = [...items];
-    [next[i], next[i + d]] = [next[i + d], next[i]];
-    onChange(next);
-  };
+  const reorder = useReorder(items, onChange);
   return (
+    <div ref={reorder.root}>
+    <p className="mb-1 text-xs text-muted">拖动手柄调整顺序，前面的优先；保存后生效。</p>
     <ol className="w-full max-w-sm divide-y divide-line rounded-md border border-line">
       {items.map((x, i) => (
-        <li key={x} className="flex items-center gap-2 px-2.5 py-1.5 text-sm">
+        <li key={x} {...reorder.row(x)} className={cn("flex items-center gap-2 px-2.5 py-1.5 text-sm", reorder.row(x).className)}>
+          {reorder.handle(x, label(x))}
           <span className="w-4 text-xs text-muted">{i + 1}</span>
           <span className="flex-1">{label(x)}</span>
-          <Button size="icon-sm" variant="ghost" disabled={i === 0} onClick={() => move(i, -1)} aria-label={`把 ${label(x)} 往前挪`}>
-            <ArrowUp />
-          </Button>
-          <Button size="icon-sm" variant="ghost" disabled={i === items.length - 1} onClick={() => move(i, 1)} aria-label={`把 ${label(x)} 往后挪`}>
-            <ArrowDown />
-          </Button>
         </li>
       ))}
     </ol>
+    </div>
   );
 }
 
@@ -327,15 +322,11 @@ function LinesTable({ specs, cfg, onChange }: { specs: LineSpecMeta[]; cfg: Site
     specs.find(s => s.name === name) ?? { name, host: "", host_label: "", note: "站点上新出现的线路，按页面内容识别播放站", supported: true, direct: true, ip_bound: false };
   const lineCfg = (name: string): LineConfig => cfg.lines[name] ?? { enabled: true, proxy: false };
   const setLine = (name: string, patch: Partial<LineConfig>) => onChange({ lines: { ...cfg.lines, [name]: { ...lineCfg(name), ...patch } }, line_order: order });
-  const move = (i: number, d: number) => {
-    const next = [...order];
-    [next[i], next[i + d]] = [next[i + d], next[i]];
-    onChange({ line_order: next });
-  };
+  const reorder = useReorder(order, line_order => onChange({ line_order }));
   const mode = (s: LineSpecMeta, c: LineConfig) => (!s.supported ? "暂不支持" : !s.direct || c.proxy ? "中转" : s.ip_bound ? "302（绑出口 IP）" : "302");
   return (
-    <div className="mt-3">
-      <div className="mb-1 text-[13px] text-muted">线路（按顺序试，一条不能用自动换下一条）</div>
+    <div className="mt-3" ref={reorder.root}>
+      <div className="mb-1 text-[13px] text-muted">线路（拖动手柄调整尝试顺序，保存后生效）</div>
       <Table className="text-[13px]">
         <thead>
           <tr>
@@ -352,14 +343,10 @@ function LinesTable({ specs, cfg, onChange }: { specs: LineSpecMeta[]; cfg: Site
             const s = spec(name);
             const c = lineCfg(name);
             return (
-              <tr key={name} className={!c.enabled || !s.supported ? "opacity-55" : ""} title={s.note}>
+              <tr key={name} {...reorder.row(name)} className={cn(reorder.row(name).className, (!c.enabled || !s.supported) && "opacity-55")} title={s.note}>
                 <Td className="whitespace-nowrap">
-                  <Button size="icon-sm" variant="ghost" disabled={i === 0} onClick={() => move(i, -1)} aria-label={`线路 ${name} 往前挪`}>
-                    <ArrowUp />
-                  </Button>
-                  <Button size="icon-sm" variant="ghost" disabled={i === order.length - 1} onClick={() => move(i, 1)} aria-label={`线路 ${name} 往后挪`}>
-                    <ArrowDown />
-                  </Button>
+                  {reorder.handle(name, `线路 ${name}`)}
+                  <span className="ml-1 text-xs text-muted">{i + 1}</span>
                 </Td>
                 <Td className="font-mono">{name}</Td>
                 <Td>

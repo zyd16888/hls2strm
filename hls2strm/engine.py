@@ -31,6 +31,7 @@ from .config import BootConfig, SettingsStore, check_path_template
 from .db import DEFAULT_LIBRARY_ID, Database
 from .fetcher import Blocked, FetchError, Fetcher, NotFound
 from .observability import Metrics
+from .job_history import capture_task_logs
 from .parser import ParseError, VideoGone, m3u8_duration
 from .health import host_key, host_label, measure
 from .play import Resolver
@@ -225,6 +226,10 @@ class Engine:
             await self._run(task)
 
     async def _run(self, task: dict) -> None:
+        async with capture_task_logs(self.db.history, task):
+            await self._run_task(task)
+
+    async def _run_task(self, task: dict) -> None:
         tid = task["id"]
         t0 = time.monotonic()
         finished = False
@@ -237,7 +242,7 @@ class Engine:
                 waited = time.time() - job["created_at"]
                 log.info("任务 #%d「%s」开始执行%s", job["id"], job["name"],
                          f"（排队了 {_fmt_secs(waited)}）" if waited >= 10 else "")
-            log.debug("子任务 #%d %s %s 开始（第 %d 次）", tid, task["kind"], task["target"], task["attempts"])
+            log.info("子任务 #%d %s %s 开始（第 %d 次）", tid, task["kind"], task["target"], task["attempts"])
             handler = {"list": self._do_list, "detail": self._do_detail, "probe": self._do_probe,
                        "rewrite": self._do_rewrite, "verify": self._do_verify, "cover": self._do_cover,
                        "purge": self._do_purge, "reclassify": self._do_reclassify,
@@ -247,14 +252,16 @@ class Engine:
                        "membership": self._do_membership}[task["kind"]]
             await handler(job, task)
             await self.db.finish_task(tid, "done", duration_ms=int((time.monotonic() - t0) * 1000))
-            log.debug("子任务 #%d %s %s 完成（%.1fs）", tid, task["kind"], task["target"], time.monotonic() - t0)
+            log.info("子任务 #%d %s %s 完成（%.1fs）", tid, task["kind"], task["target"], time.monotonic() - t0)
             self.metrics.inc(f"task_{task['kind']}_done")
             finished = True
         except asyncio.CancelledError:
             await self.db.finish_task(tid, "pending", "进程退出时中断", refund_attempt=True)
+            log.info("子任务 #%d 进程退出时中断，已放回队列", tid)
             raise
         except TaskStopped as e:
             await self.db.finish_task(tid, e.status, "任务暂停后恢复" if e.status == "pending" else "任务已取消", refund_attempt=True)
+            log.info("子任务 #%d：%s", tid, "任务暂停后恢复" if e.status == "pending" else "任务已取消")
         except (NotFound, VideoGone) as e:
             await self.db.finish_task(tid, "gone", f"已下架：{e}")
             if task["kind"] == "detail":
@@ -466,9 +473,9 @@ class Engine:
         """新作品的 slug：Jable 沿用站内 slug（和老数据一致），其他站用番号。"""
         return key if site.name == "jable" else work_slug(code, uncensored)
 
-    async def upsert_item(self, site: Site, it: SourceItem) -> tuple[dict, bool]:
+    async def upsert_item(self, site: Site, it: SourceItem, *, crawl: tuple[int, int, int] | None = None) -> tuple[dict, bool]:
         vid, created = await self.db.upsert_item(site.name, it, self._slug_for(site, it.key, it.code, it.uncensored),
-                                                 self._rank)
+                                                 self._rank, crawl=crawl)
         return await self.db.get_video_by_id(vid), created
 
     async def upsert_detail(self, site: Site, d: SourceDetail) -> dict:
@@ -500,14 +507,15 @@ class Engine:
                        if n in SITES and n != site.name and SITES[n].can_lookup]
         for it in lp.items:
             await self.checkpoint(job["id"])
-            v, created = await self.upsert_item(site, it)
+            v, created = await self.upsert_item(site, it, crawl=(job["id"], task["id"], page))
             for n in probe_sites if created else ():
                 await self.db.add_tasks(job["id"], "probe", [f"{n}:{v['id']}"], PRIORITY_DETAIL, n)
             if await self.db.in_libraries(v["id"], lib["excludes"]):
+                await self.db.history.output_result(job["id"], v["id"], excluded=True)
                 # 已分到排除库：本库不收，但算作已知，增量照常停
                 state["known_streak"] = state.get("known_streak", 0) + 1
                 continue
-            added = await self.db.ensure_output(v["id"], lib_id)
+            added = await self.db.ensure_output(v["id"], lib_id, crawl_job=job["id"])
             strm_path = (await self.db.get_output(v["id"], lib_id))["strm_path"]
             if not added and strm_path and not await asyncio.to_thread(os.path.isfile, strm_path):
                 # 记录在、文件不在了（换了输出目录的挂载、被删了，或者被外部刮削器挪走、改名）
