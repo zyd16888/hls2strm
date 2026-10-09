@@ -30,6 +30,12 @@ _UUID_RE = re.compile(r"surrit\.com\\?/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{
 _DIGITS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _PAGE_RE = re.compile(r"[?&]page=(\d+)")
 _LAST_PAGE_RE = re.compile(r"/\s*(\d+)")
+UNCENSORED_LISTS = {
+    "heyzo": "HEYZO", "tokyohot": "东京热", "1pondo": "一本道",
+    "caribbeancom": "Caribbeancom", "caribbeancompr": "Caribbeancompr",
+    "10musume": "10musume", "pacopacomama": "pacopacomama", "gachinco": "Gachinco",
+    "xxxav": "XXX-AV", "marriedslash": "人妻斩",
+}
 
 
 def split_variant(key: str) -> tuple[str, str, bool]:
@@ -122,6 +128,9 @@ class MissAVSite(Site):
         {"name": "最新发行", "source": "/cn/release", "sort": ""},
         {"name": "中文字幕", "source": "/cn/chinese-subtitle", "sort": ""},
         {"name": "无码流出", "source": "/cn/uncensored-leak", "sort": ""},
+        {"name": "FC2", "source": "/cn/fc2", "sort": "published_at"},
+        *[{"name": f"原生无码 · {label}", "source": f"/cn/{key}", "sort": "published_at"}
+          for key, label in UNCENSORED_LISTS.items()],
         {"name": "搜索", "source": "/cn/search/<关键词>", "sort": ""},
         {"name": "女优", "source": "/cn/actresses/<名字>", "sort": ""},
         {"name": "类型", "source": "/cn/genres/<名称>", "sort": ""},
@@ -164,7 +173,8 @@ class MissAVSite(Site):
         if not rest:
             raise ValueError(f"不是列表地址：{value}")
         if "/" not in rest and rest not in ("new", "release", "chinese-subtitle", "uncensored-leak", "today-hot",
-                                            "weekly-hot", "monthly-hot", "fc2", "siro", "luxu", "gana", "maan"):
+                                            "weekly-hot", "monthly-hot", "fc2", "siro", "luxu", "gana", "maan",
+                                            *UNCENSORED_LISTS):
             raise ValueError(f"看起来是影片地址，不是列表地址：{value}")
         parts = [quote(unquote(p), safe="") for p in rest.split("/")]
         return "/cn/" + "/".join(parts)

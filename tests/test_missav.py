@@ -7,6 +7,7 @@ from hls2strm.observability import Metrics
 from hls2strm.play import Resolver, _decode_x, _upstream, Resolved, rewrite_playlist
 from hls2strm.sites import SITES
 from hls2strm.sites.missav import split_variant
+from hls2strm.sites.missav import UNCENSORED_LISTS
 from hls2strm.writer import OutputWriter
 
 from .conftest import FakeFetcher, fixture
@@ -43,6 +44,8 @@ def test_keys_and_sources():
     assert MISSAV.key_from_url("https://missav123.com/cn/ssis-001-chinese-subtitle") == "ssis-001-chinese-subtitle"
     assert MISSAV.normalize_source("https://missav.ws/dm514/cn/genres/巨乳?page=2") == "/cn/genres/%E5%B7%A8%E4%B9%B3"
     assert MISSAV.normalize_source("new") == "/cn/new"
+    for key in UNCENSORED_LISTS:
+        assert MISSAV.normalize_source(f"https://missav123.com/dm817/cn/{key}?page=3") == f"/cn/{key}"
     assert MISSAV.page_url("/cn/new", 3, "released_at") == "/cn/new?page=3&sort=released_at"
 
 

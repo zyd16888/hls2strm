@@ -21,6 +21,7 @@ from . import __version__
 from . import auth as auth_module
 from .auth import COOKIE, REMEMBER_TTL, SESSION_TTL
 from .config import Settings
+from .config_transfer import ImportRequest, apply_config, export_config, preview_config
 from .db import DEFAULT_LIBRARY_ID, FACET_FIELDS, VIDEO_SORTS, VideoQuery, source_cooldown
 from .engine import snapshot_path
 from .fetcher import Blocked, FetchError, NotFound, ping_solver
@@ -793,6 +794,32 @@ async def strm_revert(change_set: int, request: Request):
 
 
 # ---- 设置 ----
+
+
+@router.get("/configuration/export")
+async def configuration_export(request: Request):
+    db = _ctx(request).db
+    async with db._tx(invalidate=False):
+        config = await export_config(db)
+    return Response(json.dumps(config, ensure_ascii=False, indent=2), media_type="application/json",
+                    headers={"Content-Disposition": 'attachment; filename="hls2strm-config.json"',
+                             "Cache-Control": "no-store"})
+
+
+@router.post("/configuration/preview")
+async def configuration_preview(body: ImportRequest, request: Request):
+    try:
+        return await preview_config(_ctx(request).engine, body)
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from None
+
+
+@router.post("/configuration/import")
+async def configuration_import(body: ImportRequest, request: Request):
+    try:
+        return await apply_config(_ctx(request).engine, body)
+    except (ValueError, sqlite3.IntegrityError) as err:
+        raise HTTPException(400, str(err)) from None
 
 
 @router.get("/settings")
