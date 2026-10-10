@@ -42,7 +42,8 @@ def test_preview_confirm_roundtrip_and_stale(make_store, boot):
             await apply_config(engine, request)
         request.preview_token = plan["preview_token"]
         result = await apply_config(engine, request)
-        assert result == {"libraries_created": 1, "subscriptions_created": 1}
+        assert result == {"libraries_created": 1, "subscriptions_created": 1,
+                          "libraries_updated": 0, "subscriptions_updated": 0}
         assert not store.output_dir.exists()
         subs = await db.list_subscriptions()
         added = next(s for s in subs if s["name"] == "Jable")
@@ -52,7 +53,8 @@ def test_preview_confirm_roundtrip_and_stale(make_store, boot):
         with pytest.raises(ValueError, match="重新预览"):
             await apply_config(engine, request)
         request.preview_token = (await preview_config(engine, request))["preview_token"]
-        assert await apply_config(engine, request) == {"libraries_created": 0, "subscriptions_created": 0}
+        assert await apply_config(engine, request) == {"libraries_created": 0, "subscriptions_created": 0,
+                                                       "libraries_updated": 0, "subscriptions_updated": 0}
         exported = await export_config(db)
         assert "play_token" not in json.dumps(exported)
         restored = ImportRequest(config=exported)
