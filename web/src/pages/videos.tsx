@@ -13,6 +13,7 @@ import {
   RefreshCw,
   Search,
   SlidersHorizontal,
+  Trash2,
   X,
 } from "lucide-react";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
@@ -23,7 +24,7 @@ import { playVideo } from "@/components/player";
 import { Button } from "@/components/ui/button";
 import { Chip, Code, EmptyRow, Panel, Table, Td, Th } from "@/components/ui/data";
 import { Field, Input, Segmented, Select } from "@/components/ui/form";
-import { Menu, MenuContent, MenuItem, MenuLabel, MenuTrigger } from "@/components/ui/overlay";
+import { Menu, MenuContent, MenuItem, MenuLabel, MenuSeparator, MenuTrigger } from "@/components/ui/overlay";
 import { openDetail } from "@/components/video-detail";
 import { api, type FacetField, type Page, type Video, qs } from "@/lib/api";
 import { fmtClockDur } from "@/lib/format";
@@ -52,7 +53,7 @@ const SORTS: Record<string, string> = {
   views: "观看数",
   updated: "更新时间",
 };
-const STATUS: Record<string, string> = { "": "全部影片", active: "可用的", no_detail: "缺详情", no_output: "没输出", gone: "已下架" };
+const STATUS: Record<string, string> = { "": "全部影片", active: "可用的", no_detail: "缺详情", no_output: "没输出", gone: "已下架", removed: "已删源" };
 const SOURCES: Record<string, string> = { "": "不限", single: "只有一个", multi: "多个", failing: "有失败的", none: "没有可用的" };
 const SUBTITLE: Record<string, string> = { "": "不限", zh: "中字", en: "英字", none: "无字幕" };
 // 用数组：对象里 "1" 这类数字键会排到 "" 前面
@@ -430,6 +431,7 @@ function BatchBar({ ids, onDone }: { ids: number[]; onDone: () => void }) {
   const run = useRun();
   const qc = useQueryClient();
   const { data: libraries = [] } = useLibraries();
+  const meta = useMeta();
   const batch = async (body: Record<string, unknown>, success: (r: Record<string, number>) => string) => {
     const r = await run(() => api.post<Record<string, number>>("/api/videos/batch", { ids, ...body }), {
       success,
@@ -484,7 +486,7 @@ function BatchBar({ ids, onDone }: { ids: number[]; onDone: () => void }) {
                 const ok = await ask(
                   `把选中的 ${ids.length} 部移出「${l.name}」？`,
                   l.external_dir
-                    ? "会删掉它们在这个库里的 strm（外部整理库只删 strm，nfo 和图片留给外部工具）。"
+                    ? "会删掉它们在这个库里的 strm，外部工具整理好的目录（nfo、图片）移进回收区。"
                     : "会删掉它们在这个库里的 strm、nfo 和封面。规则库、有来源库的库之后会按规则把符合的再加回来。",
                   { confirmText: "移出并删除文件", danger: true },
                 );
@@ -494,6 +496,39 @@ function BatchBar({ ids, onDone }: { ids: number[]; onDone: () => void }) {
               {l.name}
             </MenuItem>
           ))}
+        </MenuContent>
+      </Menu>
+      <Menu>
+        <MenuTrigger asChild>
+          <Button size="sm">
+            <Trash2 />
+            删除源
+          </Button>
+        </MenuTrigger>
+        <MenuContent align="start">
+          <MenuLabel>删掉选中影片在哪个站的源</MenuLabel>
+          {Object.entries(meta.sites).map(([site, m]) => (
+            <MenuItem
+              key={site}
+              danger
+              onSelect={async () => {
+                const ok = await ask(
+                  `删掉选中的 ${ids.length} 部在 ${m.label} 的源？`,
+                  <>
+                    <p>只删这几部影片在 {m.label} 上的这个源，{m.label} 的其他影片和订阅不受影响。以后订阅、补源再抓到它们也不再使用这个源。</p>
+                    <p>删完没有别的可用源的影片，从所有输出库移出：删掉 strm，外部整理库里整理好的目录移进回收区，不再刮削。以后别的站点抓到这部片，会按订阅自动回来。</p>
+                    <p className="text-muted">删错了可以筛「已删源」，选中后用「恢复删掉的源」放回原来的输出库。</p>
+                  </>,
+                  { confirmText: "删除源", danger: true },
+                );
+                if (ok) batch({ action: "remove_source", sites: [site] }, r => `已排队删掉 ${m.label} 的源，任务 #${r.job_id}`);
+              }}
+            >
+              {m.label}
+            </MenuItem>
+          ))}
+          <MenuSeparator />
+          <MenuItem onSelect={() => batch({ action: "restore_source" }, r => `已排队恢复删掉的源，任务 #${r.job_id}`)}>恢复删掉的源</MenuItem>
         </MenuContent>
       </Menu>
       <Button size="sm" variant="quiet" className="ml-auto" onClick={onDone}>
@@ -563,6 +598,7 @@ function VideoRow({
         </button>
         <div className="mt-1 flex gap-1">
           {v.status === "gone" && <Chip tone="err">已下架</Chip>}
+          {v.status === "removed" && <Chip tone="err">已删源</Chip>}
           {!!v.uncensored && <Chip tone="info">无码</Chip>}
           {!v.detail_at && <Chip tone="warn">缺详情</Chip>}
         </div>
@@ -642,7 +678,7 @@ function VideoCard({ v, selected, onToggle }: { v: Video; selected: boolean; onT
           <Code className="text-[14px]">{v.slug}</Code>
         </span>
         {v.duration ? <span className="absolute bottom-1.5 right-1.5 rounded-sm bg-black/65 px-1.5 py-0.5 text-xs text-white">{fmtClockDur(v.duration)}</span> : null}
-        {v.status === "gone" && <span className="absolute right-1.5 top-1.5 rounded-sm bg-err px-1.5 py-0.5 text-xs text-white">已下架</span>}
+        {v.status !== "active" && <span className="absolute right-1.5 top-1.5 rounded-sm bg-err px-1.5 py-0.5 text-xs text-white">{v.status === "gone" ? "已下架" : "已删源"}</span>}
       </button>
       <label
         className={cn(

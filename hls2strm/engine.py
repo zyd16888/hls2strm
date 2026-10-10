@@ -11,8 +11,10 @@ job 种类：
   locate       外部整理库：找回被外部工具（mdcng 等）移走、改名的 strm，更新记录的路径
   reclassify   重新归库：规则库重新求值，并按来源库、排除库归并（只在本地，不联网）
   tidy         外部整理库：把只剩 nfo、图片的影片目录（以前移出库时留下的）移进回收区
+  source_remove / source_restore  删掉 / 恢复影片在某些站点的源（删完没有可用的源就移出所有输出库）
 子任务种类：list（目标=页码）、detail（目标=站内 key）、probe（目标=站点:作品 id）、rewrite（目标=all）、
-          purge / locate / tidy（目标=库 id）、verify（目标=all）、cover（目标=库 id:作品 id，补封面）
+          purge / locate / tidy（目标=库 id）、verify（目标=all）、cover（目标=库 id:作品 id，补封面）、
+          membership / source_remove / source_restore（目标=作品 id）
 list、detail 子任务带站点（tasks.site）：某个站被拦截时只暂停这个站的子任务，每个站的并发也各自限制。
 """
 
@@ -258,7 +260,8 @@ class Engine:
                        "scan": self.strm.do_scan, "adopt": self.strm.do_adopt,
                        "prefix": self.strm.do_prefix, "revert": self.strm.do_revert,
                        "locate": self.strm.do_locate, "quality": self._do_quality, "prepare": self._do_prepare,
-                       "membership": self._do_membership, "tidy": self.strm.do_tidy}[task["kind"]]
+                       "membership": self._do_membership, "tidy": self.strm.do_tidy,
+                       "source_remove": self._do_source_remove, "source_restore": self._do_source_restore}[task["kind"]]
             await handler(job, task)
             await self.db.finish_task(tid, "done", duration_ms=int((time.monotonic() - t0) * 1000))
             log.info("子任务 #%d %s %s 完成（%.1fs）", tid, task["kind"], task["target"], time.monotonic() - t0)
@@ -544,6 +547,10 @@ class Engine:
             v, created = await self.upsert_item(site, it, crawl=(job["id"], task["id"], page))
             for n in probe_sites if created else ():
                 await self.db.add_tasks(job["id"], "probe", [f"{n}:{v['id']}"], PRIORITY_DETAIL, n)
+            if v["status"] == "removed":
+                # 用户删掉了这部片的源、又没有别的可用源：不收，但算作已知，增量照常停
+                state["known_streak"] = state.get("known_streak", 0) + 1
+                continue
             if await self.db.in_libraries(v["id"], lib["excludes"]):
                 await self.db.history.output_result(job["id"], v["id"], excluded=True)
                 # 已分到排除库：本库不收，但算作已知，增量照常停
@@ -608,11 +615,14 @@ class Engine:
         site = get_site(site_name)
         d = await site.fetch_detail(self.fetcher.site(site.name), key, priority=priority)
         v = await self.upsert_detail(site, d)
+        src = await self.db.find_source(site.name, d.key)
+        if src is not None and src["status"] == "removed":
+            log.info("详情 %s %s：这个源已经删掉了，不用", site.label, key)
+            return v
         if not v["duration"] and d.stream_url:
             await self._fill_duration(v, site, d.stream_url)
         if d.stream_url and self.store.current.quality_capture:
             # 详情页给了播放地址：后台顺手读一次播放列表认出画质（只请求 CDN）
-            src = await self.db.find_source(site.name, d.key)
             if src is not None and quality_needed(src):
                 self.resolver.quality.spawn(src["id"], None, d.stream_url, site.stream.headers)
         if library_id:
@@ -848,6 +858,66 @@ class Engine:
             removed += 1
         log.info("输出库「%s」：手动移出 %d 部", lib["name"], removed)
         return removed
+
+    async def create_source_removal(self, video_ids: list[int], sites: list[str] | None = None) -> int:
+        """sites 为 None 是恢复：把这些影片删掉的源都恢复；否则删掉它们在这些站点的源。"""
+        ids = list(dict.fromkeys(video_ids))
+        if sites is None:
+            job = await self.db.create_job("source_restore", f"恢复删掉的源：{len(ids)} 部", {})
+            await self.db.add_tasks(job, "source_restore", ids, PRIORITY_USER)
+        else:
+            sites = [x for x in dict.fromkeys(sites) if x in SITES]
+            if not sites:
+                raise ValueError("要选删掉哪个站点的源")
+            names = "、".join(SITES[x].label for x in sites)
+            job = await self.db.create_job("source_remove", f"删掉 {names} 的源：{len(ids)} 部", {"sites": sites})
+            await self.db.add_tasks(job, "source_remove", ids, PRIORITY_USER)
+        self.notify()
+        return job
+
+    async def _do_source_remove(self, job: dict, task: dict) -> None:
+        await self.remove_sources(int(task["target"]), job["params"]["sites"])
+
+    async def _do_source_restore(self, job: dict, task: dict) -> None:
+        video_id = int(task["target"])
+        if await self.restore_sources(video_id) and (v := await self.db.get_video_by_id(video_id)):
+            await self._queue_covers(job["id"], v)
+
+    async def remove_sources(self, video_id: int, sites: list[str]) -> bool:
+        """删掉影片在这些站点的源（以后列表、详情、补源再抓到也不用）。删完没有可用的源了，影片从所有输出库移出
+        （外部整理库删 strm，整理目录进回收区），记下移出了哪些库，恢复时放回去。返回影片是不是移出了。"""
+        v = await self.db.get_video_by_id(video_id)
+        if v is None:
+            return False
+        outputs = await self.db.get_outputs(video_id)
+        if not await self.db.remove_sources(video_id, sites, [(o["library_id"], o["via"]) for o in outputs]):
+            log.info("删源 %s：删掉 %s 的源，还有别的可用源，留在输出库里", v["slug"], "、".join(sites))
+            return False
+        for out in outputs:
+            if (lib := self.libs.get(out["library_id"])) and out["strm_path"]:
+                await self._remove_files(lib, video_id, v["slug"], out["strm_path"])
+            await self.db.delete_output(video_id, out["library_id"])
+        log.info("删源 %s：删掉 %s 的源，没有可用的源了，移出%s", v["slug"], "、".join(sites),
+                 "「" + "」「".join(o["library_name"] for o in outputs) + "」" if outputs else "（本来就不在输出库里）")
+        return True
+
+    async def restore_sources(self, video_id: int) -> int:
+        """恢复影片删掉的源；影片因此恢复可用时，放回删源时所在的输出库（已经在排除库里的不放）。返回放回了几个库。"""
+        libs = await self.db.restore_sources(video_id)
+        v = await self.db.get_video_by_id(video_id)
+        n = 0
+        for lib_id, via in libs:
+            lib = self.libs.get(lib_id)
+            if v is None or lib is None or await self.db.in_libraries(video_id, lib["excludes"]):
+                continue
+            await self.db.ensure_output(video_id, lib_id, via=via)
+            await self._output_one(v, lib_id, cover=False)
+            n += 1
+        if v is not None:
+            log.info("恢复 %s 删掉的源%s", v["slug"], f"，放回 {n} 个输出库" if n else "")
+        if n:
+            self._settle_wanted = True  # 有排除库的库等归并确认后再写
+        return n
 
     async def refresh_video(self, slug: str) -> dict:
         """重抓作品每个可用源的详情；全部失败才报错（都下架时抛 NotFound）。"""

@@ -1,6 +1,9 @@
 """SQLite 存储：设置、作品与源、输出库、订阅、任务（job）与子任务（task）。
 
 作品（videos 表）是一个番号，对应一个 strm；源（sources 表）是某个站点上的一个页面，一部作品可以有多个源。
+源的状态：active 可用、gone 下架（站点再列出来就恢复）、removed 用户删掉的（能抓到地址但播不了之类），
+以后列表、详情、补源再抓到也不启用，只能手动恢复。作品删源后没有可用的源时状态是 removed，不进任何输出库；
+别的站点以后抓到新源会回到 active。
 写入、快速读取、批量查询分连接；写操作串行，事务内读取使用原连接。
 表结构用 PRAGMA user_version 做版本化迁移，见 MIGRATIONS。
 """
@@ -328,13 +331,20 @@ async def _migrate_v11(conn: aiosqlite.Connection) -> None:
     await conn.execute("ALTER TABLE libraries ADD COLUMN versions TEXT NOT NULL DEFAULT ''")
 
 
+async def _migrate_v15(conn: aiosqlite.Connection) -> None:
+    """删源后影片没有可用的源、移出输出库时，记下移出了哪些库（[[库 id, via], …]），恢复时放回去。"""
+    await conn.execute("ALTER TABLE videos ADD COLUMN removed_from TEXT NOT NULL DEFAULT ''")
+
+
 MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
-              _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11, _migrate_v12, _migrate_v13, _migrate_v14]
+              _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11, _migrate_v12, _migrate_v13, _migrate_v14,
+              _migrate_v15]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")
 SOURCE_FAIL_COOLDOWN = 300
 SOURCE_FAIL_COOLDOWN_MAX = 6 * 3600
+REVIVE = "status=CASE WHEN status='removed' THEN status ELSE 'active' END"  # 取到地址就算可用，用户删掉的除外
 
 
 def now() -> int:
@@ -524,15 +534,18 @@ class Database:
     # ---- 作品与源 ----
 
     async def _attach(self, site: str, key: str, code: str, uncensored: bool, slug: str, site_vid: str,
-                      title: str, subtitle: str, video_id: int | None = None) -> tuple[int, int, bool]:
-        """在事务里调用：找到或新建这个源和它所属的作品，返回 (作品 id, 源 id, 是否新作品)。
+                      title: str, subtitle: str, video_id: int | None = None) -> tuple[int, int, bool, bool]:
+        """在事务里调用：找到或新建这个源和它所属的作品，返回 (作品 id, 源 id, 是否新作品, 是不是用户删掉的源)。
 
         已有的源直接用；新源挂到指定的作品（video_id，补源时用），没指定就按番号匹配键 + 是否无码流出找作品，
-        找不到就新建（slug 撞了加序号）。
+        找不到就新建（slug 撞了加序号）。用户删掉的源不复活，调用方也不拿它更新作品。
         """
         t = now()
-        async with self.conn.execute("SELECT id, video_id FROM sources WHERE site=? AND key=?", (site, key)) as cur:
+        async with self.conn.execute("SELECT id, video_id, status FROM sources WHERE site=? AND key=?",
+                                     (site, key)) as cur:
             src = await cur.fetchone()
+        if src is not None and src["status"] == "removed":
+            return src["video_id"], src["id"], False, True
         if src is not None:
             await self.conn.execute(
                 """UPDATE sources SET site_vid=CASE WHEN ?!='' THEN ? ELSE site_vid END,
@@ -541,7 +554,7 @@ class Database:
                    WHERE id=?""",
                 (site_vid, site_vid, title, title, subtitle, subtitle, t, src["id"]),
             )
-            return src["video_id"], src["id"], False
+            return src["video_id"], src["id"], False, False
         ck = code_key(code)
         work = {"id": video_id} if video_id else None
         if ck and work is None:
@@ -572,7 +585,7 @@ class Database:
             "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
             (video_id, site, key, site_vid, title, subtitle, t, t),
         )
-        return video_id, cur.lastrowid, created
+        return video_id, cur.lastrowid, created, False
 
     async def _is_primary(self, video_id: int, site: str, rank: Callable[[str], int]) -> bool:
         """这个站点是不是作品现有可用源里优先级最高的（元数据以它为准）。"""
@@ -590,7 +603,8 @@ class Database:
         if code:
             sets["code"] = code.upper()
             sets["code_key"] = code_key(code)
-        sets["status"] = "active"
+        sets["status"] = "active"  # 抓到了可用的源：下架的、删源后没有源的都回来
+        sets["removed_from"] = ""
         sets["updated_at"] = t
         cols = ", ".join(f"{k}=?" for k in sets)
         await self.conn.execute(f"UPDATE videos SET {cols} WHERE id=?", (*sets.values(), video_id))
@@ -599,13 +613,14 @@ class Database:
                           video_id: int | None = None, *, crawl: tuple[int, int, int] | None = None) -> tuple[int, bool]:
         """列表页数据入库：找到或新建作品，记下这个源。返回 (作品 id, 是否新作品)。video_id 见 _attach。"""
         async with self._tx():
-            video_id, _, created = await self._attach(site, it.key, it.code, it.uncensored, slug, it.site_vid,
-                                                      it.title, it.subtitle, video_id)
-            primary = await self._is_primary(video_id, site, rank)
+            video_id, _, created, removed = await self._attach(site, it.key, it.code, it.uncensored, slug,
+                                                               it.site_vid, it.title, it.subtitle, video_id)
             async with self.conn.execute("SELECT * FROM videos WHERE id=?", (video_id,)) as cur:
                 work = dict(await cur.fetchone())
-            new = {k: getattr(it, k) for k in WORK_LIST_FIELDS}
-            await self._update_work(video_id, _merge(work, new, primary), it.code if primary else "")
+            if not removed:
+                primary = await self._is_primary(video_id, site, rank)
+                new = {k: getattr(it, k) for k in WORK_LIST_FIELDS}
+                await self._update_work(video_id, _merge(work, new, primary), it.code if primary else "")
             if crawl is not None:
                 job_id, task_id, page = crawl
                 await self.conn.execute(
@@ -620,8 +635,10 @@ class Database:
         """详情页数据入库：更新这个源（播放地址等）并合并作品元数据，返回作品 id。video_id 见 _attach。"""
         t = now()
         async with self._tx():
-            video_id, source_id, _ = await self._attach(site, d.key, d.code, d.uncensored, slug, d.site_vid,
-                                                        d.title, d.subtitle, video_id)
+            video_id, source_id, _, removed = await self._attach(site, d.key, d.code, d.uncensored, slug, d.site_vid,
+                                                                 d.title, d.subtitle, video_id)
+            if removed:
+                return video_id
             if d.lines:
                 await self._set_lines(source_id, d.lines)
                 await self.conn.execute(
@@ -698,8 +715,8 @@ class Database:
             if not use:
                 return
             await self.conn.execute(
-                """UPDATE sources SET stream_url=?, stream_expires=?, line=(SELECT line FROM source_lines WHERE id=?),
-                          status='active', fail_streak=0, last_ok_at=?, last_error='', updated_at=?
+                f"""UPDATE sources SET stream_url=?, stream_expires=?, line=(SELECT line FROM source_lines WHERE id=?),
+                          {REVIVE}, fail_streak=0, last_ok_at=?, last_error='', updated_at=?
                    WHERE id=(SELECT source_id FROM source_lines WHERE id=?)""",
                 (url, expires, line_id, t, t, line_id),
             )
@@ -776,7 +793,7 @@ class Database:
     async def set_stream(self, source_id: int, url: str, expires: int | None) -> None:
         t = now()
         await self._write(
-            """UPDATE sources SET stream_url=?, stream_expires=?, status='active', fail_streak=0, last_ok_at=?,
+            f"""UPDATE sources SET stream_url=?, stream_expires=?, {REVIVE}, fail_streak=0, last_ok_at=?,
                       last_error='', updated_at=? WHERE id=?""",
             (url, expires, t, t, source_id),
         )
@@ -798,12 +815,13 @@ class Database:
             if src is None:
                 return None
             t = now()
-            await self.conn.execute("UPDATE sources SET status='gone', updated_at=? WHERE id=?", (t, src["id"]))
+            await self.conn.execute("UPDATE sources SET status='gone', updated_at=? WHERE id=? AND status!='removed'",
+                                    (t, src["id"]))
             async with self.conn.execute(
                 "SELECT 1 FROM sources WHERE video_id=? AND status='active' LIMIT 1", (src["video_id"],)
             ) as cur:
                 if await cur.fetchone() is None:
-                    await self.conn.execute("UPDATE videos SET status='gone', updated_at=? WHERE id=?",
+                    await self.conn.execute("UPDATE videos SET status='gone', updated_at=? WHERE id=? AND status='active'",
                                             (t, src["video_id"]))
             return src["video_id"]
 
@@ -876,6 +894,39 @@ class Database:
             sql += " AND EXISTS (SELECT 1 FROM outputs o WHERE o.video_id=v.id AND o.library_id=?)"
             params.append(library_id)
         return [dict(r) for r in await self._all(sql + " ORDER BY s.video_id DESC", params, bulk=True)]
+
+    async def remove_sources(self, video_id: int, sites: list[str], outputs: list[tuple[int, str]]) -> bool:
+        """删掉作品在这些站点的源（标为 removed）。删完没有可用的源了，作品标为 removed，记下它在哪些库
+        （outputs：[(库 id, via)]，调用方随后移出），返回 True；还有别的可用源返回 False。"""
+        marks = ",".join("?" * len(sites))
+        t = now()
+        async with self._tx():
+            await self.conn.execute(
+                f"UPDATE sources SET status='removed', updated_at=? WHERE video_id=? AND site IN ({marks})",
+                (t, video_id, *sites))
+            async with self.conn.execute(
+                    "SELECT 1 FROM sources WHERE video_id=? AND status='active' LIMIT 1", (video_id,)) as cur:
+                if await cur.fetchone() is not None:
+                    return False
+            libs = json.dumps([list(o) for o in outputs])
+            await self.conn.execute(
+                """UPDATE videos SET status='removed', updated_at=?,
+                          removed_from=CASE WHEN status='removed' AND ?='[]' THEN removed_from ELSE ? END
+                   WHERE id=?""", (t, libs, libs, video_id))
+        return True
+
+    async def restore_sources(self, video_id: int) -> list[tuple[int, str]]:
+        """恢复作品被删掉的源；作品因此恢复可用时，返回删源时它在哪些库 [(库 id, via)]，调用方放回去。"""
+        async with self._tx():
+            await self.conn.execute("UPDATE sources SET status='active', updated_at=? WHERE video_id=? AND status='removed'",
+                                    (now(), video_id))
+            async with self.conn.execute("SELECT status, removed_from FROM videos WHERE id=?", (video_id,)) as cur:
+                row = await cur.fetchone()
+            if row is None or row["status"] != "removed":
+                return []
+            await self.conn.execute("UPDATE videos SET status='active', removed_from='', updated_at=? WHERE id=?",
+                                    (now(), video_id))
+        return [(int(lib), via) for lib, via in json.loads(row["removed_from"] or "[]")]
 
     async def set_source_check(self, video_id: int, site: str, found: bool) -> None:
         await self._write(

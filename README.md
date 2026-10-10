@@ -215,6 +215,7 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 - **补源任务**：「任务 → 补源」，选站点和输出库，逐部按番号去找备用源（每部一次请求；MissAV 页面上有中字版的话一并加上）。现有约 3.9 万部按每秒 1 次大约 11 小时。
 - **新片自动补源**：设置里「新片自动补源」填站点名（如 `missav`），列表任务、订阅收进新影片时顺手去这些站点找。
 - 影片库的详情里按播放顺序列出所有源（多线路站点的源下面再列出各条线路），可以试播指定的源或线路，也可以点「查找其他源」立即找一次。补源和刷新任务执行中、结束后，抽屉会自动更新。
+- **删除源**：能取到地址但实际播不了的源，在影片库多选后点「删除源」选站点。只删这几部影片在这个站的源，这个站的其他影片和订阅不受影响；以后订阅、详情、补源再抓到也不再用它。删完没有别的可用源的影片从所有输出库移出（外部整理库删 strm、整理目录进回收区），不再刮削；以后别的站点抓到这部片会按订阅自动回来。删错了筛「已删源」，选中后「恢复删掉的源」，会放回原来的输出库。
 - 设置里的站点、字幕和线路优先顺序可拖动手柄调整，也可聚焦手柄后用上下方向键移动；保存后生效，「放弃改动」恢复已保存的顺序。
 - **线路**：「设置 → 站点」里每个多线路站点列出它的线路，可以调顺序、停用、强制中转。播放时按顺序找有新鲜直链的线路，
   没有就逐条现取；取不到的线路进冷却、换下一条；全都不行时重抓一次详情（线路数据可能换了）再试。中转播到一半只认当前线路。
@@ -408,7 +409,7 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 | GET | `/api/jobs/{id}/items?status=new&limit=50&offset=0` | 列表识别明细；状态为空、`new`、`existing` 或 `excluded`，响应含总数 |
 | POST | `/api/jobs/{id}/pause\|resume\|cancel\|retry` | 控制任务 |
 | GET | `/api/videos?q=&filter=no_detail&library_id=&page=` | 影片库（每部影片带各个源、所在的库和 strm 路径）。还能按 `has_site`、`lacks_site`、`sources=single\|multi\|failing\|none`、`subtitle=zh\|en\|none`、`uncensored`、`model`、`category`、`tag`、`maker`、`quality`（列表参数可以重复，组内任一满足）、`release_from/to`、`added_from/to`、`duration_min/max` 筛，`sort=created\|release\|duration\|code\|views\|updated&order=asc\|desc` 排序 |
-| POST | `/api/videos/batch` | 批量：`{"action": "probe\|refresh\|add\|remove", "ids": [...], "library_id": 2}`；probe、refresh 排成任务，add、remove 当场改输出库 |
+| POST | `/api/videos/batch` | 批量：`{"action": "probe\|refresh\|add\|remove\|remove_source\|restore_source", "ids": [...], "library_id": 2, "sites": ["123av"]}`；都排成任务；remove_source 删掉 `sites` 里站点的源，restore_source 恢复删掉的源 |
 | GET | `/api/facets?field=models\|categories\|tags\|makers\|quality&q=` | 库里已有的女优、分类等及影片数（筛选、规则的候选） |
 | GET / POST / PUT / DELETE | `/api/libraries`、`/api/libraries/{id}` | 输出库；DELETE 可带 `?delete_files=true` |
 | POST | `/api/libraries/{id}/locate` | 外部整理库：同步位置 |

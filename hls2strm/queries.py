@@ -21,7 +21,7 @@ class VideoQuery:
     """影片库的筛选和排序。列表类条件组内任一满足即可，不同条件之间都要满足。"""
 
     q: str = ""
-    status: str = ""  # no_detail / no_output / gone
+    status: str = ""  # active / no_detail / no_output / gone / removed（删源后没有可用的源）
     library_id: int | None = None
     has_site: list[str] = field(default_factory=list)  # 有其中任一站点的可用源
     lacks_site: list[str] = field(default_factory=list)  # 这些站点都没有源
@@ -63,6 +63,8 @@ class VideoQuery:
                          "(SELECT 1 FROM outputs o WHERE o.video_id=videos.id AND o.strm_path!='')")
         elif self.status == "gone":
             where.append("status='gone'")
+        elif self.status == "removed":
+            where.append("status='removed'")
         elif self.status == "active":
             where.append("status='active'")
         active = "s.video_id=videos.id AND s.status='active'"

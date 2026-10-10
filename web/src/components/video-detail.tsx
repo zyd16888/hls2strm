@@ -86,6 +86,7 @@ function Detail({ v: initial, probe }: { v: Video; probe: ProbeResult[] | null }
       <header className="flex flex-wrap items-center gap-2 border-b border-line px-5 py-3">
         <Code className="text-xl">{v.slug}</Code>
         {v.status === "gone" && <Chip tone="err">已下架</Chip>}
+        {v.status === "removed" && <Chip tone="err">已删源</Chip>}
         {!!v.uncensored && <Chip tone="info">无码流出</Chip>}
         <div className="ml-auto flex items-center gap-1.5">
           <Button size="sm" variant="primary" onClick={() => playVideo(v)}>

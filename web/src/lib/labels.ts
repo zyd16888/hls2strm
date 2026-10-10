@@ -26,6 +26,8 @@ export const KIND_NAMES: Record<string, string> = {
   membership: "调整影片归属",
   library_add: "加入输出库",
   library_remove: "移出输出库",
+  source_remove: "删除源",
+  source_restore: "恢复删掉的源",
 };
 export const kindName = (k: string) => KIND_NAMES[k] || k;
 

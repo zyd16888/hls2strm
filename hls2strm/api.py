@@ -376,7 +376,7 @@ def _video_view(c, v: dict, sources: list[dict] | None = None, lines: dict[int, 
 async def list_videos(
     request: Request,
     q: str = "",
-    filter: Literal["", "active", "no_detail", "no_output", "gone"] = "",
+    filter: Literal["", "active", "no_detail", "no_output", "gone", "removed"] = "",
     library_id: int | None = None,
     has_site: list[str] = Query([]),
     lacks_site: list[str] = Query([]),
@@ -463,9 +463,10 @@ async def job_detail(job_id: int, request: Request):
 
 
 class VideoBatch(BaseModel):
-    action: Literal["probe", "refresh", "add", "remove"]
+    action: Literal["probe", "refresh", "add", "remove", "remove_source", "restore_source"]
     ids: list[int] = Field(min_length=1, max_length=500)
     library_id: int | None = None  # add / remove：哪个输出库
+    sites: list[str] = []  # remove_source：删掉哪些站点的源
 
 
 @router.post("/videos/batch", status_code=202)
@@ -477,6 +478,10 @@ async def videos_batch(body: VideoBatch, request: Request):
             return {"job_id": await e.create_probe_videos(body.ids)}
         if body.action == "refresh":
             return {"job_id": await e.create_refresh(body.ids)}
+        if body.action == "remove_source":
+            return {"job_id": await e.create_source_removal(body.ids, body.sites)}
+        if body.action == "restore_source":
+            return {"job_id": await e.create_source_removal(body.ids)}
         if not body.library_id:
             raise ValueError("要选一个输出库")
         return {"job_id": await e.create_membership(body.ids, body.library_id, remove=body.action == "remove")}

@@ -332,7 +332,7 @@ export interface Source extends StreamState {
   label: string;
   title: string;
   subtitle: string;
-  status: "active" | "gone" | "disabled";
+  status: "active" | "gone" | "removed" | "disabled";
   direct: boolean;
   line: string;
   lines?: SourceLine[];
@@ -366,7 +366,7 @@ export interface Video {
   director: string;
   series: string;
   uncensored: number;
-  status: "active" | "gone";
+  status: "active" | "gone" | "removed";
   detail_at: number | null;
   created_at: number;
   play_url: string;

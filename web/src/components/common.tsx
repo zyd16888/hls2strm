@@ -29,6 +29,7 @@ export function CopyButton({ text, label = "复制", size = "sm" }: { text: stri
 /** 源（或线路）现在的播放地址状态。 */
 export function streamState(s: Source | SourceLine, now = Date.now() / 1000): { text: string; tone: Tone } {
   if (s.status === "gone") return { text: "已下架", tone: "err" };
+  if (s.status === "removed") return { text: "已删除", tone: "err" };
   if (s.status === "disabled") return { text: "已禁用", tone: "neutral" };
   if (s.cooldown_until > now) return { text: `失败冷却 ${fmtDur(s.cooldown_until - now)}`, tone: "warn" };
   if (!s.stream_url) return { text: "未缓存", tone: "neutral" };
