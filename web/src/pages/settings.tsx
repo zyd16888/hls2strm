@@ -91,7 +91,7 @@ const LABELS: Record<string, string> = {
   download_cover: "下载封面",
   poster_crop: "裁剪 poster",
   public_base_url: "对外地址",
-  play_mode: "播放模式",
+  play_mode: "普通播放模式",
   proxy_user_agents: "中转 UA 片段",
   play_token: "播放令牌",
   hls_margin: "有效期余量（分钟）",
@@ -108,8 +108,8 @@ const LABELS: Record<string, string> = {
   resolve_timeout: "取地址总时限（秒）",
   resolve_attempt_timeout: "单源 / 线路尝试时限（秒）",
   resolve_token: "网关解析令牌",
-  resolve_mode: "网关默认给的地址",
-  resolve_relay_ttl: "网关中转地址缓存（秒）",
+  resolve_mode: "网关解析策略",
+  resolve_relay_ttl: "中转链接期限（秒）",
   resolve_proxy_url: "公网中转地址",
 };
 const REWRITE_KEYS = ["public_base_url", "play_mode", "play_token", "path_template", "output_dir", "write_nfo"];
@@ -177,6 +177,10 @@ export default function Settings() {
             改了影响 strm 内容或位置的设置，已有的文件要按新设置重写。
           </Notice>
         )}
+        <Notice>
+          普通播放模式控制 /play；网关解析策略控制 /api/resolve。网关的 Relay 只决定需要中转时由谁转发，不会强制全部资源中转。
+          <a href="#/playback-guide" target="_blank" rel="noopener noreferrer" className="ml-1 text-accent underline">查看配置组合与路径说明（新标签页）</a>
+        </Notice>
         {GROUPS.map(g => (
           <Panel key={g.id} id={`set-${g.id}`} title={g.title} bodyClassName="divide-y divide-line py-0" className="scroll-mt-28">
             {g.keys

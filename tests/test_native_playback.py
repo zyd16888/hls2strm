@@ -71,9 +71,14 @@ def test_mp4_probe_and_range_requests_pin_the_resolved_session(make_store):
 
             # 另一个播放器或刷新任务改了数据库直链，不影响这次播放后续的 Range。
             await db.set_line_stream(line["id"], "https://cdn.invalid/changed", int(time.time()) + 14400, "dooplayer")
-            response = await client.get(media_url, headers={"Range": "bytes=4-7"})
+            response = await client.get(media_url, headers={"Range": "bytes=4-7", "Origin": "https://player.invalid"})
             assert response.status_code == 206 and response.content == b"ftyp"
             assert response.headers["content-range"] == "bytes 4-7/8"
+            assert response.headers["access-control-allow-origin"] == "*"
+            assert "Content-Range" in response.headers["access-control-expose-headers"]
+            preflight = await client.options(media_url, headers={"Origin": "https://player.invalid",
+                                                                 "Access-Control-Request-Method": "GET"})
+            assert preflight.status_code == 204 and preflight.headers["access-control-allow-origin"] == "*"
             url, kw, upstream = fetcher.session.calls[-1]
             assert url == original and kw["headers"]["Range"] == "bytes=4-7" and upstream.closed
             assert (await client.get(media_url.replace("test-token", "wrong"))).status_code == 403
@@ -106,8 +111,9 @@ def test_hls_probe_pins_format_and_preserves_variant_choice(make_store):
             assert probe.status_code == 200 and "mpegurl" in probe.headers["content-type"]
             await db.set_stream(src["id"], "https://cdn.invalid/changed.mp4", int(time.time()) + 14400)
             media_url = urljoin(str(probe.url), probe.headers["content-location"])
-            response = await client.get(media_url)
+            response = await client.get(media_url, headers={"Origin": "https://player.invalid"})
             assert response.status_code == 200 and "mpegurl" in response.headers["content-type"]
+            assert response.headers["access-control-allow-origin"] == "*"
             refs = [ln for ln in response.text.splitlines() if ln and not ln.startswith("#")]
             assert len(refs) == 1 and "480p/video.m3u8" in refs[0]
     asyncio.run(run())

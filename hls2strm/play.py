@@ -600,7 +600,7 @@ CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
     "Access-Control-Allow-Headers": "*",
-    "Access-Control-Expose-Headers": "Content-Length, Content-Type",
+    "Access-Control-Expose-Headers": "Content-Length, Content-Type, Content-Range, Accept-Ranges, Content-Location",
 }
 
 
@@ -728,6 +728,7 @@ async def play(name: str, request: Request, t: str = "", proxy: int = 0, src: st
 
 
 @router.options("/play/{name}")
+@router.options("/media/{source_id}")
 @router.options("/hls/{source_id}/{path:path}")
 async def cors_preflight():
     return Response(status_code=204, headers=CORS_HEADERS)
@@ -1002,8 +1003,12 @@ async def media_file(source_id: int, request: Request, s: str, t: str = "", want
     except (Blocked, FetchError, ParseError) as e:
         raise HTTPException(502, f"刷新播放地址失败：{e}") from None
     if _is_hls(r.url):
-        return await _proxy_playlist(request, r, t, want, all_variants=variants == "all")
-    return await _proxy_file(request, r)
+        response = await _proxy_playlist(request, r, t, want, all_variants=variants == "all")
+    else:
+        response = await _proxy_file(request, r)
+    if request.headers.get("origin"):
+        response.headers.update(CORS_HEADERS)
+    return response
 
 
 async def _proxy_playlist(request: Request, r: Resolved, t: str, want: int | None = None,

@@ -22,6 +22,7 @@ const pages: { id: string; name: string; icon: ComponentType<{ className?: strin
   { id: "libraries", name: "输出库与订阅", icon: FolderTree, Page: lazy(() => import("./pages/libraries")) },
   { id: "strm", name: "strm 管理", icon: FileVideo, Page: lazy(() => import("./pages/strm")) },
   { id: "settings", name: "设置", icon: Settings2, Page: lazy(() => import("./pages/settings")) },
+  { id: "playback-guide", name: "播放与网关说明", icon: Monitor, Page: lazy(() => import("./pages/playback-guide")) },
   { id: "logs", name: "日志", icon: ScrollText, Page: lazy(() => import("./pages/logs")) },
 ];
 

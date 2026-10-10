@@ -171,7 +171,7 @@ class Settings(BaseModel):
     public_base_url: str = Field("", description="Emby/Jellyfin 访问本服务的地址，写进 strm；留空使用 HLS2STRM_PUBLIC_BASE_URL")
     play_mode: Literal["redirect", "proxy", "direct"] = Field(
         "redirect",
-        description="redirect：可以直连时 302，否则原样中转；proxy：全部原样中转；direct：strm 写 CDN 地址，仅调试。本服务不转码",
+        description="普通 /play 请求：redirect 可以直连时 302，否则原样中转；proxy 全部原样中转；direct 生成 strm 时写 CDN 地址，仅调试。网关 /api/resolve 由 resolve_mode 控制。本服务不转码",
     )
     proxy_user_agents: list[str] = Field(
         default_factory=lambda: ["Lavf", "python-requests"],
@@ -252,10 +252,10 @@ class Settings(BaseModel):
     speed_test_timeout: float = Field(20, gt=0, description="每条线路测速的总时限（秒），包含解析、清单与下载；各线路并行执行")
     resolve_mode: Literal["auto", "redirect", "strict_redirect", "proxy"] = Field(
         "auto",
-        description="网关 resolve 默认给什么地址（网关请求里带 mode 时以它为准）：auto 按上面的偏好挑源，"
+        description="网关 /api/resolve 的选源与交付策略，与普通播放模式独立（请求带 mode 时优先）：auto 按上面的偏好挑源，"
                     "能直连给 CDN 地址、要中转给中转地址；redirect 优先直连、失败可回退；strict_redirect 只直连且禁止中转回退；proxy 一律原样中转",
     )
-    resolve_relay_ttl: int = Field(21600, ge=0, description="网关中转地址缓存时长（秒），0 不缓存；绑定会话的地址还会按会话有效期缩短")
+    resolve_relay_ttl: int = Field(21600, ge=0, description="兼容网关的中转链接期限（秒），不是 CDN 地址缓存；绑定源时最多为影片时长加一小时。设为 0 时，当前 Emby Gateway 使用 6 小时默认票据期限，不表示关闭票据")
     resolve_timeout: int = Field(20, ge=5, le=120, description="播放解析与首份清单返回的总时限（秒），包含找源、排队和 CDN 请求；媒体传输另按停滞超时判断")
     resolve_attempt_timeout: int = Field(6, ge=1, le=120, description="每个源或线路单次尝试最多等待几秒；仍受播放总时限约束，给备用源保留机会")
     play_discover: bool = Field(
@@ -264,7 +264,7 @@ class Settings(BaseModel):
     resolve_proxy_url: str = Field(
         "",
         description="网关 resolve 用的公网中转地址：挑中的源要中转（如 MissAV）、或直连的源都失败时，返回这个地址下的中转链接，"
-                    "须能从外网访问（本服务的公网地址，或网关转发到本服务的地址）；留空则只给能直连的源，没有时返回 409",
+                    "须能从外网访问。网关选择 Relay 并传 relay=gateway 时无需填写；其他情况下留空则无法提供中转地址，只有需中转的源时返回 409",
     )
 
     @model_validator(mode="before")
