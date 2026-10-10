@@ -8,6 +8,7 @@ import { useRun } from "@/lib/queries";
 import { createStore } from "@/lib/store";
 import { CopyButton, streamState } from "./common";
 import { playVideo } from "./player";
+import { LineSpeedTest } from "./line-speed-test";
 import { Button } from "./ui/button";
 import { Chip, Code, KV, Mono } from "./ui/data";
 import { Sheet, SheetClose, SheetContent } from "./ui/overlay";
@@ -177,6 +178,8 @@ function Detail({ v: initial, probe }: { v: Video; probe: ProbeResult[] | null }
           )}
         </section>
 
+        <LineSpeedTest key={v.slug} slug={v.slug} />
+
         <section className="space-y-2">
           <h4 className="text-sm font-semibold">本服务播放地址</h4>
           <p className="text-xs text-muted">这就是 strm 文件里的内容。</p>
@@ -277,7 +280,7 @@ function LineRow({ v, src, ln }: { v: Video; src: Source; ln: SourceLine }) {
     <li className={"flex flex-wrap items-center gap-2 text-[13px] " + (ln.enabled ? "" : "opacity-55")}>
       <span className="font-mono">{ln.line}</span>
       <span className="text-muted">{ln.host_label}</span>
-      <Chip>{ln.direct ? (ln.ip_uncertain ? "302·IP 限制待验证" : ln.ip_bound ? "302·绑 IP" : "302") : "中转"}</Chip>
+      <Chip>{!ln.supported ? "暂不支持" : ln.direct ? (ln.ip_uncertain ? "出口限制待验证·外部中转" : ln.ip_bound ? "出口受限·外部中转" : "外部可直连") : "原样中转"}</Chip>
       <QualityChip row={ln} />
       <HealthChip tier={ln.health} />
       <Chip tone={ln.enabled ? state.tone : "neutral"}>{ln.enabled ? state.text : "已停用"}</Chip>

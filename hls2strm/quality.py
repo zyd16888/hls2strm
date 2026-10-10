@@ -190,13 +190,21 @@ def needed(row: dict) -> bool:
 class QualityProber:
     """探测并记下画质；同一个源 / 线路同时只探一次，后台探测有并发和排队上限。"""
 
-    def __init__(self, db: Database, fetcher: Fetcher, concurrency: int = 2) -> None:
+    def __init__(self, db: Database, fetcher: Fetcher, concurrency: int = 2, pending: int = MAX_PENDING) -> None:
         self.db = db
         self.fetcher = fetcher
         self.on_change: Callable[[int], Awaitable[None]] | None = None  # 源的各档画质变了（参数是源 id）
         self._busy: set[tuple[int, int | None]] = set()
         self._tasks: set[asyncio.Task] = set()
         self._sem = asyncio.Semaphore(concurrency)
+        self.concurrency = concurrency
+        self.pending = pending
+
+    def configure(self, concurrency: int, pending: int) -> None:
+        if concurrency != self.concurrency:
+            self._sem = asyncio.Semaphore(concurrency)
+            self.concurrency = concurrency
+        self.pending = pending
 
     async def save(self, source_id: int, line_id: int | None, q: Quality | None) -> None:
         """记下画质；源的各档变了就通知（多画质版本文件要跟着改）。"""
@@ -229,7 +237,7 @@ class QualityProber:
 
     def spawn(self, source_id: int, line_id: int | None, url: str, headers: dict | None = None) -> None:
         """放到后台探测，不耽误调用方（比如 302）。"""
-        if (source_id, line_id) in self._busy or len(self._tasks) >= MAX_PENDING:
+        if (source_id, line_id) in self._busy or (self.pending and len(self._tasks) >= self.pending):
             return
         with background():
             task = asyncio.create_task(self.probe_and_save(source_id, line_id, url, headers))

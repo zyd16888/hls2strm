@@ -335,7 +335,7 @@ def _line_view(c, site, ln: dict) -> dict:
             "direct": t.direct and not cfg.proxy and cfg.direct_mode != "proxy",
             "ip_bound": t.ip_bound and cfg.direct_mode != "allow",
             "ip_uncertain": t.ip_uncertain and cfg.direct_mode != "allow", "expires_stream": t.expires,
-            "cooldown_until": source_cooldown(ln), "health": c.resolver.health.tier(host_key(site, ln))}
+            "cooldown_until": source_cooldown(ln, c.store.current.source_failure_cooldown, c.store.current.source_failure_cooldown_max), "health": c.resolver.health.tier(host_key(site, ln))}
 
 
 def _source_view(c, src: dict, lines: list[dict] | None = None) -> dict:
@@ -344,7 +344,7 @@ def _source_view(c, src: dict, lines: list[dict] | None = None) -> dict:
     out["label"] = site.label if site else src["site"]
     out["direct"] = bool(site and site.stream.direct)
     out["expires_stream"] = bool(site and site.stream.expires)
-    out["cooldown_until"] = source_cooldown(src)
+    out["cooldown_until"] = source_cooldown(src, c.store.current.source_failure_cooldown, c.store.current.source_failure_cooldown_max)
     out["health"] = c.resolver.health.source_tier(site) if site else 0
     if site and site.multi_line:
         cfg = c.store.current.site(site.name)
@@ -506,6 +506,21 @@ async def probe_video(slug: str, request: Request):
 
 
 # ---- 输出库 ----
+
+
+class SpeedTestBody(BaseModel):
+    include_disabled: bool = False
+
+
+@router.post("/videos/{slug}/speed-test")
+async def speed_test(slug: str, body: SpeedTestBody, request: Request):
+    from .line_speed import speed_events
+    ctx = _ctx(request)
+    video = await ctx.db.get_video(slug.lower())
+    if video is None:
+        raise HTTPException(404, "影片不存在")
+    return StreamingResponse(speed_events(ctx, video, body.include_disabled), media_type="application/x-ndjson",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 
 class LibraryBody(BaseModel):
@@ -852,7 +867,7 @@ def _line_specs(site) -> list[dict]:
 
     out = []
     for name, spec in site.line_specs.items():
-        t = HOST_TRAITS.get(spec.host)
+        t = HOST_TRAITS.get(spec.host) or site.line_traits(name)
         out.append({"name": name, "host": spec.host, "host_label": HOST_LABELS.get(spec.host, ""), "note": spec.note,
                     "supported": spec.supported, "direct": bool(t and t.direct), "ip_bound": bool(t and t.ip_bound),
                     "ip_uncertain": bool(t and t.ip_uncertain)})

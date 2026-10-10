@@ -11,14 +11,16 @@ from curl_cffi.curl import CURL_WRITEFUNC_PAUSE, CURL_WRITEFUNC_ERROR
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.utils import set_curl_options
 
-from .runtime import stage
+from .runtime import stage, local_queue
+from .errors import PoolBusy
 
 BUFFER_BYTES = 512 * 1024
 
 
 class MediaResponse:
-    def __init__(self, session, curl, metrics):
+    def __init__(self, session, curl, metrics, buffer_bytes=BUFFER_BYTES):
         self.session, self.curl, self.metrics = session, curl, metrics
+        self.buffer_bytes = buffer_bytes
         self.chunks = deque()
         self.buffered = 0
         self.paused = False
@@ -35,7 +37,7 @@ class MediaResponse:
     def write(self, data):
         if self.quit_now.is_set():
             return CURL_WRITEFUNC_ERROR
-        if self.buffered + len(data) > BUFFER_BYTES:
+        if self.buffered + len(data) > self.buffer_bytes:
             self.paused = True
             self.metrics.inc("relay_buffer_pauses")
             return CURL_WRITEFUNC_PAUSE
@@ -90,23 +92,37 @@ class ManagedSession:
         self.raw = AsyncSession(impersonate=settings.impersonate or "chrome", proxy=settings.proxy or None,
                                 trust_env=False, max_clients=capacity)
         self.metrics, self.kind = metrics, kind
+        self.capacity = capacity
+        self.wait_timeout = settings.pool_wait_timeout
+        self.buffer_bytes = settings.relay_buffer_kb * 1024
         self.slots = asyncio.Semaphore(capacity)
         self.active = 0
         self.idle = asyncio.Event()
         self.idle.set()
 
     async def request(self, method, url, **kw):
-        async with asyncio.timeout(kw.get("timeout", 30)):
-            return await self._request(method, url, **kw)
+        return await self._request(method, url, **kw)
 
     async def _request(self, method, url, **kw):
         self.active += 1
         self.idle.clear()
         handed_off, acquired = False, False
+        budget = time.monotonic() + kw.get("timeout", 30)
         try:
-            with stage(self.metrics, f"pool.{self.kind}.wait"):
-                await self.slots.acquire()
+            self.metrics.gauges[f"http_waiting_{self.kind}"] += 1
+            try:
+                with stage(self.metrics, f"pool.{self.kind}.wait"):
+                    wait = min(kw.get("timeout", 30), self.wait_timeout or float("inf"))
+                    try:
+                        async with local_queue():
+                            await asyncio.wait_for(self.slots.acquire(), wait)
+                    except TimeoutError:
+                        self.metrics.inc(f"pool_{self.kind}_busy")
+                        raise PoolBusy(f"{self.kind} 连接额度排队超时") from None
+            finally:
+                self.metrics.gauges[f"http_waiting_{self.kind}"] -= 1
             acquired = True
+            kw["timeout"] = max(.001, budget - time.monotonic())
             self.metrics.gauges[f"http_active_{self.kind}"] += 1
             with stage(self.metrics, f"upstream.{self.kind}"):
                 if kw.pop("stream", False):
@@ -141,7 +157,7 @@ class ManagedSession:
 
     async def _stream(self, url, *, headers=None, timeout=30, **kw):
         curl = await self.raw.pop_curl()
-        resp = MediaResponse(self.raw, curl, self.metrics)
+        resp = MediaResponse(self.raw, curl, self.metrics, self.buffer_bytes)
         try:
             _, buffer, header_buffer, _, _, _ = set_curl_options(
                 curl, "GET", url, params_list=[self.raw.params, None],

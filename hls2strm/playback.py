@@ -11,16 +11,17 @@ from .errors import NotFound
 
 
 class PlaybackSessions:
-    def __init__(self, capacity: int = 2048):
+    def __init__(self, capacity: int = 2048, hours: float = 8):
         self.capacity = capacity
+        self.hours = hours
         self.items = OrderedDict()
         self.created = 0
 
     def create(self, resolved):
         key = secrets.token_hex(12)
-        ttl = max(8 * 3600, (resolved.video.get("duration") or 0) + 3600)
+        ttl = max(self.hours * 3600, (resolved.video.get("duration") or 0) + 3600)
         self.items[key] = (time.monotonic() + ttl, resolved)
-        while len(self.items) > self.capacity:
+        while self.capacity and len(self.items) > self.capacity:
             self.items.popitem(last=False)
         return key
 
@@ -64,6 +65,6 @@ class PlaybackSessions:
             resolved = Resolved(data["video"], data["source"], get_site(data["source"]["site"]), data["line"],
                                 data["proxy_forced"], data.get("allow_direct", False))
             self.items[key] = (time.monotonic()+row["expires_at"]-time.time(), resolved)
-            while len(self.items) > self.capacity:
+            while self.capacity and len(self.items) > self.capacity:
                 self.items.popitem(last=False)
             return resolved

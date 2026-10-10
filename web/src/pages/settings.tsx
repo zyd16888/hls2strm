@@ -7,13 +7,13 @@ import { Chip, Mono, Notice, Panel, Table, Td, Th } from "@/components/ui/data";
 import { Check, Field, Input, Select, Switch, Textarea } from "@/components/ui/form";
 import { rewriteAll } from "@/lib/actions";
 import { api, type LineConfig, type LineSpecMeta, type SchemaProp, type SettingsResponse, type SettingsValues, type SiteConfig } from "@/lib/api";
-import { PLAY_MODES, RESOLVE_MODES, VARIANT_MODES } from "@/lib/labels";
+import { DOMAIN_MODES, PLAY_MODES, RESOLVE_MODES, VARIANT_MODES } from "@/lib/labels";
 import { useMeta, useRun } from "@/lib/queries";
 import { cn } from "@/lib/utils";
 
 const GROUPS: { id: string; title: string; keys: string[] }[] = [
   { id: "sites", title: "站点", keys: ["sites", "site_priority"] },
-  { id: "fetch", title: "抓取", keys: ["proxy", "impersonate", "request_timeout", "domain_cooldown", "solver_url", "solver_timeout"] },
+  { id: "fetch", title: "抓取", keys: ["proxy", "impersonate", "request_timeout", "domain_cooldown", "domain_cooldown_max", "solver_url", "solver_timeout"] },
   { id: "retry", title: "重试", keys: ["max_attempts", "retry_base_delay"] },
   { id: "tasks", title: "任务", keys: ["fetch_detail", "auto_probe_sites", "probe_recheck_days", "external_restore"] },
   { id: "output", title: "输出", keys: ["output_dir", "path_template", "write_nfo", "download_cover", "poster_crop"] },
@@ -35,27 +35,38 @@ const GROUPS: { id: string; title: string; keys: string[] }[] = [
       "variant_mode",
       "version_min_height",
       "quality_capture",
+      "quality_concurrency", "quality_pending",
       "play_discover",
       "resolve_timeout",
       "resolve_attempt_timeout",
       "resolve_token",
       "resolve_mode",
+      "resolve_relay_ttl",
       "resolve_proxy_url",
-      "continuous_enabled", "continuous_ffmpeg", "continuous_ffprobe", "continuous_height",
-      "continuous_workers", "continuous_cache_mb", "continuous_timeout",
+      "play_remote",
     ],
   },
+  { id: "capacity", title: "连接与缓存", keys: ["play_connections", "background_connections", "hls_connections", "file_connections", "preflight_connections", "speed_connections", "pool_wait_timeout", "relay_buffer_kb", "playlist_cache_entries", "playlist_cache_seconds", "preflight_bytes", "preflight_cache_entries", "preflight_cache_seconds", "preflight_failure_cooldown", "source_failure_cooldown", "source_failure_cooldown_max", "play_session_entries", "play_session_hours"] },
+  { id: "speed", title: "线路测速", keys: ["speed_test_bytes", "speed_test_timeout"] },
   { id: "health", title: "连通性", keys: ["health_rank", "health_interval", "health_samples", "health_bytes", "health_slow_kbps"] },
 ];
 
 const LABELS: Record<string, string> = {
-  continuous_enabled: "允许外部连续播放（按需转码）",
-  continuous_ffmpeg: "FFmpeg 路径", continuous_ffprobe: "FFprobe 路径",
-  continuous_height: "连续播放输出高度上限", continuous_workers: "连续播放转码并发",
-  continuous_cache_mb: "连续播放缓存上限（MB）", continuous_timeout: "连续播放单片超时（秒）",
+  play_remote: "按外部客户端处理普通播放",
+  play_connections: "播放解析连接额度", background_connections: "后台抓取连接额度",
+  hls_connections: "HLS 中转连接额度", file_connections: "文件中转连接额度",
+  preflight_connections: "起播预检连接额度", speed_connections: "线路测速连接额度",
+  pool_wait_timeout: "连接排队时限（秒）", relay_buffer_kb: "每连接媒体缓冲（KiB）",
+  playlist_cache_entries: "清单缓存条数", playlist_cache_seconds: "清单缓存有效期（秒）",
+  preflight_bytes: "起播预检采样（KiB）", preflight_cache_entries: "预检缓存条数",
+  preflight_cache_seconds: "预检缓存有效期（秒）", preflight_failure_cooldown: "预检失败冷却（秒）",
+  play_session_entries: "播放会话内存缓存条数", play_session_hours: "播放会话最低有效期（小时）",
+  speed_test_bytes: "单线路测速采样（KiB）", speed_test_timeout: "单线路测速时限（秒）",
+  source_failure_cooldown: "源 / 线路首次失败冷却（秒）", source_failure_cooldown_max: "源 / 线路冷却上限（秒）",
+  quality_concurrency: "后台画质探测并发", quality_pending: "后台画质探测任务额度", domain_cooldown_max: "域名冷却上限（秒）",
   sites: "各站点",
   site_priority: "站点优先顺序",
-  proxy: "抓取代理",
+  proxy: "上游代理（解析与中转）",
   impersonate: "浏览器指纹",
   request_timeout: "请求超时（秒）",
   domain_cooldown: "域名冷却（秒）",
@@ -85,7 +96,7 @@ const LABELS: Record<string, string> = {
   subtitle_priority: "字幕偏好",
   subtitle_fallback: "字幕回退",
   quality_first: "画质优先",
-  quality_max: "画质上限",
+  quality_max: "选源画质偏好上限",
   quality_unknown: "未知画质按",
   prefer_direct: "直连优先",
   variant_mode: "多码率的源给几档",
@@ -96,6 +107,7 @@ const LABELS: Record<string, string> = {
   resolve_attempt_timeout: "单源 / 线路尝试时限（秒）",
   resolve_token: "网关解析令牌",
   resolve_mode: "网关默认给的地址",
+  resolve_relay_ttl: "网关中转地址缓存（秒）",
   resolve_proxy_url: "公网中转地址",
 };
 const REWRITE_KEYS = ["public_base_url", "play_mode", "play_token", "path_template", "output_dir", "write_nfo"];
@@ -214,7 +226,7 @@ function Control({ k, schema, value, draft, set }: { k: string; schema: SchemaPr
   }
   if (schema.enum)
     return (
-      <Select value={String(value)} onChange={e => set(k, e.target.value)} className="w-full max-w-md">
+      <Select value={String(value)} aria-label={LABELS[k] ?? k} onChange={e => set(k, e.target.value)} className="w-full max-w-md">
         {schema.enum.map(o => (
           <option key={o} value={o}>
             {(k === "play_mode" ? PLAY_MODES : k === "resolve_mode" ? RESOLVE_MODES : k === "variant_mode" ? VARIANT_MODES : {})[o] ?? o}
@@ -222,11 +234,12 @@ function Control({ k, schema, value, draft, set }: { k: string; schema: SchemaPr
         ))}
       </Select>
     );
-  if (schema.type === "boolean") return <Switch checked={!!value} onCheckedChange={v => set(k, v)} />;
+  if (schema.type === "boolean") return <Switch aria-label={LABELS[k] ?? k} checked={!!value} onCheckedChange={v => set(k, v)} />;
   if (schema.type === "integer" || schema.type === "number")
     return (
       <Input
         type="number"
+        aria-label={LABELS[k] ?? k}
         className="w-36"
         step={schema.type === "integer" ? 1 : 0.1}
         min={schema.minimum ?? schema.exclusiveMinimum}
@@ -238,7 +251,7 @@ function Control({ k, schema, value, draft, set }: { k: string; schema: SchemaPr
   if (schema.type === "array") return <Lines value={value as string[]} onChange={v => set(k, v)} />;
   return (
     <>
-      <Input value={String(value ?? "")} onChange={e => set(k, e.target.value)} className="max-w-xl" />
+      <Input aria-label={LABELS[k] ?? k} value={String(value ?? "")} onChange={e => set(k, e.target.value)} className="max-w-xl" />
       {k === "solver_url" && <SolverTest url={String(value ?? "")} />}
     </>
   );
@@ -286,11 +299,11 @@ function SitesEditor({ sites, onChange }: { sites: Record<string, SiteConfig>; o
   const meta = useMeta();
   const update = (name: string, patch: Partial<SiteConfig>) => onChange({ ...sites, [name]: { ...sites[name], ...patch } });
   return (
-    <div className="grid gap-3 2xl:grid-cols-2">
+    <div className="grid min-w-0 grid-cols-1 gap-3 2xl:grid-cols-2">
       {Object.entries(sites).map(([name, cfg]) => {
         const m = meta.site(name);
         return (
-          <div key={name} className={cn("rounded-md border border-line p-3", !cfg.enabled && "bg-panel-2/60")}>
+          <div key={name} className={cn("min-w-0 rounded-md border border-line p-3", !cfg.enabled && "bg-panel-2/60")}>
             <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-2">
               <b className="text-[15px]">{m.label}</b>
               <Chip>{m.lines.length ? "按线路策略播放" : m.direct ? (m.ip_bound ? "302（直链绑出口 IP，网关不用它）" : "可以 302") : "必须中转"}</Chip>
@@ -303,15 +316,29 @@ function SitesEditor({ sites, onChange }: { sites: Record<string, SiteConfig>; o
                 被拦时用解题服务
               </label>
             </div>
-            <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_110px_90px]">
-              <Field label="域名（每行一个，前面的先用）">
+            <div className="mb-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_160px]">
+              <Field label="域名选择策略">
+                <Select value={cfg.domain_mode} aria-label={`${m.label} 域名选择策略`} onChange={e => update(name, { domain_mode: e.target.value as SiteConfig["domain_mode"] })}>
+                  {Object.entries(DOMAIN_MODES).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                </Select>
+              </Field>
+              <Field label="网络错误冷却（秒）" hint="轮询 / 均衡模式生效，0 关闭">
+                <Input type="number" min={0} aria-label={`${m.label} 网络错误冷却（秒）`} disabled={cfg.domain_mode === "priority"} value={cfg.domain_error_cooldown} onChange={e => update(name, { domain_error_cooldown: Number(e.target.value) })} />
+              </Field>
+            </div>
+            <p className="mb-2 text-xs leading-relaxed text-muted">选择的是站点页面镜像，抓取与播放解析共用此策略；站点总并发和限速不变，中转仍由实际 CDN 线路决定。仅配置同一站点的有效镜像。</p>
+            <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_100px_100px_100px]">
+              <Field label="镜像域名（每行一个，顺序作为优先 / 平局依据）">
                 <Lines value={cfg.domains} onChange={v => update(name, { domains: v })} />
               </Field>
               <Field label="限速（次/秒）">
-                <Input type="number" step={0.1} min={0.05} max={20} value={cfg.rate_per_sec} onChange={e => update(name, { rate_per_sec: Number(e.target.value) })} />
+                <Input type="number" step={0.1} min={0.05} value={cfg.rate_per_sec} onChange={e => update(name, { rate_per_sec: Number(e.target.value) })} />
               </Field>
-              <Field label="并发">
-                <Input type="number" min={1} max={16} value={cfg.concurrency} onChange={e => update(name, { concurrency: Number(e.target.value) })} />
+              <Field label="后台抓取并发">
+                <Input type="number" min={1} value={cfg.concurrency} onChange={e => update(name, { concurrency: Number(e.target.value) })} />
+              </Field>
+              <Field label="播放页面并发">
+                <Input type="number" min={1} value={cfg.play_concurrency} onChange={e => update(name, { play_concurrency: Number(e.target.value) })} />
               </Field>
             </div>
             {m.lines.length > 0 && <LinesTable specs={m.lines} cfg={cfg} onChange={patch => update(name, patch)} />}
@@ -329,17 +356,18 @@ function LinesTable({ specs, cfg, onChange }: { specs: LineSpecMeta[]; cfg: Site
   const lineCfg = (name: string): LineConfig => cfg.lines[name] ?? { enabled: true, proxy: false };
   const setLine = (name: string, patch: Partial<LineConfig>) => onChange({ lines: { ...cfg.lines, [name]: { ...lineCfg(name), ...patch } }, line_order: order });
   const reorder = useReorder(order, line_order => onChange({ line_order }));
-  const mode = (s: LineSpecMeta, c: LineConfig) => (!s.supported ? "暂不支持" : !s.direct || c.proxy || c.direct_mode === "proxy" ? "中转" : c.direct_mode === "allow" ? "302（允许外部直连）" : s.ip_uncertain ? "IP 限制待验证" : s.ip_bound ? "302（绑出口 IP）" : "302");
+  const mode = (s: LineSpecMeta, c: LineConfig) => (!s.supported ? "暂不支持" : !s.direct || c.proxy || c.direct_mode === "proxy" ? "原样中转" : c.direct_mode === "allow" ? "允许外部直连（手动覆盖）" : s.ip_uncertain ? "出口限制待验证 → 中转" : s.ip_bound ? "直链受出口限制 → 中转" : "外部可直连");
   return (
     <div className="mt-3" ref={reorder.root}>
       <div className="mb-1 text-[13px] text-muted">线路（拖动手柄调整尝试顺序，保存后生效）</div>
+      <p className="mb-2 text-xs text-muted">以下为外部客户端的播放策略；中转会经过本服务，保持原媒体编码。“允许外部直连”需自行验证，不会解除 CDN 的出口限制。</p>
       <Table className="text-[13px]">
         <thead>
           <tr>
             <Th>顺序</Th>
             <Th>线路</Th>
             <Th>播放站</Th>
-            <Th>方式</Th>
+            <Th>外部播放</Th>
             <Th>启用</Th>
             <Th>直连策略</Th>
           </tr>
@@ -366,11 +394,11 @@ function LinesTable({ specs, cfg, onChange }: { specs: LineSpecMeta[]; cfg: Site
                   <Switch checked={c.enabled} disabled={!s.supported} onCheckedChange={v => setLine(name, { enabled: v })} aria-label={`启用线路 ${name}`} />
                 </Td>
                 <Td>
-                  <Select value={c.proxy ? "proxy" : c.direct_mode || "auto"} disabled={!s.direct}
+                  <Select value={c.proxy ? "proxy" : c.direct_mode || "auto"} disabled={!s.direct || !s.supported}
                     aria-label={`线路 ${name} 直连策略`} onChange={e => setLine(name, {
                       proxy: e.target.value === "proxy", direct_mode: e.target.value as LineConfig["direct_mode"],
                     })}>
-                    <option value="auto">自动</option><option value="allow">允许外部直连</option><option value="proxy">强制中转</option>
+                    <option value="auto">自动（受限时中转）</option><option value="allow">允许外部直连</option><option value="proxy">强制原样中转</option>
                   </Select>
                 </Td>
               </tr>

@@ -365,11 +365,12 @@ def _merge(cur: dict, new: dict, primary: bool) -> dict:
     return out
 
 
-def source_cooldown(src: dict) -> int:
+def source_cooldown(src: dict, base: int = SOURCE_FAIL_COOLDOWN, maximum: int = SOURCE_FAIL_COOLDOWN_MAX) -> int:
     """源连续失败后的冷却截止时间（0 表示不在冷却）：5 分钟起，每次翻倍，最长 6 小时。"""
-    if not src.get("fail_streak") or not src.get("last_fail_at"):
+    if not base or not src.get("fail_streak") or not src.get("last_fail_at"):
         return 0
-    return src["last_fail_at"] + min(SOURCE_FAIL_COOLDOWN_MAX, SOURCE_FAIL_COOLDOWN * 2 ** (src["fail_streak"] - 1))
+    duration = base * 2 ** (src["fail_streak"] - 1)
+    return src["last_fail_at"] + (min(maximum, duration) if maximum else duration)
 
 
 def _job_row(row: aiosqlite.Row | None) -> dict | None:

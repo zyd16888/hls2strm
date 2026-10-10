@@ -135,6 +135,7 @@ class Engine:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.resolver.quality.close()
+        await self.resolver.selection.close()
         await self._save_health()
 
     def _worker_count(self) -> int:

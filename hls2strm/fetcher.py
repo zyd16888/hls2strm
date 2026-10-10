@@ -21,16 +21,15 @@ from urllib.parse import urlsplit, urlunsplit
 from curl_cffi.requests import AsyncSession
 
 from .config import Settings, SettingsStore, SiteConfig
-from .errors import Blocked, FetchError, NotFound  # noqa: F401  其他模块仍从这里导入
+from .errors import Blocked, FetchError, NotFound, PoolBusy  # noqa: F401  其他模块仍从这里导入
 from .observability import Metrics
 from .http_resources import ManagedSession
 from .cache import AsyncCache
-from .runtime import traffic, stage, background
+from .runtime import traffic, stage, background, local_queue
 from .sites import SITES, Site
 
 log = logging.getLogger(__name__)
 
-MAX_COOLDOWN = 3600
 
 
 
@@ -56,6 +55,9 @@ class DomainState:
     cookies: dict[str, str] = field(default_factory=dict)
     user_agent: str = ""
     solved_at: float = 0.0  # 上次解题服务过了这个域名的时间
+    in_flight: int = 0
+    response_ms: float | None = None
+    error_until: float = 0.0
 
     @property
     def host(self) -> str:
@@ -66,6 +68,7 @@ class DomainState:
         d.pop("cookies")
         d["host"] = self.host
         d["cooling"] = max(0, int(self.cooldown_until - time.time()))
+        d["error_cooling"] = max(0, int(self.error_until - time.time()))
         d["solver_cookie"] = bool(self.cookies)
         return d
 
@@ -256,17 +259,23 @@ class Fetcher:
     # ---- 会话与设置 ----
 
     def _on_settings(self, old: Settings, new: Settings) -> None:
-        if old.proxy != new.proxy or old.impersonate != new.impersonate:
+        resources = ("proxy", "impersonate", "play_connections", "background_connections", "hls_connections",
+                     "file_connections", "preflight_connections", "speed_connections", "relay_buffer_kb", "pool_wait_timeout")
+        if any(getattr(old, key) != getattr(new, key) for key in resources):
             self._reset_session()
+        self.playlists.capacity = new.playlist_cache_entries
+        if old.playlist_cache_seconds != new.playlist_cache_seconds:
+            self.playlists.clear()
         for name, sf in self.sites.items():
             sf.sync(old.site(name), new.site(name))
 
     @property
     def session(self) -> AsyncSession:
-        if traffic.get() == "play":
-            return self._pool("play", 8)
+        if traffic.get() in ("play", "speed"):
+            kind = traffic.get()
+            return self._pool(kind, getattr(self.store.current, f"{kind}_connections"))
         if self._session is None:
-            self._session = self._pool("background", 32)
+            self._session = self._pool("background", self.store.current.background_connections)
         return self._session
 
     def _pool(self, kind: str, capacity: int):
@@ -276,7 +285,23 @@ class Fetcher:
 
     @property
     def media_session(self):
-        return self._pool("media", 16)
+        return self.hls_session
+
+    @property
+    def hls_session(self):
+        return self._pool("hls", self.store.current.hls_connections)
+
+    @property
+    def file_session(self):
+        return self._pool("file", self.store.current.file_connections)
+
+    @property
+    def preflight_session(self):
+        return self._pool("preflight", self.store.current.preflight_connections)
+
+    @property
+    def speed_session(self):
+        return self._pool("speed", self.store.current.speed_connections)
 
     def _reset_session(self) -> None:
         old, self._pools, self._session = list(self._pools.values()), {}, None
@@ -306,13 +331,14 @@ class Fetcher:
         self._pools.clear()
         self._session = None
 
-    async def get_playlist(self, url: str, headers: dict | None = None) -> bytes:
+    async def get_playlist(self, url: str, headers: dict | None = None, timeout: float | None = None) -> bytes:
         s = self.store.current
         key = (url, tuple(sorted((headers or {}).items())), s.proxy, s.impersonate)
         async def load():
             self.metrics.inc("playlist_fetch")
-            return await self.get_bytes(url, headers=headers)
-        return await self.playlists.get(key, load, 15)
+            return await self.get_bytes(url, headers=headers, timeout=timeout)
+        self.playlists.capacity = s.playlist_cache_entries
+        return await self.playlists.get(key, load, s.playlist_cache_seconds)
 
     def reset_cooldowns(self, site: str | None = None) -> None:
         for name, sf in self.sites.items():
@@ -337,19 +363,23 @@ class Fetcher:
             resp = await self.session.request(method, url, headers=headers or None, json=json, data=data,
                                               allow_redirects=allow_redirects,
                                               timeout=self.store.current.request_timeout)
+        except PoolBusy:
+            raise
         except Exception as e:
             log.debug("%s %s 失败（%.1fs）：%s", method, url, time.monotonic() - t0, e)
             raise FetchError(f"{urlsplit(url).hostname}: {e}") from e
         log.debug("%s %s → HTTP %d（%.1fs）", method, url, resp.status_code, time.monotonic() - t0)
         return resp
 
-    async def get_bytes(self, url: str, *, referer: str | None = None, headers: dict | None = None) -> bytes:
+    async def get_bytes(self, url: str, *, referer: str | None = None, headers: dict | None = None, timeout: float | None = None) -> bytes:
         headers = dict(headers or {})
         if referer:
             headers["Referer"] = referer
         t0 = time.monotonic()
         try:
-            resp = await self.session.get(url, timeout=self.store.current.request_timeout, headers=headers or None)
+            resp = await self.session.get(url, timeout=timeout if timeout is not None else self.store.current.request_timeout, headers=headers or None)
+        except PoolBusy:
+            raise
         except Exception as e:
             log.debug("GET %s 失败（%.1fs）：%s", url, time.monotonic() - t0, e)
             raise FetchError(f"{urlsplit(url).hostname}: {e}") from e
@@ -373,8 +403,9 @@ class SiteFetcher:
         self.domains = [DomainState(base) for base in cfg.domains]
         self.limiter = RateLimiter(cfg.rate_per_sec)
         self._solver_lock = asyncio.Lock()
-        self._priority_slots = asyncio.Semaphore(2)
+        self._priority_slots = asyncio.Semaphore(cfg.play_concurrency)
         self._solving: dict[str, asyncio.Task] = {}
+        self._domain_cursor = 0
 
     def _schedule_solver(self, dom: DomainState):
         if not self.parent.store.current.solver_url or not self.cfg.solver or dom.base in self._solving:
@@ -401,9 +432,14 @@ class SiteFetcher:
         return self.parent.session
 
     def sync(self, old: SiteConfig, new: SiteConfig) -> None:
+        if old.play_concurrency != new.play_concurrency:
+            self._priority_slots = asyncio.Semaphore(new.play_concurrency)
         if old.domains != new.domains:
             existing = {d.base: d for d in self.domains}
             self.domains = [existing.get(base) or DomainState(base) for base in new.domains]
+            self._domain_cursor = 0
+        if old.domain_mode != new.domain_mode:
+            self._domain_cursor = 0
         if old.rate_per_sec != new.rate_per_sec:
             self.limiter.set_limit(new.rate_per_sec)
 
@@ -411,6 +447,7 @@ class SiteFetcher:
         for d in self.domains:
             d.cooldown_until = 0
             d.block_streak = 0
+            d.error_until = 0
         self.limiter.set_limit(self.cfg.rate_per_sec)
 
     def blocked_for(self) -> float:
@@ -430,6 +467,7 @@ class SiteFetcher:
             "domains": [d.to_dict() for d in self.domains],
             "rate": {"limit": self.limiter.limit, "current": round(self.limiter.rate, 3)},
             "concurrency": cfg.concurrency,
+            "domain_mode": cfg.domain_mode,
             "blocked_for": int(self.blocked_for()),
         }
 
@@ -445,7 +483,10 @@ class SiteFetcher:
     def _mark_blocked(self, dom: DomainState, reason: str) -> None:
         dom.blocked += 1
         dom.block_streak += 1
-        cool = min(MAX_COOLDOWN, self.parent.store.current.domain_cooldown * 2 ** (dom.block_streak - 1))
+        settings = self.parent.store.current
+        cool = settings.domain_cooldown * 2 ** (dom.block_streak - 1)
+        if settings.domain_cooldown_max:
+            cool = min(settings.domain_cooldown_max, cool)
         dom.cooldown_until = time.time() + cool
         dom.last_status = f"被拦截（{reason}），冷却 {cool}s"
         self.limiter.penalize()
@@ -458,10 +499,46 @@ class SiteFetcher:
             return await self.session.get(dom.base + path, timeout=self.parent.store.current.request_timeout,
                                           headers={"User-Agent": dom.user_agent} if dom.user_agent else None,
                                           cookies=dom.cookies or None)
-        if traffic.get() == "play":
-            async with self._priority_slots:
-                return await get()
-        return await get()
+        dom.in_flight += 1
+        try:
+            if traffic.get() == "play":
+                slots = self._priority_slots
+                async with local_queue():
+                    await slots.acquire()
+                try:
+                    started = time.monotonic()
+                    response = await get()
+                finally:
+                    slots.release()
+            else:
+                started = time.monotonic()
+                response = await get()
+            if response.status_code == 200 and not self._block_reason(response):
+                ms = (time.monotonic()-started)*1000
+                dom.response_ms = ms if dom.response_ms is None else dom.response_ms*.7+ms*.3
+                dom.error_until = 0
+            return response
+        finally:
+            dom.in_flight -= 1
+
+    def _pick_domain(self, tried: set[str]) -> DomainState | None:
+        mode = self.cfg.domain_mode
+        eligible = self._eligible_domains(tried)
+        if not eligible:
+            return None
+        if mode == "priority":
+            return eligible[0]
+        ranks = {d.base: (i-self._domain_cursor) % len(self.domains) for i, d in enumerate(self.domains)}
+        if mode == "balanced":
+            domain = min(eligible, key=lambda d: (d.in_flight, d.response_ms or 0, ranks[d.base]))
+        else:
+            domain = min(eligible, key=lambda d: ranks[d.base])
+        self._domain_cursor = (self.domains.index(domain)+1) % len(self.domains)
+        return domain
+
+    def _soft_error(self, dom: DomainState) -> None:
+        if self.cfg.domain_mode != "priority":
+            dom.error_until = time.time()+self.cfg.domain_error_cooldown
 
     @staticmethod
     def _block_reason(resp) -> str:
@@ -478,26 +555,34 @@ class SiteFetcher:
     async def get_page(self, path: str, *, priority: bool = False) -> Page:
         """抓取站点页面。priority=True 时跳过限速（播放请求用）。
 
-        按顺序试没在冷却的域名。被拦了先让解题服务当场过这个域名，过了接着用、不冷却不降速；
+        按站点策略动态选择可用镜像；轮询和均衡模式在所有镜像都 404 后才确认不存在。
+        被拦了先让解题服务当场过这个域名，过了接着用、不冷却不降速；
         没配解题服务或者也没过，才冷却这个域名、换下一个。域名都在冷却时也给解题服务一次机会。
         """
         path = self._to_path(path)
-        now = time.time()
-        candidates = [d for d in self.domains if d.cooldown_until <= now]
+        tried: set[str] = set()
+        missing: list[str] = []
         errors: list[str] = []
         skipped: list[str] = []  # 前面没拿到页面的域名，后面的拿到了记一条 info，日志里看得出换过域名
-        for dom in candidates:
+        while self._eligible_domains(tried):
             if not priority:
                 await self.limiter.acquire()
+            dom = self._pick_domain(tried)
+            if dom is None:
+                break
+            tried.add(dom.base)
             url = dom.base + path
             sent, t0 = time.time(), time.monotonic()
             try:
                 resp = await self._get(dom, path)
+            except PoolBusy:
+                raise
             except Exception as e:
                 dom.errors += 1
                 dom.last_status = f"网络错误：{e}"[:200]
                 self.metrics.inc("fetch_error")
                 self.limiter.slow_down()
+                self._soft_error(dom)
                 errors.append(f"{dom.host}: {e}")
                 skipped.append(f"{dom.host} 网络错误")
                 log.info("请求失败 %s（%.1fs）：%s", url, time.monotonic() - t0, e)
@@ -513,7 +598,16 @@ class SiteFetcher:
                     if traffic.get() == "play":
                         self._schedule_solver(dom)
                     else:
-                        page = await self._solve(dom, path, reason, sent)
+                        try:
+                            page = await self._solve(dom, path, reason, sent)
+                        except NotFound:
+                            if self.cfg.domain_mode == "priority":
+                                raise
+                            missing.append(dom.base)
+                            dom.last_status = "HTTP 404（解题后确认此镜像缺页）"
+                            self.metrics.inc("fetch_404")
+                            skipped.append(f"{dom.host} HTTP 404")
+                            continue
                 if page is not None:
                     return self._served(page, skipped)
                 self._mark_blocked(dom, reason)
@@ -522,11 +616,17 @@ class SiteFetcher:
             if status == 404:
                 dom.ok += 1
                 self.metrics.inc("fetch_404")
-                raise NotFound(url)
+                dom.last_status = "HTTP 404（此镜像没有该页面）"
+                if self.cfg.domain_mode == "priority":
+                    raise NotFound(url)
+                missing.append(dom.base)
+                skipped.append(f"{dom.host} HTTP 404")
+                continue
             if status != 200:
                 dom.errors += 1
                 dom.last_status = f"HTTP {status}"
                 self.metrics.inc("fetch_error")
+                self._soft_error(dom)
                 errors.append(f"{dom.host}: HTTP {status}")
                 skipped.append(f"{dom.host} HTTP {status}")
                 continue
@@ -538,7 +638,9 @@ class SiteFetcher:
             self.metrics.inc("fetch_ok")
             return self._served(Page(resp.text, str(resp.url), dom.base), skipped)
 
-        if not candidates and self.domains:
+        if missing and len(missing) == len(self.domains):
+            raise NotFound(f"{self.site.label} 所有镜像都没有该页面：{path}")
+        if not tried and self.domains and all(d.cooldown_until > time.time() for d in self.domains):
             if traffic.get() == "play":
                 self._schedule_solver(self.domains[0])
                 raise Blocked(f"{self.site.label} 正在恢复，稍后重试", self.blocked_for())
@@ -547,7 +649,14 @@ class SiteFetcher:
                 return page
         if errors:
             raise FetchError("；".join(errors))
+        if self.cfg.domain_mode != "priority" and (missing or any(d.error_until > time.time() for d in self.domains)):
+            raise FetchError(f"{self.site.label} 暂无可用镜像，部分镜像缺页或处于冷却，无法确认页面不存在")
         raise Blocked(f"{self.site.label} 的域名都被拦截（{self._blocked_reason()}）", self.blocked_for())
+
+    def _eligible_domains(self, tried: set[str]) -> list[DomainState]:
+        now = time.time()
+        return [d for d in self.domains if d.base not in tried and d.cooldown_until <= now
+                and (self.cfg.domain_mode == "priority" or d.error_until <= now)]
 
     def _served(self, page: Page, skipped: list[str]) -> Page:
         if skipped:
@@ -644,6 +753,7 @@ class SiteFetcher:
                 ok = resp.status_code == 200 and not blocked
                 if ok:
                     dom.cooldown_until = 0
+                    dom.error_until = 0
                     dom.block_streak = 0
                     dom.last_status = "正常"
                 out.append({"host": dom.host, "status": resp.status_code, "blocked": blocked, "ok": ok, "ms": ms})

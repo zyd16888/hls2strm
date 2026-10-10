@@ -77,10 +77,15 @@ export const SUBTITLES: Record<string, string> = { zh: "中文字幕", en: "英�
 export const subtitleTag = (code: string) => (code === "zh" ? "中字" : code === "en" ? "英字" : "");
 
 export const PLAY_MODES: Record<string, string> = {
-  continuous: "连续播放（服务端转码与自动换源）",
-  redirect: "302 跳转（ffmpeg 类客户端自动中转）",
-  proxy: "全部中转",
+  redirect: "可直连时 302，受限时原样中转",
+  proxy: "全部原样中转（不转码）",
   direct: "直写 CDN 地址（仅调试）",
+};
+
+export const DOMAIN_MODES: Record<string, string> = {
+  priority: "按顺序优先（失败再换）",
+  round_robin: "轮询（依次分摊请求）",
+  balanced: "负载均衡（处理中少的优先，再看响应速度）",
 };
 
 export const VARIANT_MODES: Record<string, string> = {
@@ -89,10 +94,10 @@ export const VARIANT_MODES: Record<string, string> = {
 };
 
 export const RESOLVE_MODES: Record<string, string> = {
-  continuous: "固定 HLS 连续播放",
   auto: "按挑源偏好（能直连给 CDN 地址，要中转给中转地址）",
-  redirect: "只挑能直连的源",
-  proxy: "一律走中转",
+  redirect: "优先直连，失败可回退中转",
+  strict_redirect: "仅直连，禁止中转回退",
+  proxy: "一律原样中转（不转码）",
 };
 
 export const PROBE_STATUS: Record<string, [string, Tone]> = {

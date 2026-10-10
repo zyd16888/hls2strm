@@ -2,6 +2,7 @@ import { RotateCcw, Wifi } from "lucide-react";
 import { useState } from "react";
 import { api, type SiteStatus } from "@/lib/api";
 import { fmtDur, fmtNum } from "@/lib/format";
+import { DOMAIN_MODES } from "@/lib/labels";
 import { useRun, useStatus } from "@/lib/queries";
 import { cn } from "@/lib/utils";
 import { Button } from "./ui/button";
@@ -11,7 +12,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "./ui/overlay";
 export function siteSignal(st: SiteStatus, blockedFor = 0): { tone: Tone; text: string } {
   if (!st.enabled) return { tone: "neutral", text: "未启用" };
   if (blockedFor > 0 || st.blocked_for > 0) return { tone: "err", text: `被拦截，${fmtDur(blockedFor || st.blocked_for)}后重试` };
-  const cooling = st.domains.filter(d => d.cooling > 0).length;
+  const cooling = st.domains.filter(d => d.cooling > 0 || (st.domain_mode !== "priority" && d.error_cooling > 0)).length;
   if (cooling) return { tone: "warn", text: `${cooling} 个域名冷却中` };
   if (st.domains.some(d => d.ok > 0)) return { tone: "ok", text: "可用" };
   return { tone: "neutral", text: "还没请求过" };
@@ -78,6 +79,7 @@ function SiteLamp({ st, blockedFor }: { st: SiteStatus; blockedFor: number }) {
               并发 <b className="text-ink">{st.concurrency}</b>
             </span>
           </div>
+          <p className="text-xs text-muted">域名策略：{DOMAIN_MODES[st.domain_mode] ?? DOMAIN_MODES.priority}</p>
           <ul className="space-y-1.5">
             {st.domains.map(d => (
               <li key={d.base} className="flex items-start gap-2">
@@ -90,8 +92,9 @@ function SiteLamp({ st, blockedFor }: { st: SiteStatus; blockedFor: number }) {
                     </span>
                   </div>
                   <div className="truncate text-xs text-muted" title={d.last_status}>
-                    {d.cooling ? `冷却 ${fmtDur(d.cooling)}` : d.last_status || "未使用"}
+                    {d.cooling ? `拦截冷却 ${fmtDur(d.cooling)}` : st.domain_mode !== "priority" && d.error_cooling ? `网络错误冷却 ${fmtDur(d.error_cooling)}` : d.last_status || "未使用"}
                   </div>
+                  <div className="text-xs text-muted">处理中 {d.in_flight ?? 0} · 响应 {d.response_ms == null ? "未测" : `${d.response_ms.toFixed(0)} ms`}</div>
                 </div>
               </li>
             ))}

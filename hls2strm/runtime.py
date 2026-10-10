@@ -13,6 +13,19 @@ from contextvars import ContextVar
 request_id: ContextVar[str] = ContextVar("request_id", default="")
 deadline: ContextVar[float | None] = ContextVar("deadline", default=None)
 traffic: ContextVar[str] = ContextVar("traffic", default="background")
+attempt_wait_state: ContextVar[dict | None] = ContextVar("attempt_wait_state", default=None)
+
+
+@asynccontextmanager
+async def local_queue():
+    """记录单次候选预算是否在本服务排队时耗尽，不把拥塞记为源故障。"""
+    state = attempt_wait_state.get()
+    try:
+        yield
+    except asyncio.CancelledError:
+        if state is not None:
+            state["local_timeout"] = True
+        raise
 
 
 @contextmanager
@@ -38,7 +51,8 @@ def stage(metrics, name: str):
 @asynccontextmanager
 async def measured_lock(metrics, lock, name: str):
     with stage(metrics, name):
-        await lock.acquire()
+        async with local_queue():
+            await lock.acquire()
     try:
         yield
     finally:
@@ -70,11 +84,9 @@ class RequestTelemetry:
         if ctx is None:
             return await self.app(scope, receive, send)
         path = scope["path"]
-        playback = path.startswith(("/play/", "/hls/", "/media/", "/continuous/", "/api/resolve/"))
+        playback = path.startswith(("/play/", "/hls/", "/media/", "/api/resolve/"))
         tokens = (request_id.set(secrets.token_hex(8)), traffic.set("play" if playback else "background"))
         budget = time.monotonic() + ctx.store.current.resolve_timeout if playback else None
-        if path.startswith("/continuous/"):
-            budget = time.monotonic() + ctx.store.current.continuous_timeout
         dt = deadline.set(budget)
         started, status = time.monotonic(), 500
         headers_sent = False

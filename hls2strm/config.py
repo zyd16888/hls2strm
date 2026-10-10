@@ -67,7 +67,8 @@ def normalize_domains(v: list[str]) -> list[str]:
             continue
         if not d.startswith(("http://", "https://")):
             d = "https://" + d
-        out.append(d)
+        if d not in out:
+            out.append(d)
     return out
 
 
@@ -84,8 +85,11 @@ class SiteConfig(BaseModel):
 
     enabled: bool = True
     domains: list[str] = Field(default_factory=list)
-    rate_per_sec: float = Field(1.0, gt=0, le=20)
-    concurrency: int = Field(2, ge=1, le=16)
+    domain_mode: Literal["priority", "round_robin", "balanced"] = "priority"
+    domain_error_cooldown: int = Field(15, ge=0)
+    rate_per_sec: float = Field(1.0, gt=0)
+    concurrency: int = Field(2, ge=1)
+    play_concurrency: int = Field(2, ge=1)
     solver: bool = True  # 域名被拦时是否当场调用解题服务（没过才冷却、换下一个域名）
     lines: dict[str, LineConfig] = Field(default_factory=dict)  # 多线路站点：每条线路的设置
     line_order: list[str] = Field(default_factory=list)  # 线路的优先顺序，前面的先试
@@ -113,17 +117,18 @@ class Settings(BaseModel):
     # 站点
     sites: dict[str, SiteConfig] = Field(
         default_factory=default_sites,
-        description="各站点的启用、域名（按顺序优先使用，被拦的进入冷却并切到下一个）、限速、并发",
+        description="各站点的启用、镜像域名与选择策略、限速、后台抓取和播放页面并发；域名策略不分摊 CDN 视频流量",
     )
     site_priority: list[str] = Field(
         default_factory=lambda: list(SITES),
         description="同一部影片有多个源时，站点的优先顺序（播放择优、元数据取用都按它）",
     )
     # 抓取
-    proxy: str = Field("", description="抓取代理，如 http://host:port、socks5h://user:pass@host:port")
+    proxy: str = Field("", description="上游代理，页面解析与原样中转都会经过该出口，如 http://host:port、socks5h://user:pass@host:port")
     impersonate: str = Field("chrome", description="curl_cffi 模拟的浏览器指纹")
     request_timeout: int = Field(30, ge=5, le=300, description="单次请求超时（秒）")
-    domain_cooldown: int = Field(300, ge=10, le=86400, description="域名被拦后的首次冷却（秒），连续被拦翻倍，上限 1 小时")
+    domain_cooldown: int = Field(300, ge=0, description="域名被拦后的首次冷却（秒），连续被拦翻倍；0 不冷却")
+    domain_cooldown_max: int = Field(3600, ge=0, description="域名拦截冷却上限（秒），0 不限制上限")
     solver_url: str = Field("", description="Byparr / FlareSolverr 地址，如 http://byparr:8191；留空不启用")
     solver_timeout: int = Field(60, ge=10, le=300, description="解题超时（秒）")
     # 重试
@@ -154,9 +159,9 @@ class Settings(BaseModel):
     poster_crop: bool = Field(True, description="从封面裁出竖版 poster")
     # 播放
     public_base_url: str = Field("", description="Emby/Jellyfin 访问本服务的地址，写进 strm；留空使用 HLS2STRM_PUBLIC_BASE_URL")
-    play_mode: Literal["redirect", "proxy", "direct", "continuous"] = Field(
+    play_mode: Literal["redirect", "proxy", "direct"] = Field(
         "redirect",
-        description="redirect：302 到 CDN；proxy：本服务中转；continuous：固定 HLS 转码与自动换源（需启用）；direct：strm 写 CDN 地址，仅调试",
+        description="redirect：可以直连时 302，否则原样中转；proxy：全部原样中转；direct：strm 写 CDN 地址，仅调试。本服务不转码",
     )
     proxy_user_agents: list[str] = Field(
         default_factory=lambda: ["Lavf", "python-requests"],
@@ -177,7 +182,7 @@ class Settings(BaseModel):
     quality_first: bool = Field(
         True, description="挑源时画质优先：先比画质（源里最清楚的一档），再看站点优先顺序；关掉则站点优先，画质只用来分先后"
     )
-    quality_max: int = Field(0, ge=0, le=4320, description="画质上限（分辨率的高，如 1080）：超过的源排到不超过的后面；0 不限")
+    quality_max: int = Field(0, ge=0, le=4320, description="选源画质偏好上限：超过的源排到后面，不限制实际播放档位、不转码；0 不限")
     quality_unknown: int = Field(
         720, ge=0, le=4320, description="还不知道画质的源按多少算（分辨率的高）；Jable 实测多为 720"
     )
@@ -199,6 +204,8 @@ class Settings(BaseModel):
         True,
         description="顺手探测画质：抓详情、播放拿到播放地址时读一次播放列表认出分辨率；只请求 CDN，不多访问源站",
     )
+    quality_concurrency: int = Field(2, ge=1, description="后台画质探测并发，不进行转码")
+    quality_pending: int = Field(32, ge=0, description="后台顺手探测画质的任务额度，0 不限制；达到额度时仍可稍后通过显式画质探测任务补全")
     health_rank: bool = Field(
         True,
         description="按播放连通性挑源：本服务测到不通、不稳、慢的播放站排到后面，同一档里再比画质、站点优先顺序。"
@@ -212,18 +219,33 @@ class Settings(BaseModel):
     health_samples: int = Field(1, ge=1, le=5, description="每轮每个播放站抽几部片检测（每部最多访问一次源站）")
     health_bytes: int = Field(512, ge=64, le=8192, description="每次检测下载多少（KB）来测速")
     health_slow_kbps: int = Field(1500, ge=0, le=100000, description="检测速度低于它（kbps）算慢；0 不按速度分档")
-    continuous_enabled: bool = Field(False, description="允许外部连续播放：服务端按需转码为固定 HLS，可在分片失败时换源，消耗 CPU 和缓存空间")
-    continuous_ffmpeg: str = Field("ffmpeg", description="连续播放使用的 FFmpeg 可执行文件")
-    continuous_ffprobe: str = Field("ffprobe", description="连续播放使用的 FFprobe 可执行文件")
-    continuous_height: int = Field(1080, ge=360, le=2160, description="连续播放统一输出高度上限；宽高统一为 16:9，不足部分补黑边")
-    continuous_workers: int = Field(2, ge=1, le=4, description="连续播放同时运行的转码进程数；修改后重启服务生效")
-    continuous_cache_mb: int = Field(128, ge=32, le=2048, description="连续播放磁盘分片缓存上限（MB）")
-    continuous_timeout: int = Field(45, ge=10, le=120, description="连续播放单个分片生成及换源总超时（秒）")
-    resolve_mode: Literal["auto", "redirect", "proxy", "continuous"] = Field(
+    play_remote: bool = Field(True, description="普通播放按外部客户端处理：受出口限制的直链自动原样中转；关闭仅适合同出口播放器。网关始终按外部客户端处理")
+    play_connections: int = Field(32, ge=1, description="播放解析连接额度，与后台任务独立；不限制用户数，保存后新请求生效")
+    background_connections: int = Field(32, ge=1, description="后台抓取连接额度")
+    hls_connections: int = Field(64, ge=1, description="HLS 分片、子清单和密钥中转连接额度；每个请求结束后释放")
+    file_connections: int = Field(64, ge=1, description="MP4 等文件原样中转连接额度，与 HLS 独立；传输结束后释放")
+    preflight_connections: int = Field(16, ge=1, description="起播预检连接额度，与视频传输独立")
+    speed_connections: int = Field(16, ge=1, description="影片线路测速的独立连接额度；同时覆盖线路解析、清单与媒体采样")
+    pool_wait_timeout: float = Field(30, ge=0, description="连接额度排队时限（秒），0 不单独限制；仍受请求总时限约束，拥塞不记为源故障")
+    relay_buffer_kb: int = Field(512, ge=64, description="每条媒体连接的缓冲上限（KiB），满时暂停上游；不限制用户下载速度")
+    playlist_cache_entries: int = Field(128, ge=0, description="播放清单缓存条数，0 关闭缓存；并发请求仍合并")
+    playlist_cache_seconds: float = Field(15, ge=0, description="播放清单缓存有效期（秒），0 不保留结果")
+    preflight_bytes: int = Field(32, ge=1, description="起播媒体预检采样大小（KiB）")
+    preflight_cache_entries: int = Field(512, ge=0, description="起播预检缓存条数，0 关闭缓存；同一地址的并发预检合并")
+    preflight_cache_seconds: float = Field(30, ge=0, description="成功预检缓存有效期（秒）")
+    preflight_failure_cooldown: float = Field(300, ge=0, description="媒体预检失败候选的冷却（秒），0 不启用；本服务排队拥塞不进入冷却")
+    source_failure_cooldown: int = Field(300, ge=0, description="源或线路连续失败的首次排序冷却（秒），连续失败翻倍；0 关闭，失败记录仍保留")
+    source_failure_cooldown_max: int = Field(21600, ge=0, description="源或线路排序冷却上限（秒），0 不限制上限")
+    play_session_entries: int = Field(2048, ge=0, description="播放会话内存缓存条数，0 不限制；被移出内存的有效会话仍可从数据库恢复")
+    play_session_hours: float = Field(8, gt=0, description="播放会话最低有效期（小时），实际至少覆盖影片时长再加一小时")
+    speed_test_bytes: int = Field(2048, ge=1, description="单线路测速媒体采样上限（KiB）；只读取有限媒体数据，不转码")
+    speed_test_timeout: float = Field(20, gt=0, description="每条线路测速的总时限（秒），包含解析、清单与下载；各线路并行执行")
+    resolve_mode: Literal["auto", "redirect", "strict_redirect", "proxy"] = Field(
         "auto",
         description="网关 resolve 默认给什么地址（网关请求里带 mode 时以它为准）：auto 按上面的偏好挑源，"
-                    "能直连给 CDN 地址、要中转给公网中转地址；redirect 只挑能直连的源；proxy 一律给公网中转地址",
+                    "能直连给 CDN 地址、要中转给中转地址；redirect 优先直连、失败可回退；strict_redirect 只直连且禁止中转回退；proxy 一律原样中转",
     )
+    resolve_relay_ttl: int = Field(21600, ge=0, description="网关中转地址缓存时长（秒），0 不缓存；绑定会话的地址还会按会话有效期缩短")
     resolve_timeout: int = Field(20, ge=5, le=120, description="播放解析与首份清单返回的总时限（秒），包含找源、排队和 CDN 请求；媒体传输另按停滞超时判断")
     resolve_attempt_timeout: int = Field(6, ge=1, le=120, description="每个源或线路单次尝试最多等待几秒；仍受播放总时限约束，给备用源保留机会")
     play_discover: bool = Field(
@@ -234,6 +256,16 @@ class Settings(BaseModel):
         description="网关 resolve 用的公网中转地址：挑中的源要中转（如 MissAV）、或直连的源都失败时，返回这个地址下的中转链接，"
                     "须能从外网访问（本服务的公网地址，或网关转发到本服务的地址）；留空则只给能直连的源，没有时返回 409",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_play_mode(cls, data):
+        if isinstance(data, dict):
+            data = dict(data)
+            for key in ("play_mode", "resolve_mode"):
+                if data.get(key) == "continuous":
+                    data[key] = "proxy"
+        return data
 
     @model_validator(mode="after")
     def _fill_sites(self) -> Settings:

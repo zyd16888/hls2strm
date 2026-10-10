@@ -5,6 +5,10 @@ class FetchError(Exception):
     """可重试的失败：网络错误、超时、5xx 等。"""
 
 
+class PoolBusy(FetchError):
+    """本服务连接额度排队超时，不代表上游源故障。"""
+
+
 class NotFound(Exception):
     """页面不存在（404），不再重试。"""
 

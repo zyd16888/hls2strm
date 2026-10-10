@@ -8,7 +8,8 @@ from collections import OrderedDict
 from urllib.parse import urljoin
 from curl_cffi import CurlError
 
-from .errors import FetchError, NotFound, ParseError
+from .errors import FetchError, NotFound, ParseError, PoolBusy
+from .cache import AsyncCache
 from .fetcher import close_stream
 from .quality import filter_master
 from .runtime import deadline, traffic
@@ -21,19 +22,38 @@ def candidate_key(resolved) -> tuple[int, int]:
 class PlaybackSelection:
     def __init__(self, resolver):
         self.resolver = resolver
-        self.checked = OrderedDict()
+        self.checked = AsyncCache(resolver.store.current.preflight_cache_entries)
         self.cooling = OrderedDict()
+        resolver.store.on_change(self._on_settings)
+
+    def _on_settings(self, old, new):
+        self.checked.capacity = new.preflight_cache_entries
+        self.checked.clear()
+        self.cooling.clear()
+
+    async def close(self):
+        await self.checked.close()
 
     async def probe(self, resolved, want=None):
         fetcher = self.resolver.fetcher
         headers = resolved.traits.headers
         cache_key = (resolved.url, tuple(sorted(headers.items())), want)
-        if self.checked.get(cache_key, 0) > time.monotonic():
-            return
+        cache_key += (fetcher.store.current.proxy, fetcher.store.current.impersonate) if hasattr(fetcher, "store") else ()
+        return await self.checked.get(cache_key, lambda: self._probe(resolved, want),
+                                      self.resolver.store.current.preflight_cache_seconds)
+
+    async def _probe(self, resolved, want):
+        fetcher = self.resolver.fetcher
+        headers = resolved.traits.headers
+        settings = self.resolver.store.current
         target = resolved.url
         if target.split("?", 1)[0].lower().endswith(".m3u8"):
             for _ in range(4):
-                body = (await getattr(fetcher, "get_playlist", fetcher.get_bytes)(target, headers=headers)).decode("utf-8", "replace")
+                if hasattr(fetcher, "get_playlist"):
+                    raw = await fetcher.get_playlist(target, headers=headers, timeout=settings.resolve_attempt_timeout)
+                else:
+                    raw = await asyncio.wait_for(fetcher.get_bytes(target, headers=headers), settings.resolve_attempt_timeout)
+                body = raw.decode("utf-8", "replace")
                 if not body.lstrip().startswith("#EXTM3U"):
                     raise FetchError("CDN 没有返回有效的 HLS 清单")
                 if "#EXT-X-STREAM-INF" in body:
@@ -50,8 +70,9 @@ class PlaybackSelection:
                 break
             else:
                 raise FetchError("播放清单嵌套过深")
-        session = getattr(fetcher, "media_session", fetcher.session)
-        response = await session.get(target, stream=True, headers={**headers, "Range": "bytes=0-32767"},
+        session = getattr(fetcher, "preflight_session", getattr(fetcher, "media_session", fetcher.session))
+        nbytes = settings.preflight_bytes * 1024
+        response = await session.get(target, stream=True, headers={**headers, "Range": f"bytes=0-{nbytes-1}"},
                                      timeout=self.resolver.store.current.resolve_attempt_timeout)
         try:
             if response.status_code not in (200, 206):
@@ -60,18 +81,15 @@ class PlaybackSelection:
             if "text/html" in kind or "application/json" in kind:
                 raise FetchError("CDN 返回错误页面而非媒体")
             got = 0
-            async for chunk in response.aiter_content():
-                got += len(chunk)
-                if got >= 32768:
-                    break
+            async with asyncio.timeout(settings.resolve_attempt_timeout):
+                async for chunk in response.aiter_content():
+                    got += len(chunk)
+                    if got >= nbytes:
+                        break
             if not got:
                 raise FetchError("媒体预检返回空内容")
         finally:
             await close_stream(response)
-        self.checked[cache_key] = time.monotonic() + 30
-        self.checked.move_to_end(cache_key)
-        while len(self.checked) > 512:
-            self.checked.popitem(last=False)
 
     async def choose(self, slug: str, *, excluded=frozenset(), **options):
         resolver = self.resolver
@@ -98,16 +116,18 @@ class PlaybackSelection:
                         raise
                     key = candidate_key(resolved)
                     try:
-                        await asyncio.wait_for(self.probe(resolved, options.get("want")),
-                                               resolver.store.current.resolve_attempt_timeout)
+                        await self.probe(resolved, options.get("want"))
+                    except PoolBusy:
+                        resolver.metrics.inc("play_preflight_busy")
+                        raise
                     except (FetchError, NotFound, ParseError, TimeoutError, OSError, CurlError) as error:
                         message = str(error) or "媒体预检超时"
                         failures.append(f"{resolved.site.label} {resolved.line['line'] if resolved.line else ''}：{message}")
                         blocked.add(key)
                         cooling.discard(key)
-                        self.cooling[key] = time.monotonic() + 300
+                        self.cooling[key] = time.monotonic() + resolver.store.current.preflight_failure_cooldown
                         self.cooling.move_to_end(key)
-                        while len(self.cooling) > 512:
+                        while len(self.cooling) > resolver.store.current.preflight_cache_entries:
                             self.cooling.popitem(last=False)
                         if resolved.line:
                             await resolver.db.line_failed(resolved.line["id"], message)

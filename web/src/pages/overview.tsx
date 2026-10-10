@@ -247,14 +247,14 @@ export default function Overview() {
 function RequestTimings({ s }: { s: Status }) {
   const labels: Record<string, string> = {
     "play.resolve": "播放选源与刷新", "play.refresh_wait": "同源刷新排队", "play.playlist": "播放清单", "pool.play.wait": "播放连接排队",
-    "pool.media.wait": "中转连接排队", "upstream.play": "源站响应", "relay.ttfb": "中转首字节",
+    "pool.hls.wait": "HLS 连接排队", "pool.file.wait": "文件连接排队", "pool.preflight.wait": "预检连接排队", "pool.speed.wait": "测速连接排队", "upstream.play": "源站响应", "relay.ttfb": "中转首字节",
     "db.read": "数据读取", "db.bulk": "列表与统计查询", "task.output": "文件输出",
   };
   const rows = Object.entries(s.metrics.timings ?? {}).filter(([key]) => labels[key]);
   const gauges = s.metrics.gauges ?? {};
   return <Panel title="请求耗时">
     <p className="mb-2 text-xs text-muted">最近 15 分钟的服务端样本；302 后播放器的首帧时间由客户端网络决定。</p>
-    <p className="mb-3 text-xs text-muted">活动中转 {gauges.http_active_media ?? 0} · 缓冲 {((gauges.relay_buffer_bytes ?? 0)/1024).toFixed(0)} KB · 上游断流 {s.metrics.counters.relay_aborted ?? 0} · 日志缺口 {s.metrics.log_dropped ?? 0}</p>
+    <p className="mb-3 text-xs leading-relaxed text-muted">HLS 活动 {gauges.http_active_hls ?? 0} / 等待 {gauges.http_waiting_hls ?? 0} · 文件活动 {gauges.http_active_file ?? 0} / 等待 {gauges.http_waiting_file ?? 0} · 预检活动 {gauges.http_active_preflight ?? 0} / 等待 {gauges.http_waiting_preflight ?? 0} · 缓冲 {((gauges.relay_buffer_bytes ?? 0)/1024).toFixed(0)} KiB · 上游断流 {s.metrics.counters.relay_aborted ?? 0} · 日志缺口 {s.metrics.log_dropped ?? 0}</p>
     <Table><thead><tr><Th>阶段</Th><Th>样本</Th><Th>P50</Th><Th>P95</Th><Th>最大</Th></tr></thead><tbody>
       {rows.length ? rows.map(([key, v]) => <tr key={key}><Td>{labels[key]}</Td><Td>{v.count}</Td><Td>{v.p50_ms}ms</Td><Td>{v.p95_ms}ms</Td><Td>{v.max_ms}ms</Td></tr>) : <tr><Td colSpan={5}>还没有请求样本</Td></tr>}
     </tbody></Table>

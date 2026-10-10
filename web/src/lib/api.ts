@@ -41,7 +41,46 @@ export const api = {
   post: <T = { ok: boolean }>(url: string, body: unknown = {}) => req<T>("POST", url, body),
   put: <T = { ok: boolean }>(url: string, body: unknown) => req<T>("PUT", url, body),
   del: <T = { ok: boolean }>(url: string) => req<T>("DELETE", url),
+  stream: async <T>(url: string, body: unknown, signal: AbortSignal, onItem: (item: T) => void) => {
+    const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal });
+    if (!response.ok) {
+      if (response.status === 401) onUnauthorized();
+      const error = await response.json().catch(() => null);
+      throw new ApiError(error?.detail || `HTTP ${response.status}`, response.status);
+    }
+    if (!response.body) throw new Error("没有收到测速结果");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let pending = "";
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        pending += decoder.decode(value, { stream: !done });
+        const lines = pending.split("\n");
+        pending = lines.pop() ?? "";
+        lines.filter(Boolean).forEach(line => onItem(JSON.parse(line) as T));
+        if (done) {
+          if (pending.trim()) onItem(JSON.parse(pending) as T);
+          break;
+        }
+      }
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+  },
 };
+
+export interface LineSpeedResult {
+  key: string; source_id: number; line_id: number; site: string; label: string; line: string; enabled: boolean;
+  status: "waiting" | "ok" | "failed" | "timeout" | "busy" | "skipped" | "cancelled";
+  error: string; host?: string; mode?: string; media_type?: string; height?: number;
+  http_status?: number; resolve_ms?: number; manifest_ms?: number; ttfb_ms?: number;
+  download_ms?: number; total_ms?: number; queue_ms?: number; sample_bytes?: number; mbps?: number; sample_limited?: boolean;
+}
+
+export type LineSpeedEvent = { event: "start"; items: LineSpeedResult[]; sample_kb: number }
+  | { event: "result"; item: LineSpeedResult } | { event: "done" };
 
 /** 查询参数：数组按重复键展开（has_site=a&has_site=b），空值省略。 */
 export function qs(params: Record<string, string | number | boolean | string[] | null | undefined>): string {
@@ -58,6 +97,9 @@ export function qs(params: Record<string, string | number | boolean | string[] |
 // ---- 状态 ----
 
 export interface Domain {
+  in_flight: number;
+  response_ms: number | null;
+  error_cooling: number;
   base: string;
   host: string;
   cooldown_until: number;
@@ -72,6 +114,7 @@ export interface Domain {
 }
 
 export interface SiteStatus {
+  domain_mode: "priority" | "round_robin" | "balanced";
   name: string;
   label: string;
   enabled: boolean;
@@ -442,6 +485,9 @@ export interface LineConfig {
 }
 
 export interface SiteConfig {
+  domain_mode: "priority" | "round_robin" | "balanced";
+  domain_error_cooldown: number;
+  play_concurrency: number;
   enabled: boolean;
   domains: string[];
   rate_per_sec: number;
