@@ -145,6 +145,9 @@ export interface Subscription {
   library_name: string;
   detail: number;
   interval: number;
+  cron: string | null;
+  timezone: string;
+  next_run_at: number | null;
   stop_after_known: number;
   max_pages: number;
   enabled: number;

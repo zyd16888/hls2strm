@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .db import now
 from .rules import normalize_rule
 from .sites import SITES, get_site
+from .subscription_schedule import ScheduleFields, has_schedule, next_cron_at
 
 
 class TransferModel(BaseModel):
@@ -43,7 +44,7 @@ class LibraryConfig(TransferModel):
         return normalize_rule(rule)
 
 
-class SubscriptionConfig(TransferModel):
+class SubscriptionConfig(TransferModel, ScheduleFields):
     name: str = Field(min_length=1, max_length=200)
     site: str
     source: str
@@ -72,7 +73,8 @@ class ImportRequest(TransferModel):
 
 
 LIB_FIELDS = ("name", "dir", "external_dir", "path_template", "versions", "rule", "sources", "excludes")
-SUB_FIELDS = ("name", "site", "source", "sort", "library_id", "detail", "interval", "stop_after_known", "max_pages")
+SUB_FIELDS = ("name", "site", "source", "sort", "library_id", "detail", "interval", "cron", "timezone",
+              "stop_after_known", "max_pages")
 
 
 async def export_config(db) -> dict:
@@ -179,12 +181,18 @@ async def preview_config(engine, request: ImportRequest) -> dict:
             enabled = sub.enabled and request.activate_subscriptions
         fields["enabled"] = enabled
         sub_plans.append({**fields, "library_key": sub.library, "library_name": view.libs[lid]["name"],
-                          "action": "reuse" if matches else "create", "initial_full": sub.initial_full})
+                          "action": "reuse" if matches else "create", "initial_full": sub.initial_full,
+                          "scheduled_at": next_cron_at(sub.cron, sub.timezone, now()) if sub.cron else None})
         if not engine.store.current.site(site.name).enabled:
             warnings.append(f"{site.label} 当前未启用，运行订阅前需在设置页启用站点。")
         if enabled and not matches:
-            warnings.append(f"订阅「{name}」确认后启用；" + (
-                "需手动执行首轮全量，完成后定时增量。" if sub.initial_full else "调度器可能立即执行增量。"))
+            if not has_schedule(fields):
+                advice = "仅手动运行。"
+            elif sub.initial_full:
+                advice = "需手动执行首轮全量，完成后定时增量。"
+            else:
+                advice = "将按 cron 定时执行增量。" if sub.cron else "调度器可能立即执行增量。"
+            warnings.append(f"订阅「{name}」确认后启用；{advice}")
     external = [lib for lib in view.libs.values() if lib["external_dir"]]
     if len(external) > 1:
         exclusive = all(a["id"] in b["excludes"] or b["id"] in a["excludes"]

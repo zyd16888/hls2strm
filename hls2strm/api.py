@@ -29,6 +29,7 @@ from .health import host_key
 from .observability import get_level, ring, set_level
 from .parser import ParseError, VideoGone
 from .rules import describe_rule
+from .subscription_schedule import ScheduleFields, next_cron_at
 from .sites import SITES, get_site
 
 log = logging.getLogger(__name__)
@@ -609,14 +610,13 @@ async def delete_library(lib_id: int, request: Request, delete_files: bool = Fal
 # ---- 订阅 ----
 
 
-class SubscriptionBody(BaseModel):
+class SubscriptionBody(ScheduleFields):
     name: str
     site: str = "jable"
     source: str
     sort: str = ""
     library_id: int = DEFAULT_LIBRARY_ID
     detail: bool = True
-    interval: int = Field(60, ge=0)
     stop_after_known: int = Field(48, ge=1)
     max_pages: int = Field(20, ge=1)
     enabled: bool = True
@@ -637,6 +637,8 @@ def _subscription_fields(c, body: SubscriptionBody) -> dict:
         "library_id": body.library_id,
         "detail": int(body.detail),
         "interval": body.interval,
+        "cron": body.cron,
+        "timezone": body.timezone,
         "stop_after_known": body.stop_after_known,
         "max_pages": body.max_pages,
         "enabled": int(body.enabled),
@@ -646,6 +648,12 @@ def _subscription_fields(c, body: SubscriptionBody) -> dict:
 @router.get("/subscriptions")
 async def list_subscriptions(request: Request):
     return await _ctx(request).db.list_subscriptions()
+
+
+@router.post("/subscriptions/schedule-preview")
+async def preview_subscription_schedule(body: ScheduleFields):
+    return {"cron": body.cron, "timezone": body.timezone,
+            "next_run_at": next_cron_at(body.cron, body.timezone, time.time()) if body.cron else None}
 
 
 @router.post("/subscriptions")

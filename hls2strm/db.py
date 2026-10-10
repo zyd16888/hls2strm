@@ -23,6 +23,7 @@ from .queries import FACET_FIELDS, VIDEO_SORTS, VideoQuery  # API 和旧调用�
 from .cache import AsyncCache
 from .database_indexes import migrate_v12 as _migrate_v12
 from .job_history import JobHistory, migrate_v13 as _migrate_v13
+from .subscription_schedule import migrate_v14 as _migrate_v14, next_run_at
 from .runtime import stage
 from .quality import TRUST, Quality, parse_heights
 from .sites import SourceDetail, SourceItem
@@ -328,7 +329,7 @@ async def _migrate_v11(conn: aiosqlite.Connection) -> None:
 
 
 MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
-              _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11, _migrate_v12, _migrate_v13]
+              _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11, _migrate_v12, _migrate_v13, _migrate_v14]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")
@@ -401,6 +402,7 @@ class Database:
         self._transaction_owner = None
         self.cache = AsyncCache()
         self.metrics = None
+        self.subscription_schedule_started_at = 0
         self._lock = asyncio.Lock()
 
     async def open(self) -> None:
@@ -1329,7 +1331,9 @@ class Database:
                          AND json_extract(j.params,'$.subscription_id')=s.id ORDER BY j.id DESC LIMIT 1) AS listing_job_id
                FROM subscriptions s LEFT JOIN libraries l ON l.id=s.library_id ORDER BY s.id"""
         )
-        return [dict(r) for r in rows]
+        current = now()
+        return [{**dict(r), "next_run_at": next_run_at(dict(r), current,
+                 self.subscription_schedule_started_at)} for r in rows]
 
     async def get_subscription(self, sub_id: int) -> dict | None:
         row = await self._one("SELECT * FROM subscriptions WHERE id=?", (sub_id,))
@@ -1343,6 +1347,11 @@ class Database:
         return cur.lastrowid
 
     async def update_subscription(self, sub_id: int, **fields) -> None:
+        schedule_fields = {"cron", "timezone", "enabled", "initialized"} & fields.keys()
+        if schedule_fields:
+            old = await self.get_subscription(sub_id)
+            if old and any(old[k] != fields[k] for k in schedule_fields):
+                fields["schedule_updated_at"] = now()
         await self._update("subscriptions", sub_id, fields)
 
     async def delete_subscription(self, sub_id: int) -> None:

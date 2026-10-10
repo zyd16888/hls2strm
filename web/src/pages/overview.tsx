@@ -3,6 +3,7 @@ import { useState } from "react";
 import { ErrorText } from "@/components/common";
 import { LogLines } from "@/components/log-lines";
 import { siteSignal } from "@/components/site-signals";
+import { nextSubscriptionTime } from "@/components/subscription-schedule";
 import { Button } from "@/components/ui/button";
 import { Chip, Dot, EmptyRow, KV, Mono, Notice, Panel, Table, Td, Th, type Tone } from "@/components/ui/data";
 import { rewriteAll, runSubscription, verifyLibrary } from "@/lib/actions";
@@ -19,7 +20,7 @@ export function subState(sub: Subscription): { text: string; tone: "warn" | "neu
   if (sub.active_job_id) return { text: "补充元数据", tone: "neutral" };
   if (!sub.enabled) return { text: "已停用", tone: "neutral" };
   if (!sub.initialized) return { text: "未跑首轮全量", tone: "neutral" };
-  return { text: sub.interval ? "定时增量" : "仅手动", tone: "ok" };
+  return { text: (sub.cron ?? sub.interval) ? "定时增量" : "仅手动", tone: "ok" };
 }
 
 export default function Overview() {
@@ -137,6 +138,7 @@ export default function Overview() {
                 <Th>输出库</Th>
                 <Th>状态</Th>
                 <Th>上次运行</Th>
+                <Th>下次执行时间</Th>
                 <Th />
               </tr>
             </thead>
@@ -156,6 +158,10 @@ export default function Overview() {
                       <Chip tone={st.tone}>{st.text}</Chip>
                     </Td>
                     <Td className="whitespace-nowrap text-[13px] text-muted">{sub.last_run_at ? fmtTime(sub.last_run_at) : "-"}</Td>
+                    <Td className="whitespace-nowrap text-[13px] text-muted">
+                      {nextSubscriptionTime(sub)}
+                      {!!sub.cron && <div className="text-xs">{sub.timezone}</div>}
+                    </Td>
                     <Td className="text-right">
                       {!sub.listing_job_id &&
                         (sub.initialized ? (
@@ -171,7 +177,7 @@ export default function Overview() {
                   </tr>
                 );
               })}
-              {s.subscriptions.length === 0 && <EmptyRow cols={5}>还没有订阅。到「输出库与订阅」新建一个，按周期自动跟进站点更新。</EmptyRow>}
+              {s.subscriptions.length === 0 && <EmptyRow cols={6}>还没有订阅。到「输出库与订阅」新建一个，用 cron 自动跟进站点更新。</EmptyRow>}
             </tbody>
           </Table>
           <div className="mt-4 flex flex-wrap gap-2">

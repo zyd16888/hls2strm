@@ -8,6 +8,14 @@ export function pct(a: number | null | undefined, b: number | null | undefined):
 
 const p2 = (x: number) => String(x).padStart(2, "0");
 
+/** cron 时间按订阅时区显示，不随浏览器时区改变。 */
+export function fmtScheduledTime(ts: number, timezone: string): string {
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).format(new Date(ts * 1000));
+}
+
 /** 'MM-DD HH:MM:SS'；跨年时带年份。 */
 export function fmtTime(ts: number | null | undefined): string {
   if (!ts) return "";

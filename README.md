@@ -133,7 +133,7 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 
 - **输出库**：一个名称加一个目录。目录可以写相对输出根目录的路径，也可以写绝对路径；还可以单独设置路径模板。库目录之间不能互相嵌套。默认库叫「全部」，目录是 `全部`。
 - 同一部影片可以同时出现在多个库里。nfo 每个库各写一份；封面在同一文件系统下用硬链接，不额外占空间。
-- **订阅**：列表来源 + 输出库 + 周期。第一次跑「首轮全量」，翻完全部页；之后按周期增量。新建时不勾「首轮全量」，就只跟进以后的更新。
+- **订阅**：列表来源 + 输出库 + cron / 时区。第一次跑「首轮全量」，翻完全部页；之后按五段 cron 增量。页面显示下次执行时间，默认时区 `Asia/Shanghai`，cron 留空仅手动。新建时不勾「首轮全量」，就只跟进以后的更新；旧分钟周期仍兼容，编辑保存时切换为 cron。推荐配置及错峰安排见 [MDCNG 配置说明](docs/mdcng-configuration.md)。
 - 例子：新建库「中文字幕」（目录 `中文字幕`），再新建订阅，来源填 `/categories/chinese-subtitle/`，输出库选「中文字幕」。
 - 修改库的目录或模板时，会自动排一个重写任务，把已有文件搬到新位置。删除库时可以选择是否连同文件一起删除。
 - **规则库**：给库设置规则后，影片会按条件自动归入，不需要单独的订阅。可用条件有分类、标签、女优、画质、关键词；组内多个值满足任一即可，各组之间可选"满足任一组"或"每组都满足"。
@@ -413,6 +413,7 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 | GET / POST / PUT / DELETE | `/api/subscriptions`、`/api/subscriptions/{id}` | 订阅 |
 | POST | `/api/subscriptions/{id}/run?mode=auto\|full\|incremental` | 立即运行订阅 |
 | POST | `/api/subscriptions/{id}/initialized` | 标记首轮已完成（不跑首轮全量，直接定时增量） |
+| POST | `/api/subscriptions/schedule-preview` | 校验 `{cron, timezone}` 并返回下次计划时间；不保存、不抓取 |
 | POST | `/api/videos/{slug}/refresh` | 立即重抓每个源的详情 |
 | POST | `/api/videos/{slug}/probe` | 到还没有源的站点按番号找一次 |
 | GET / PUT | `/api/settings` | 读取或修改设置（PUT 只需要传改动的字段） |

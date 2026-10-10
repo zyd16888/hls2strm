@@ -1,13 +1,13 @@
 {
   "format": "hls2strm-library-config",
   "version": 1,
-  "description": "五库互斥：中文字幕 > FC2 > 无码破解与流出 > 原生无码 > 其他。按站点明确分类归库，不依赖 -C 后缀；未区分原生/破解的 Jable 无码总类先进入其他候选，再由明确分类排除。先完成前四库分类，再运行其他，首次归并完成后才启动 MDCNG。全部订阅停用；路径相对输出根。详见 mdcng-configuration.md。",
+  "description": "五库互斥：中文字幕 > FC2 > 无码破解与流出 > 原生无码 > 其他。目录兼容既有 /strm 与 /mnt/hls2strm_matched 布局；uncensored 为原生无码，decensored 为破解/流出，asia 为其他。收件目录相对输出根（通常 /strm）；整理目录为容器内绝对路径，必须挂载可读。全部订阅停用；Asia/Shanghai 每天一次，站点分时段、同站订阅间隔 20 分钟。先分类再其他，首轮完成后启用定时。详见 mdcng-configuration.md。",
   "libraries": [
     {
       "key": "chinese",
       "name": "中文字幕",
-      "dir": "mdcng-inbox/中文字幕",
-      "external_dir": "mdcng-library/中文字幕",
+      "dir": "chinese-subtitle",
+      "external_dir": "/mnt/hls2strm_matched/chinese_subtitle",
       "path_template": "{slug}/{slug}",
       "versions": "",
       "rule": null,
@@ -17,8 +17,8 @@
     {
       "key": "fc2",
       "name": "FC2",
-      "dir": "mdcng-inbox/FC2",
-      "external_dir": "mdcng-library/FC2",
+      "dir": "fc2",
+      "external_dir": "/mnt/hls2strm_matched/fc2",
       "path_template": "{slug}/{slug}",
       "versions": "",
       "rule": null,
@@ -30,8 +30,8 @@
     {
       "key": "decensored",
       "name": "无码破解与流出",
-      "dir": "mdcng-inbox/无码破解与流出",
-      "external_dir": "mdcng-library/无码破解与流出",
+      "dir": "decensored",
+      "external_dir": "/mnt/hls2strm_matched/decensored",
       "path_template": "{slug}/{slug}",
       "versions": "",
       "rule": null,
@@ -44,8 +44,8 @@
     {
       "key": "native_uncensored",
       "name": "原生无码",
-      "dir": "mdcng-inbox/原生无码",
-      "external_dir": "mdcng-library/原生无码",
+      "dir": "uncensored",
+      "external_dir": "/mnt/hls2strm_matched/uncensored",
       "path_template": "{slug}/{slug}",
       "versions": "",
       "rule": null,
@@ -59,8 +59,8 @@
     {
       "key": "other",
       "name": "其他",
-      "dir": "mdcng-inbox/其他",
-      "external_dir": "mdcng-library/其他",
+      "dir": "asia",
+      "external_dir": "/mnt/hls2strm_matched/asia",
       "path_template": "{slug}/{slug}",
       "versions": "",
       "rule": null,
@@ -81,11 +81,12 @@
       "sort": "post_date",
       "library": "chinese",
       "detail": false,
-      "interval": 120,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "10 0 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "中字 · MissAV",
@@ -94,11 +95,12 @@
       "sort": "published_at",
       "library": "chinese",
       "detail": false,
-      "interval": 120,
       "stop_after_known": 96,
       "max_pages": 60,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "10 2 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "中字 · SupJav",
@@ -107,11 +109,12 @@
       "sort": "",
       "library": "chinese",
       "detail": false,
-      "interval": 120,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "10 8 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "FC2 · Jable 搜索",
@@ -120,11 +123,12 @@
       "sort": "post_date",
       "library": "fc2",
       "detail": false,
-      "interval": 180,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "30 0 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "FC2 · MissAV",
@@ -133,11 +137,12 @@
       "sort": "published_at",
       "library": "fc2",
       "detail": false,
-      "interval": 180,
       "stop_after_known": 96,
       "max_pages": 60,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "30 2 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "FC2 · SupJav 搜索",
@@ -146,11 +151,12 @@
       "sort": "",
       "library": "fc2",
       "detail": false,
-      "interval": 180,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "30 8 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "FC2 · JavGuru",
@@ -159,11 +165,12 @@
       "sort": "",
       "library": "fc2",
       "detail": false,
-      "interval": 180,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "10 11 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "FC2 · JAVMost",
@@ -172,11 +179,12 @@
       "sort": "",
       "library": "fc2",
       "detail": false,
-      "interval": 180,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "10 13 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "FC2 · 123AV",
@@ -185,11 +193,12 @@
       "sort": "recent",
       "library": "fc2",
       "detail": false,
-      "interval": 180,
       "stop_after_known": 96,
       "max_pages": 60,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "10 15 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "破解与流出 · MissAV 流出",
@@ -198,11 +207,12 @@
       "sort": "published_at",
       "library": "decensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 60,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "50 2 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "破解与流出 · SupJav 破解",
@@ -211,11 +221,12 @@
       "sort": "",
       "library": "decensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "50 8 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "破解与流出 · JavGuru 破解",
@@ -224,11 +235,12 @@
       "sort": "",
       "library": "decensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "30 11 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "破解与流出 · JAVMost 破解",
@@ -237,11 +249,12 @@
       "sort": "",
       "library": "decensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "30 13 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "破解与流出 · 123AV 流出",
@@ -250,11 +263,12 @@
       "sort": "recent",
       "library": "decensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 60,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "30 15 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "原生无码 · MissAV HEYZO",
@@ -263,11 +277,12 @@
       "sort": "published_at",
       "library": "native_uncensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "10 3 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "原生无码 · MissAV 东京热",
@@ -276,11 +291,12 @@
       "sort": "published_at",
       "library": "native_uncensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "30 3 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "原生无码 · MissAV 一本道",
@@ -289,11 +305,12 @@
       "sort": "published_at",
       "library": "native_uncensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "50 3 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "原生无码 · MissAV Caribbeancom",
@@ -302,11 +319,12 @@
       "sort": "published_at",
       "library": "native_uncensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "10 4 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "原生无码 · MissAV Caribbeancompr",
@@ -315,11 +333,12 @@
       "sort": "published_at",
       "library": "native_uncensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "30 4 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "原生无码 · MissAV 10musume",
@@ -328,11 +347,12 @@
       "sort": "published_at",
       "library": "native_uncensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "50 4 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "原生无码 · MissAV pacopacomama",
@@ -341,11 +361,12 @@
       "sort": "published_at",
       "library": "native_uncensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "10 5 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "原生无码 · MissAV Gachinco",
@@ -354,11 +375,12 @@
       "sort": "published_at",
       "library": "native_uncensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "30 5 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "原生无码 · MissAV XXX-AV",
@@ -367,11 +389,12 @@
       "sort": "published_at",
       "library": "native_uncensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "50 5 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "原生无码 · MissAV 人妻斩",
@@ -380,11 +403,12 @@
       "sort": "published_at",
       "library": "native_uncensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "10 6 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "原生无码 · SupJav 原生",
@@ -393,11 +417,12 @@
       "sort": "",
       "library": "native_uncensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "10 9 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "原生无码 · JAVMost 原生",
@@ -406,11 +431,12 @@
       "sort": "",
       "library": "native_uncensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "50 13 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "原生无码 · 123AV 原生",
@@ -419,11 +445,12 @@
       "sort": "recent",
       "library": "native_uncensored",
       "detail": false,
-      "interval": 240,
       "stop_after_known": 96,
       "max_pages": 60,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "50 15 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "其他 · Jable 未细分无码",
@@ -432,11 +459,12 @@
       "sort": "post_date",
       "library": "other",
       "detail": false,
-      "interval": 360,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "50 0 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "其他 · Jable 最新",
@@ -445,11 +473,12 @@
       "sort": "post_date",
       "library": "other",
       "detail": false,
-      "interval": 360,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "10 1 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "其他 · MissAV 最新",
@@ -458,11 +487,12 @@
       "sort": "published_at",
       "library": "other",
       "detail": false,
-      "interval": 360,
       "stop_after_known": 96,
       "max_pages": 60,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "30 6 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "其他 · SupJav 有码",
@@ -471,11 +501,12 @@
       "sort": "",
       "library": "other",
       "detail": false,
-      "interval": 360,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "30 9 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "其他 · SupJav 英文字幕",
@@ -484,11 +515,12 @@
       "sort": "",
       "library": "other",
       "detail": false,
-      "interval": 360,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "50 9 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "其他 · SupJav 素人",
@@ -497,11 +529,12 @@
       "sort": "",
       "library": "other",
       "detail": false,
-      "interval": 360,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "10 10 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "其他 · JavGuru 最新",
@@ -510,11 +543,12 @@
       "sort": "",
       "library": "other",
       "detail": false,
-      "interval": 360,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "50 11 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "其他 · JAVMost 最新",
@@ -523,11 +557,12 @@
       "sort": "",
       "library": "other",
       "detail": false,
-      "interval": 360,
       "stop_after_known": 96,
       "max_pages": 40,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "10 14 * * *",
+      "timezone": "Asia/Shanghai"
     },
     {
       "name": "其他 · 123AV 最近添加",
@@ -536,11 +571,12 @@
       "sort": "recent",
       "library": "other",
       "detail": false,
-      "interval": 360,
       "stop_after_known": 96,
       "max_pages": 60,
       "enabled": false,
-      "initial_full": true
+      "initial_full": true,
+      "cron": "10 16 * * *",
+      "timezone": "Asia/Shanghai"
     }
   ]
 }

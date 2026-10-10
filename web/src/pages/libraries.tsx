@@ -3,6 +3,7 @@ import { MoreHorizontal, Pencil, Plus } from "lucide-react";
 import { useState } from "react";
 import { ask, confirm } from "@/components/confirm";
 import { ConfigTransfer } from "@/components/config-transfer";
+import { nextSubscriptionTime, SubscriptionSchedule } from "@/components/subscription-schedule";
 import { Button } from "@/components/ui/button";
 import { Chip, EmptyRow, Help, Mono, Panel, Table, Td, Th } from "@/components/ui/data";
 import { Check, Field, Input, Segmented, Select, Switch } from "@/components/ui/form";
@@ -367,10 +368,11 @@ function SubscriptionsPanel() {
           <tr>
             <Th>名称 / 来源</Th>
             <Th>输出库</Th>
-            <Th>周期</Th>
+            <Th>Cron / 时区</Th>
             <Th>增量规则</Th>
             <Th>状态</Th>
             <Th>上次运行</Th>
+            <Th>下次执行时间</Th>
             <Th />
           </tr>
         </thead>
@@ -388,7 +390,11 @@ function SubscriptionsPanel() {
                   </div>
                 </Td>
                 <Td className="text-[13px]">{sub.library_name}</Td>
-                <Td className="whitespace-nowrap text-[13px]">{sub.interval ? `每 ${sub.interval} 分钟` : "手动"}</Td>
+                <Td className="whitespace-nowrap text-[13px]">
+                  <Mono>{sub.cron ?? (sub.interval ? `每 ${sub.interval} 分钟（旧配置）` : "仅手动")}</Mono>
+                  {sub.cron === "" && "仅手动"}
+                  {!!sub.cron && <div className="text-xs text-muted">{sub.timezone}</div>}
+                </Td>
                 <Td className="text-[13px] text-muted">
                   连续 {sub.stop_after_known} 部已在库就停，最多 {sub.max_pages} 页{sub.detail ? "" : "，不抓详情"}
                 </Td>
@@ -401,6 +407,7 @@ function SubscriptionsPanel() {
                   )}
                 </Td>
                 <Td className="whitespace-nowrap text-[13px] text-muted">{sub.last_run_at ? fmtTime(sub.last_run_at) : "-"}</Td>
+                <Td className="whitespace-nowrap text-[13px] text-muted">{nextSubscriptionTime(sub)}</Td>
                 <Td className="whitespace-nowrap text-right">
                   {!sub.listing_job_id &&
                     (sub.initialized ? (
@@ -447,11 +454,11 @@ function SubscriptionsPanel() {
               </tr>
             );
           })}
-          {subs.length === 0 && <EmptyRow cols={7}>还没有订阅。新建一个，按周期自动跟进站点上的更新。</EmptyRow>}
+          {subs.length === 0 && <EmptyRow cols={8}>还没有订阅。新建一个，用 cron 自动跟进站点上的更新。</EmptyRow>}
         </tbody>
       </Table>
       <p className="py-3 text-[13px] text-muted">
-        首轮全量会翻完来源的全部页；之后按周期增量：从第 1 页往后翻，连续遇到这么多部已在该库里的影片就停。不勾「首轮全量」只跟进以后的更新。
+        首轮全量会翻完来源的全部页；之后按 cron 增量：从第 1 页往后翻，连续遇到这么多部已在该库里的影片就停。不勾「首轮全量」只跟进以后的更新。下次执行时间按订阅时区显示；停机期间的 cron 不补跑。
       </p>
       <Dialog open={!!editing} onOpenChange={o => !o && setEditing(null)}>
         {editing && <SubscriptionForm sub={editing === "new" ? null : editing} onDone={() => setEditing(null)} />}
@@ -464,13 +471,15 @@ function SubscriptionForm({ sub, onDone }: { sub: Subscription | null; onDone: (
   const meta = useMeta();
   const { data: libs = [] } = useLibraries();
   const run = useRun();
+  const [scheduleValid, setScheduleValid] = useState(false);
   const [f, setF] = useState({
     name: sub?.name ?? "",
     site: sub?.site ?? "jable",
     source: sub?.source ?? "",
     sort: sub?.sort ?? meta.site("jable").default_sort,
     library_id: sub?.library_id ?? 1,
-    interval: sub?.interval ?? 60,
+    cron: sub?.cron ?? (sub?.interval === 0 ? "" : "0 3 * * *"),
+    timezone: sub?.timezone ?? "Asia/Shanghai",
     stop_after_known: sub?.stop_after_known ?? 48,
     max_pages: sub?.max_pages ?? 20,
     detail: sub ? !!sub.detail : true,
@@ -492,7 +501,7 @@ function SubscriptionForm({ sub, onDone }: { sub: Subscription | null; onDone: (
       footer={
         <>
           <Button onClick={onDone}>取消</Button>
-          <Button variant="primary" onClick={save} disabled={!f.name.trim() || !f.source.trim()}>
+          <Button variant="primary" onClick={save} disabled={!f.name.trim() || !f.source.trim() || !scheduleValid}>
             {sub ? "保存" : "新建"}
           </Button>
         </>
@@ -539,9 +548,11 @@ function SubscriptionForm({ sub, onDone }: { sub: Subscription | null; onDone: (
             ))}
           </datalist>
         </Field>
-        <Field label="周期（分钟，0 = 只手动）">
-          <Input type="number" min={0} value={f.interval} onChange={e => setF({ ...f, interval: Number(e.target.value) })} />
-        </Field>
+        {sub?.cron === null && sub.interval > 0 && <p className="text-xs text-muted sm:col-span-2">
+          当前使用旧周期：每 {sub.interval} 分钟。保存后切换为下方 cron，请先确认执行时间。
+        </p>}
+        <SubscriptionSchedule cron={f.cron} timezone={f.timezone} onValidity={setScheduleValid}
+          onChange={(cron, timezone) => { setScheduleValid(false); setF({ ...f, cron, timezone }); }} />
         <Field label="连续多少部已在库就停">
           <Input type="number" min={1} value={f.stop_after_known} onChange={e => setF({ ...f, stop_after_known: Number(e.target.value) })} />
         </Field>

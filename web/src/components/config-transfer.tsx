@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Field, Check, Textarea } from "@/components/ui/form";
 import { Dialog, DialogContent } from "@/components/ui/overlay";
 import { api } from "@/lib/api";
+import { fmtScheduledTime } from "@/lib/format";
 import { useRun } from "@/lib/queries";
 
 interface Preview {
@@ -11,6 +12,7 @@ interface Preview {
   libraries: { key: string; name: string; root: string; external_root: string; action: "create" | "reuse";
     source_names: string[]; exclude_names: string[] }[];
   subscriptions: { name: string; site: string; source: string; library_name: string; interval: number;
+    cron: string | null; timezone: string; scheduled_at: number | null;
     enabled: boolean; detail: boolean; initial_full: boolean; action: "create" | "reuse" }[];
   warnings: string[];
 }
@@ -79,7 +81,7 @@ export function ConfigTransfer() {
           <Button variant="primary" disabled={busy || !preview} onClick={apply}>{busy ? "处理中…" : "确认导入"}</Button>
         </>}>
         <div className="space-y-4">
-          <p className="text-[13px] text-muted">包含输出库、来源/排除关系和订阅周期，不包含全局设置、密钥、影片和历史任务。同名且相同的配置复用，冲突时停止导入。</p>
+          <p className="text-[13px] text-muted">包含输出库、来源/排除关系和订阅 cron / 时区，不包含全局设置、密钥、影片和历史任务。同名且相同的配置复用，冲突时停止导入。</p>
           <Field label="配置文件（JSON，最大 2 MB）">
             <input type="file" accept=".json,application/json" disabled={busy} className="w-full text-sm"
               onChange={async e => {
@@ -99,7 +101,7 @@ export function ConfigTransfer() {
               placeholder={'{"format":"hls2strm-library-config","version":1,"libraries":[],"subscriptions":[]}'} />
           </Field>
           <Check checked={activate} disabled={busy} onChange={v => { setActivate(v); setPreview(null); }}>
-            按文件中的 enabled 启用新订阅（可能立即抓取）
+            按文件中的 enabled 启用新订阅
           </Check>
           <p className="text-xs text-muted">不勾选时新订阅全部停用，之后可逐个运行首轮全量、再开启定时增量。已有订阅的启用状态和进度保持原样。</p>
           {error && <p role="alert" className="break-words text-sm text-err">{error}</p>}
@@ -115,8 +117,9 @@ export function ConfigTransfer() {
             {preview.subscriptions.map(sub => <div key={sub.name} className="rounded border border-line p-3">
               <p>{actionLabel[sub.action]}订阅 · {sub.name} → {sub.library_name}</p>
               <p className="break-all text-xs text-muted">{sub.site} · {sub.source}</p>
-              <p className="text-xs text-muted">{sub.enabled ? "启用" : "停用"} · {sub.interval ? `${sub.interval} 分钟` : "手动运行"} · {sub.detail ? "抓详情" : "仅列表"}
+              <p className="text-xs text-muted">{sub.enabled ? "启用" : "停用"} · {sub.cron ?? (sub.interval ? `每 ${sub.interval} 分钟（旧配置）` : "仅手动")}{sub.cron === "" && "仅手动"}{sub.cron && `（${sub.timezone}）`} · {sub.detail ? "抓详情" : "仅列表"}
                 {sub.action === "create" && ` · ${sub.initial_full ? "需要首轮全量" : "直接增量"}`}</p>
+              {sub.scheduled_at && <p className="text-xs text-muted">下次计划时间：{fmtScheduledTime(sub.scheduled_at, sub.timezone)}（启用并完成首轮后生效）</p>}
             </div>)}
             <ul className="list-disc space-y-1 pl-5 text-xs text-muted">{preview.warnings.map(w => <li key={w}>{w}</li>)}</ul>
           </section>}

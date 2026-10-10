@@ -41,6 +41,7 @@ from .sites.hosts import MP4_HOSTS
 from .rules import describe_rule, match_rule, normalize_rule
 from .sites import SITES, Site, SourceDetail, SourceItem, find_by_code, get_site
 from .strm_manage import StrmManager
+from .subscription_schedule import has_schedule, schedule_anchor, scheduled_after
 from .writer import VERSION_STYLES, OutputWriter, cover_path
 
 log = logging.getLogger(__name__)
@@ -91,6 +92,8 @@ class Engine:
         self.strm = StrmManager(self)
         self._workers: list[asyncio.Task] = []
         self._scheduler: asyncio.Task | None = None
+        self._subscription_schedule_started_at = time.time()
+        self.db.subscription_schedule_started_at = self._subscription_schedule_started_at
         self._wake = asyncio.Event()
         self._stopping = False
         self._settle_lock = asyncio.Lock()
@@ -1124,7 +1127,7 @@ class Engine:
         last_done = await self.db.subscription_last_done()
         cutoffs: dict[int, int] = {}
         for sub in await self.db.list_subscriptions():
-            if not sub["enabled"] or sub["interval"] <= 0:
+            if not sub["enabled"] or not has_schedule(sub):
                 continue
             t = (last_done.get(sub["id"]) or sub["created_at"]) if sub["initialized"] else 0
             cutoffs[sub["library_id"]] = min(cutoffs.get(sub["library_id"], t), t)
@@ -1621,9 +1624,11 @@ class Engine:
             return
         t = time.time()
         for sub in await self.db.list_subscriptions():
-            if not (sub["enabled"] and sub["initialized"] and sub["interval"] > 0) or sub["listing_job_id"]:
+            if not (sub["enabled"] and sub["initialized"] and has_schedule(sub)) or sub["listing_job_id"]:
                 continue
-            if sub["last_run_at"] and t - sub["last_run_at"] < sub["interval"] * 60:
+            # 重启不补跑停机期间的 cron；存活期间延迟的调度最多补一次。
+            anchor = schedule_anchor(sub, self._subscription_schedule_started_at)
+            if scheduled_after(sub, anchor) > t:
                 continue
             await self.run_subscription(sub["id"], "incremental")
 
