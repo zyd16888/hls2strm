@@ -40,7 +40,7 @@ export async function runSubscription(run: Run, sub: { id: number; name: string 
     mode === "full" &&
     !(await ask(
       `订阅「${sub.name}」跑一轮全量`,
-      "翻完来源的全部页。全站约 3.9 万部时，列表约 30 分钟、详情约 11 小时；中途可以暂停或重启，会自动续跑。",
+      "翻完来源的全部页，耗时取决于列表有多大和站点限速，大的列表要几个小时甚至更久（勾了抓详情还要逐部抓）；中途可以暂停或重启，会自动续跑。",
       { confirmText: "开始全量" },
     ))
   )
