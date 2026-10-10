@@ -331,6 +331,13 @@ async def _migrate_v11(conn: aiosqlite.Connection) -> None:
     await conn.execute("ALTER TABLE libraries ADD COLUMN versions TEXT NOT NULL DEFAULT ''")
 
 
+async def _migrate_v16(conn: aiosqlite.Connection) -> None:
+    """日期型番号（没有字母）的匹配键保留下划线：100826_001 和 100826-001 是不同厂牌的片，不再算同一部。"""
+    async with conn.execute(r"SELECT id, code FROM videos WHERE code LIKE '%\_%' ESCAPE '\'") as cur:
+        rows = [(code_key(r["code"]), r["id"]) for r in await cur.fetchall() if not any(c.isalpha() for c in r["code"])]
+    await conn.executemany("UPDATE videos SET code_key=? WHERE id=?", rows)
+
+
 async def _migrate_v15(conn: aiosqlite.Connection) -> None:
     """删源后影片没有可用的源、移出输出库时，记下移出了哪些库（[[库 id, via], …]），恢复时放回去。"""
     await conn.execute("ALTER TABLE videos ADD COLUMN removed_from TEXT NOT NULL DEFAULT ''")
@@ -338,7 +345,7 @@ async def _migrate_v15(conn: aiosqlite.Connection) -> None:
 
 MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
               _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11, _migrate_v12, _migrate_v13, _migrate_v14,
-              _migrate_v15]
+              _migrate_v15, _migrate_v16]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")

@@ -2,7 +2,8 @@
 
 各站对同一部片的写法不同：Jable 写 `fc2ppv-1066192`，MissAV 写 `fc2-ppv-1066192`；有的站编号补零到 5 位（`ssis00001`）。
 匹配键把这些统一：前缀大写、去掉分隔符，编号去掉前导零，FC2 统一成 FC2PPV。
-日期型番号（无码厂牌的 `010120-001`）前面没有字母，原样比较。
+日期型番号（无码厂牌的 `010120-001`）前面没有字母，原样比较；`_` 和 `-` 不能混为一谈：
+Caribbeancom 写 `100826-001`，一本道、Caribbeancompr、pacopacomama、10musume 写 `100826_001`，是不同的片。
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ _FC2_RE = re.compile(r"^FC2[\s_-]*(?:PPV[\s_-]*)?(\d{5,9})$")
 _SPLIT_RE = re.compile(r"[\s_-]+")
 _GLUED_RE = re.compile(r"([A-Z]+)(\d+)")
 _SLUG_UNSAFE_RE = re.compile(r"[^a-z0-9._-]+")
+_DATE_SEP_RE = re.compile(r"[\s-]+")
 
 
 def code_key(code: str) -> str:
@@ -22,6 +24,8 @@ def code_key(code: str) -> str:
         return ""
     if m := _FC2_RE.match(s):
         return f"FC2PPV-{int(m.group(1))}"
+    if not any(c.isalpha() for c in s):
+        return _DATE_SEP_RE.sub("-", s)  # 日期型番号：只统一空白和横线，下划线原样保留
     tokens = [t for t in _SPLIT_RE.split(s) if t]
     if len(tokens) == 1:
         m = _GLUED_RE.fullmatch(tokens[0])

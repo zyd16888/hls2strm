@@ -22,7 +22,7 @@ from ..parser import parse_duration
 from .base import ListPage, Site, SourceDetail, SourceItem, StreamTraits
 
 VARIANTS = (("-uncensored-leak", "uncensored"), ("-chinese-subtitle", "zh"), ("-english-subtitle", "en"))
-_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,80}$")
+_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,80}$")  # 一本道等日期型番号带下划线：100826_001
 _PATH_PREFIX_RE = re.compile(r"^/(?:dm\d+/)?(?:(?:cn|en|ja|ko|ms|th|de|fr|vi|id|fil|pt|zh)/)?")
 _PACKER_RE = re.compile(r"}\('(.*?)',\s*(\d+),\s*(\d+),\s*'(.*?)'\.split\('\|'\)", re.S)
 _SOURCE_RE = re.compile(r"source\s*=\s*\\?'(https://[^'\\]+?\.m3u8)")

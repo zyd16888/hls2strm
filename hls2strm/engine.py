@@ -527,11 +527,12 @@ class Engine:
         page = int(task["target"])
         url = site.page_url(p["source"], page, p.get("sort", ""), p.get("block_id"))
         pg = await self.fetcher.site(site.name).get_page(url)
-        lp = site.parse_list(pg.html)
+        try:
+            lp = site.parse_list(pg.html)
+        except ParseError as e:
+            raise _with_url(e, pg.url, pg.html) from e
         if not lp.items and page == p["start_page"]:
-            e = ParseError("列表为空，检查列表地址是否正确")
-            e.html = pg.html
-            raise e
+            raise _with_url(ParseError("列表为空，检查列表地址是否正确"), pg.url, pg.html)
 
         added_count = 0
         restored: Counter = Counter()
@@ -542,9 +543,16 @@ class Engine:
             state["known_streak"] = 0
         probe_sites = [n for n in self.store.current.auto_probe_sites
                        if n in SITES and n != site.name and SITES[n].can_lookup]
+        failures: list[str] = []
         for it in lp.items:
             await self.checkpoint(job["id"])
-            v, created = await self.upsert_item(site, it, crawl=(job["id"], task["id"], page))
+            try:
+                v, created = await self.upsert_item(site, it, crawl=(job["id"], task["id"], page))
+            except Exception as e:  # 一部入库失败不连累同一页的其他影片；整页处理完再报，任务照常重试
+                failures.append(f"{it.key}（番号 {it.code}）：{type(e).__name__}: {e}")
+                log.error("%s 列表 %s 第 %d 页：%s 入库失败（番号 %s）：%s", site.label, pg.url, page, it.key, it.code, e,
+                          exc_info=not isinstance(e, FetchError))
+                continue
             for n in probe_sites if created else ():
                 await self.db.add_tasks(job["id"], "probe", [f"{n}:{v['id']}"], PRIORITY_DETAIL, n)
             if v["status"] == "removed":
@@ -596,6 +604,8 @@ class Engine:
         log.info("%s 列表 %s 第 %d/%d 页 → 库「%s」：%d 部，新加入 %d，排队详情 %d%s", site.label,
                  p["source"], page, last, self.libs[lib_id]["name"], len(lp.items), added_count, len(detail_keys),
                  _restore_text(restored))
+        if failures:
+            raise RuntimeError(f"{pg.url} 有 {len(failures)} 部入库失败：" + "；".join(failures[:5]))
 
     async def _do_detail(self, job: dict, task: dict) -> None:
         if job["kind"] in ("crawl", "incremental"):
@@ -613,7 +623,10 @@ class Engine:
         if library_id:
             self._library(library_id)
         site = get_site(site_name)
-        d = await site.fetch_detail(self.fetcher.site(site.name), key, priority=priority)
+        try:
+            d = await site.fetch_detail(self.fetcher.site(site.name), key, priority=priority)
+        except ParseError as e:
+            raise _with_url(e, f"{site.label} {site.detail_path(key)}", getattr(e, "html", "")) from e
         v = await self.upsert_detail(site, d)
         src = await self.db.find_source(site.name, d.key)
         if src is not None and src["status"] == "removed":
@@ -1806,6 +1819,13 @@ def _restore_text(c: Counter) -> str:
              f"外部整理目录是空的、没补 {c['empty']} 部（检查挂载）" if c["empty"] else ""]
     text = "，".join(p for p in parts if p)
     return f"，磁盘上丢失的：{text}" if text else ""
+
+
+def _with_url(e: ParseError, url: str, html: str = "") -> ParseError:
+    """解析失败的报错带上请求的地址（日志里看得出是哪一页），类型不变（下架还是下架）。"""
+    err = type(e)(f"{e}：{url}")
+    err.html = html
+    return err
 
 
 def _overlap(a: Path, b: Path) -> bool:

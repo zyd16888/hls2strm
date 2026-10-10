@@ -49,6 +49,17 @@ def test_keys_and_sources():
     assert MISSAV.page_url("/cn/new", 3, "released_at") == "/cn/new?page=3&sort=released_at"
 
 
+def test_date_codes_with_underscore():
+    """一本道、Caribbeancompr、10musume、pacopacomama 的番号带下划线，列表里的影片不能被丢掉。"""
+    html = "".join(f'<div class="thumbnail"><div class="my-2"><a href="https://missav123.com/cn/{k}">{k}</a></div></div>'
+                   for k in ("pondo-100826_001", "100126_001", "musume-100226_01"))
+    lp = MISSAV.parse_list(html)
+    assert [(it.key, it.code) for it in lp.items] == [
+        ("pondo-100826_001", "PONDO-100826_001"), ("100126_001", "100126_001"), ("musume-100226_01", "MUSUME-100226_01")]
+    assert MISSAV.key_for("100126_001") == "100126_001"
+    assert SITES["123av"].key_from_url("https://123av.com/cn/v/100126_001") == "100126_001"
+
+
 def test_rewrite_nested_playlists():
     master = ("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\n640x360/video.m3u8\n"
               "#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720\n1280x720/video.m3u8\n")

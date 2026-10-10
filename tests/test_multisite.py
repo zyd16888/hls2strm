@@ -15,6 +15,9 @@ def test_code_key():
     assert code_key("300MIUM-001") == "300MIUM-1"
     assert code_key("KIRA-020-2") == "KIRA-20-2"
     assert code_key("010120-001") == "010120-001"  # 日期型番号原样
+    # 一本道等写 100826_001、Caribbeancom 写 100826-001，是不同的片：下划线不能和横线混为一谈
+    assert code_key("100826_001") == "100826_001" != code_key("100826-001")
+    assert code_key("100826 001") == "100826-001"
     assert code_key("") == ""
     assert work_slug("SSIS-001") == "ssis-001" and work_slug("SSIS-001", True) == "ssis-001-u"
 
