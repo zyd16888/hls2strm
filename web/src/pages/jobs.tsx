@@ -10,7 +10,7 @@ import { Chip, EmptyRow, KV, Mono, Panel, Progress, Table, Td, Th } from "@/comp
 import { Check, Field, Input, Segmented, Select, Textarea } from "@/components/ui/form";
 import { Sheet, SheetClose, SheetContent } from "@/components/ui/overlay";
 import { api, type Job, type Task, type TaskStatus } from "@/lib/api";
-import { fmtDur, fmtNum, fmtTime } from "@/lib/format";
+import { fmtBytes, fmtDur, fmtNum, fmtTime } from "@/lib/format";
 import { JOB_STATUS, kindName, TASK_STATUS } from "@/lib/labels";
 import { useJobs, useLibraries, useMeta, useRun, useStatus } from "@/lib/queries";
 import { replaceParams, useRoute } from "@/lib/route";
@@ -39,6 +39,10 @@ function progressText(j: Job): string {
   if (st.last_page) text += `，共 ${st.last_page} 页`;
   if (j.crawl) text += `，已识别 ${fmtNum(j.crawl.seen)} 部，新增 ${fmtNum(j.crawl.new)}，重复 ${fmtNum(j.crawl.existing)}`;
   if (j.kind === "locate" && st.checked != null) text += `，更新 ${n("updated")}，找不到 ${n("missing")}`;
+  if (j.kind === "tidy" && st.orphans != null) {
+    text += `，只剩 nfo、图片的目录 ${n("orphans")} 个（${fmtBytes(Number(st.bytes ?? 0))}）`;
+    if (j.params.apply) text += `，已移走 ${n("moved")}` + (st.failed ? `，失败 ${n("failed")}` : "");
+  }
   if (j.kind === "verify" && st.checked != null) {
     text += `，检查 ${n("checked")}，正常 ${n("ok")}，strm 缺 ${n("strm")}，nfo 缺 ${n("nfo")}，封面缺 ${n("cover")}`;
     if (j.params.repair) text += `；补写 ${n("repaired")}，补封面 ${n("covers_queued")}`;

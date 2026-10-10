@@ -2,6 +2,14 @@ export function fmtNum(n: number | null | undefined): string {
   return n == null ? "-" : Number(n).toLocaleString("zh-CN");
 }
 
+/** '512 KB' / '3.2 MB' / '1.5 GB'。 */
+export function fmtBytes(n: number | null | undefined): string {
+  if (n == null) return "-";
+  if (n < 1024 ** 2) return `${Math.max(1, Math.round(n / 1024))} KB`;
+  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)} MB`;
+  return `${(n / 1024 ** 3).toFixed(1)} GB`;
+}
+
 export function pct(a: number | null | undefined, b: number | null | undefined): string {
   return b ? Math.round(((a || 0) * 100) / b) + "%" : "-";
 }

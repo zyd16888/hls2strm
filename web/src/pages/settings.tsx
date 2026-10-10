@@ -15,7 +15,7 @@ const GROUPS: { id: string; title: string; keys: string[] }[] = [
   { id: "sites", title: "站点", keys: ["sites", "site_priority"] },
   { id: "fetch", title: "抓取", keys: ["proxy", "impersonate", "request_timeout", "domain_cooldown", "domain_cooldown_max", "solver_url", "solver_timeout"] },
   { id: "retry", title: "重试", keys: ["max_attempts", "retry_base_delay"] },
-  { id: "tasks", title: "任务", keys: ["fetch_detail", "auto_probe_sites", "probe_recheck_days", "external_restore"] },
+  { id: "tasks", title: "任务", keys: ["fetch_detail", "auto_probe_sites", "probe_recheck_days", "external_restore", "trash_days", "orphan_cleanup"] },
   { id: "output", title: "输出", keys: ["output_dir", "path_template", "write_nfo", "download_cover", "poster_crop"] },
   {
     id: "play",
@@ -83,6 +83,8 @@ const LABELS: Record<string, string> = {
   health_bytes: "每次下载多少（KB）",
   health_slow_kbps: "低于多少算慢（kbps）",
   external_restore: "外部整理库补回丢失的 strm",
+  trash_days: "外部整理库回收区保留（天）",
+  orphan_cleanup: "自动清理外部整理库残留",
   output_dir: "输出根目录",
   path_template: "默认路径模板",
   write_nfo: "写 nfo",

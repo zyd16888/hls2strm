@@ -10,7 +10,8 @@
   invalid  空文件
 
 外部整理库（设置了外部整理目录）的 strm 会被 mdcng 等工具移走、改名；「同步位置」在库目录和外部整理目录里
-按 strm 内容找回每部影片的文件，更新记录的路径，之后重写、改地址都在新位置原地进行。
+按 strm 内容找回每部影片的文件，更新记录的路径，之后重写、改地址都在新位置原地进行。「清理残留」把外部整理目录里
+已经没有 strm、只剩 nfo 和图片的影片目录移进回收区（见 trash.py）。
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from urllib.parse import urlsplit
 
 from .fetcher import NotFound
 from .parser import VideoGone, hls_expires
+from .trash import find_orphans, retire
 from .writer import VERSION_PATH_RE, write_atomic
 
 if TYPE_CHECKING:
@@ -34,6 +36,8 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 INDEX_TTL = 600  # 按内容找文件的索引缓存多久（秒）：订阅连续翻多页时不用每页都扫一遍目录
+RECHECK_AGE = 60  # 缓存里的位置不对时重扫；一分钟内刚扫过就不再扫（归并一次移出很多部时不用每部扫一遍）
+TIDY_LOG_LIMIT = 200  # 清理残留时日志里最多列出多少个目录
 
 OURS_RE = re.compile(r"/play/([a-z0-9][a-z0-9._-]{0,80})\.m3u8$", re.I)
 CDN_RE = re.compile(r"/(?:hls/[^/]+/\d{9,11}/\d+|vod/\d+)/(\d+)/\1\.m3u8$")
@@ -203,6 +207,15 @@ def restore_file(path: Path, expected: str, original: str) -> bool:
     return True
 
 
+def _fmt_bytes(n: int) -> str:
+    """'512 KB' / '3.2 MB' / '1.5 GB'。"""
+    if n < 1024 ** 2:
+        return f"{max(1, round(n / 1024))} KB"
+    if n < 1024 ** 3:
+        return f"{n / 1024 ** 2:.1f} MB"
+    return f"{n / 1024 ** 3:.1f} GB"
+
+
 def _check_prefixes(old: str, new: str) -> tuple[str, str]:
     old, new = old.strip(), new.strip()
     if not old or not new:
@@ -261,6 +274,24 @@ class StrmManager:
     def remember(self, lib: dict, video_id: int, path: str) -> None:
         if (cached := self._index.get(lib["id"])) is not None:
             cached[1].setdefault(video_id, []).append(path)
+
+    def forget(self, lib: dict, video_id: int) -> None:
+        if (cached := self._index.get(lib["id"])) is not None:
+            cached[1].pop(video_id, None)
+
+    async def paths_of(self, lib: dict, video_id: int, recorded: str = "") -> list[str]:
+        """这部片在这个库里现在的 strm：按内容在收件目录和外部整理目录里找（外部工具在上次同步位置之后又挪过、
+        改过名也认得出），记录的路径还在也算上。"""
+        def existing(paths: list[str]) -> list[str]:
+            return [p for p in paths if os.path.isfile(p)]
+
+        found = await self.index(lib)
+        paths = await asyncio.to_thread(existing, found.get(video_id, []))
+        if not paths and (recorded or video_id in found):  # 缓存的位置又被挪了，或者缓存时还没整理：重新扫一遍
+            paths = await asyncio.to_thread(existing, (await self.index(lib, max_age=RECHECK_AGE)).get(video_id, []))
+        if recorded and recorded not in paths and await asyncio.to_thread(os.path.isfile, recorded):
+            paths.append(recorded)
+        return paths
 
     # ---- 扫描 ----
 
@@ -427,6 +458,54 @@ class StrmManager:
                  lib["name"], result["checked"], result["updated"], result["missing"], result["duplicates"],
                  result["extra"])
         return result
+
+    # ---- 外部整理库：清理残留 ----
+
+    async def create_tidy(self, library_id: int | None = None, *, apply: bool = True) -> int:
+        """library_id 为空时清理所有外部整理库；apply 为 False 只列出残留目录，不动文件。"""
+        libs = [self.e._library(library_id)] if library_id else list(self.e.libs.values())
+        libs = [lib for lib in libs if lib["external_dir"]]
+        if not libs:
+            raise ValueError("没有设置外部整理目录的输出库")
+        name = "清理残留：" + "、".join(lib["name"] for lib in libs) + ("" if apply else "（只检查）")
+        job_id = await self.db.create_job("tidy", name, {"library_id": library_id, "apply": apply})
+        await self.db.add_tasks(job_id, "tidy", [lib["id"] for lib in libs], 20)
+        self.e.notify()
+        return job_id
+
+    async def do_tidy(self, job: dict, task: dict) -> None:
+        """外部整理目录里已经没有 strm、只剩 nfo 和图片的影片目录移进回收区（以前移出库时留下的）。"""
+        lib = self.e.libs.get(int(task["target"]))
+        if lib is None or not lib["external_dir"]:
+            return
+        ext = self.e.writer.external_root(lib)
+        if not await asyncio.to_thread(ext.is_dir):
+            log.warning("清理残留「%s」：外部整理目录 %s 不存在，跳过（检查挂载）", lib["name"], ext)
+            return
+        apply, days = job["params"].get("apply", True), self.e.store.current.trash_days
+        orphans = await asyncio.to_thread(find_orphans, ext)
+        moved = failed = 0
+        for i, (d, size) in enumerate(orphans):
+            await self.e.checkpoint(job["id"])
+            if i < TIDY_LOG_LIMIT:
+                log.info("残留目录：%s（%s）", d, _fmt_bytes(size))
+            if not apply:
+                continue
+            try:
+                moved += await asyncio.to_thread(retire, d, ext, days) is not None
+            except OSError as e:
+                failed += 1
+                log.warning("残留目录 %s 没能移走：%s", d, e)
+        if len(orphans) > TIDY_LOG_LIMIT:
+            log.info("…另外还有 %d 个残留目录没列出", len(orphans) - TIDY_LOG_LIMIT)
+        state = (await self.db.get_job(job["id"]))["state"]
+        total = sum(size for _, size in orphans)
+        for k, n in {"orphans": len(orphans), "bytes": total, "moved": moved, "failed": failed}.items():
+            state[k] = state.get(k, 0) + n
+        await self.db.update_job(job["id"], state=state)
+        log.info("清理残留「%s」：找到 %d 个只剩 nfo、图片的目录，共 %s%s", lib["name"], len(orphans), _fmt_bytes(total),
+                 (f"，{'直接删掉' if days <= 0 else '移进回收区'} {moved} 个" + (f"，失败 {failed} 个" if failed else ""))
+                 if apply else "（只检查，没动文件）")
 
     # ---- 改前缀 / 回滚 ----
 

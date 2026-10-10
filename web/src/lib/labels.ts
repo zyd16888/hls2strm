@@ -14,6 +14,7 @@ export const KIND_NAMES: Record<string, string> = {
   prefix: "改前缀",
   revert: "回滚",
   locate: "同步位置",
+  tidy: "清理残留",
   crawl: "列表抓取",
   incremental: "增量",
   videos: "指定影片",

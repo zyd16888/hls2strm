@@ -16,6 +16,8 @@ import { VERSION_STYLES } from "@/lib/labels";
 import { navigate } from "@/lib/route";
 import { subState } from "./overview";
 
+const TRASH_DIR = ".hls2strm-trash";
+
 export default function Libraries() {
   return (
     <>
@@ -50,6 +52,27 @@ function LibrariesPanel() {
     if (!choice) return;
     await run(() => api.del<{ job_id: number }>(`/api/libraries/${l.id}?delete_files=${choice === "files"}`), {
       success: r => `已排队删除任务 #${r.job_id}`,
+      ...done,
+    });
+  };
+
+  const tidy = async (l: Library) => {
+    const choice = await confirm({
+      title: `清理「${l.name}」的残留目录`,
+      body: (
+        <>
+          <p>在外部整理目录 <Mono>{l.external_root}</Mono> 里找已经没有 strm、只剩 nfo 和图片的影片目录（以前移出库时留下的），移进回收区。</p>
+          <p className="text-muted">回收区在整理目录下的 <Mono>{TRASH_DIR}</Mono>，放满设置里的保留天数后自动删除。一天内有改动的目录不动（可能正在整理）。结果和目录清单在任务日志里。</p>
+        </>
+      ),
+      choices: [
+        { value: "check", label: "只检查" },
+        { value: "apply", label: "移进回收区", variant: "primary" },
+      ],
+    });
+    if (!choice) return;
+    await run(() => api.post<{ job_id: number }>(`/api/libraries/${l.id}/tidy?apply=${choice === "apply"}`), {
+      success: r => `已排队清理残留 #${r.job_id}`,
       ...done,
     });
   };
@@ -152,6 +175,7 @@ function LibrariesPanel() {
                         同步位置
                       </MenuItem>
                     )}
+                    {l.external_dir && <MenuItem onSelect={() => tidy(l)}>清理残留目录</MenuItem>}
                     {l.id !== 1 && (
                       <>
                         <MenuSeparator />
@@ -172,6 +196,7 @@ function LibrariesPanel() {
         <Help summary="输出库、外部整理库、来源库和排除库怎么用">
           <p>库目录不能互相嵌套。改目录或模板会自动排一个重写任务，把已有文件搬到新位置；改规则会自动排一个重新归库任务，不再符合规则的影片会从库里移除（只移除规则加入的，任务和订阅加入的保留）。组内多个值满足任一即可；分类、标签按站点上的名称或 slug 匹配。</p>
           <p>外部整理库：strm 只在影片第一次入库时写进库目录（不写 nfo、封面），之后由外部工具移走、改名、刮削，本服务不再在库目录补写，也不搬文件。「同步位置」按 strm 内容在库目录和外部整理目录里找回每部影片的文件；重写输出会先同步位置，再原地改 strm 内容；删除库时只删 strm。清空外部整理目录就改回由本服务管理。</p>
+          <p>影片移出外部整理库（被排除库分走、不再符合规则、手动移出）时，删掉 strm，它独占的整理目录（外部工具生成的 nfo、图片）整个移进整理目录下的 <Mono>{TRASH_DIR}</Mono>，放满设置里的保留天数后自动删除。以前留下的只剩 nfo、图片的目录，用「清理残留目录」处理，设置里也可以每天自动清理。目录里还有别的影片文件（多部片放一个目录）时不动。</p>
           <p>来源库、排除库：比如「其他」的来源选「全部」、排除「中文字幕」「无码」，就得到剩下的影片，每部只在一个库里，外部工具不会重复刮削。有排除库的库收到新片后先不写文件，等排除库的定时订阅都跑完一轮、确认它不属于排除库再写（最多晚一个订阅周期）。排除库的订阅请按「最近更新」排序。</p>
         </Help>
       </div>

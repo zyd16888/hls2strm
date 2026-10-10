@@ -146,6 +146,16 @@ class Settings(BaseModel):
         description="外部整理库的 strm 在收件目录和外部整理目录里都找不到时（按内容找，外部工具改名、加后缀也认得出），"
                     "重新写进收件目录交给外部工具再整理；外部整理目录不存在或是空的时候不补，多半是挂载出了问题",
     )
+    trash_days: int = Field(
+        7, ge=0, le=365,
+        description="外部整理库回收区保留天数：影片移出外部整理库（归并、规则、手动移出）时删掉 strm，它独占的影片目录"
+                    "（外部工具生成的 nfo、图片）移进整理目录下的 .hls2strm-trash，放满这么多天后自动删除；0 不进回收区、直接删",
+    )
+    orphan_cleanup: bool = Field(
+        True,
+        description="每天清理一次外部整理库的残留：整理目录里已经没有 strm、只剩 nfo 和图片的影片目录移进回收区"
+                    "（一天内有改动的不动，可能正在整理）",
+    )
     # 输出
     output_dir: str = Field(
         "", description="输出根目录，各输出库的相对目录都在它下面；留空使用 HLS2STRM_OUTPUT_DIR 或 数据目录/strm"

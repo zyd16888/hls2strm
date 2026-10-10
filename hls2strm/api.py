@@ -587,6 +587,15 @@ async def locate_library(lib_id: int, request: Request):
         raise HTTPException(400, str(err)) from None
 
 
+@router.post("/libraries/{lib_id}/tidy")
+async def tidy_library(lib_id: int, request: Request, apply: bool = True):
+    """外部整理库清理残留：只剩 nfo、图片的影片目录移进回收区；apply=false 只列出来。"""
+    try:
+        return {"job_id": await _ctx(request).engine.strm.create_tidy(lib_id, apply=apply)}
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from None
+
+
 @router.get("/facets")
 async def facets(request: Request, field: str = "", q: str = "", limit: int = 300):
     """库里已有的分类、标签、女优、发行商、画质及影片数；field 只取一种，q 按名称或 id 筛。"""

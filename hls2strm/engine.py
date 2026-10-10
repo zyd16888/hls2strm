@@ -10,8 +10,9 @@ job 种类：
   purge        删除输出库及其文件
   locate       外部整理库：找回被外部工具（mdcng 等）移走、改名的 strm，更新记录的路径
   reclassify   重新归库：规则库重新求值，并按来源库、排除库归并（只在本地，不联网）
+  tidy         外部整理库：把只剩 nfo、图片的影片目录（以前移出库时留下的）移进回收区
 子任务种类：list（目标=页码）、detail（目标=站内 key）、probe（目标=站点:作品 id）、rewrite（目标=all）、
-          purge / locate（目标=库 id）、verify（目标=all）、cover（目标=库 id:作品 id，补封面）
+          purge / locate / tidy（目标=库 id）、verify（目标=all）、cover（目标=库 id:作品 id，补封面）
 list、detail 子任务带站点（tasks.site）：某个站被拦截时只暂停这个站的子任务，每个站的并发也各自限制。
 """
 
@@ -42,6 +43,7 @@ from .rules import describe_rule, match_rule, normalize_rule
 from .sites import SITES, Site, SourceDetail, SourceItem, find_by_code, get_site
 from .strm_manage import StrmManager
 from .subscription_schedule import has_schedule, schedule_anchor, scheduled_after
+from .trash import inside, purge as purge_trash, retire
 from .writer import VERSION_STYLES, OutputWriter, cover_path
 
 log = logging.getLogger(__name__)
@@ -59,6 +61,8 @@ TASK_STATUS_NAMES = {"done": "完成", "failed": "失败", "gone": "下架", "ca
 PROBE_STATUS_NAMES = {"found": "找到", "none": "没有", "failed": "失败", "timeout": "超时"}
 DEFAULT_MAX_PAGES = 20
 SETTLE_INTERVAL = 600
+HOUSEKEEP_INTERVAL = 3600  # 每小时清一次回收区里放满天数的
+TIDY_INTERVAL = 86400  # 开了自动清理残留时，每天排一次清理残留任务
 
 
 class TaskStopped(Exception):
@@ -99,6 +103,7 @@ class Engine:
         self._settle_lock = asyncio.Lock()
         self._settle_wanted = True
         self._settled_at = 0.0
+        self._housekept_at = 0.0
         self.missing: dict[int, int] = {}  # 库 id -> 有记录但磁盘上找不到的 strm 数（启动时、核对后统计）
         self._missing_task: asyncio.Task | None = None
         self._progress_at: dict[int, float] = {}  # 任务 id -> 上次在日志里报进度的时间
@@ -253,7 +258,7 @@ class Engine:
                        "scan": self.strm.do_scan, "adopt": self.strm.do_adopt,
                        "prefix": self.strm.do_prefix, "revert": self.strm.do_revert,
                        "locate": self.strm.do_locate, "quality": self._do_quality, "prepare": self._do_prepare,
-                       "membership": self._do_membership}[task["kind"]]
+                       "membership": self._do_membership, "tidy": self.strm.do_tidy}[task["kind"]]
             await handler(job, task)
             await self.db.finish_task(tid, "done", duration_ms=int((time.monotonic() - t0) * 1000))
             log.info("子任务 #%d %s %s 完成（%.1fs）", tid, task["kind"], task["target"], time.monotonic() - t0)
@@ -425,6 +430,31 @@ class Engine:
         await self.db.set_output(v["id"], library_id, str(strm), cover_done)
         if versions or (versions is None and lib["versions"]):
             await self.sync_versions(v, lib, str(strm))
+
+    async def _remove_files(self, lib: dict, video_id: int, slug: str, strm_path: str) -> None:
+        """删掉一部影片在某个库里的文件（只删本程序生成的）。
+
+        外部整理库只删 strm，先按内容找到它现在在哪（外部工具可能在上次同步位置之后又挪过、改过名）；
+        已经整理过的，它独占的影片目录（外部工具生成的 nfo、图片）整个移进回收区，免得留在整理目录里没用还占地方。
+        """
+        keep = self.keep_dirs()
+        ext = self.writer.external_root(lib)
+        if ext is None:
+            if strm_path:
+                await asyncio.to_thread(self.writer.remove, Path(strm_path), keep, False, slug)
+            return
+        days = self.store.current.trash_days
+        for p in map(Path, await self.strm.paths_of(lib, video_id, strm_path)):
+            await asyncio.to_thread(self.writer.remove, p, keep, True, slug)
+            if not inside(p, ext):
+                continue  # 还在收件目录：外部工具没整理过，没有别的文件
+            try:
+                if (moved := await asyncio.to_thread(retire, p.parent, ext, days)) is not None:
+                    log.info("「%s」移出 %s：整理目录 %s %s", lib["name"], slug, p.parent,
+                             "已删掉" if days <= 0 else f"移进回收区 {moved}")
+            except OSError as e:
+                log.warning("「%s」移出 %s：整理目录 %s 没能移进回收区：%s", lib["name"], slug, p.parent, e)
+        self.strm.forget(lib, video_id)
 
     # ---- 多画质版本 ----
 
@@ -813,8 +843,7 @@ class Engine:
                 continue
             if out["strm_path"]:
                 v = await self.db.get_video_by_id(vid)
-                await asyncio.to_thread(self.writer.remove, Path(out["strm_path"]), self.keep_dirs(),
-                                        bool(lib["external_dir"]), v["slug"] if v else "")
+                await self._remove_files(lib, vid, v["slug"] if v else "", out["strm_path"])
             await self.db.delete_output(vid, library_id)
             removed += 1
         log.info("输出库「%s」：手动移出 %d 部", lib["name"], removed)
@@ -1053,8 +1082,7 @@ class Engine:
                 added += 1
             elif not should and out is not None and out["via"] == "rule":
                 if out["strm_path"]:
-                    await asyncio.to_thread(self.writer.remove, Path(out["strm_path"]), self.keep_dirs(),
-                                            bool(lib["external_dir"]), v["slug"])
+                    await self._remove_files(lib, v["id"], v["slug"], out["strm_path"])
                 await self.db.delete_output(v["id"], lib["id"])
                 removed += 1
         return added, removed
@@ -1103,11 +1131,12 @@ class Engine:
             return total
 
     async def _settle_library(self, lib: dict, sub_cutoffs: dict[int, int]) -> dict:
-        keep, external = self.keep_dirs(), bool(lib["external_dir"])
         drop = await self.db.outputs_to_drop(lib["id"], lib["sources"], lib["excludes"])
+        if drop and lib["external_dir"]:
+            await self.strm.index(lib, max_age=0)  # 外部工具刚挪过的也要找到：重扫一遍，后面每部直接查
         for out in drop:
             if out["strm_path"]:
-                await asyncio.to_thread(self.writer.remove, Path(out["strm_path"]), keep, external, out["slug"])
+                await self._remove_files(lib, out["video_id"], out["slug"], out["strm_path"])
             await self.db.delete_output(out["video_id"], lib["id"])
         pulled = await self.db.pull_from_sources(lib["id"], lib["sources"], lib["excludes"])
         written = 0
@@ -1612,12 +1641,32 @@ class Engine:
                 await self._save_health()
             except Exception:
                 log.exception("保存连通性出错")
+            if time.time() - self._housekept_at >= HOUSEKEEP_INTERVAL:
+                self._housekept_at = time.time()
+                try:
+                    await self._housekeep()
+                except Exception:
+                    log.exception("清理回收区出错")
             if self.paused or not (self._settle_wanted or time.time() - self._settled_at > SETTLE_INTERVAL):
                 continue
             try:
                 await self.settle()
             except Exception:
                 log.exception("归并出错")
+
+    async def _housekeep(self) -> None:
+        """外部整理库：删掉回收区里放满天数的；开了自动清理残留时，每天排一次清理残留任务。"""
+        days = self.store.current.trash_days
+        external = [lib for lib in list(self.libs.values()) if lib["external_dir"]]
+        for lib in external:
+            if n := await asyncio.to_thread(purge_trash, self.writer.external_root(lib), days):
+                log.info("回收区「%s」：删掉放满 %d 天的 %d 批", lib["name"], days, n)
+        if self.paused or not self.store.current.orphan_cleanup or not external:
+            return
+        last = await self.db.last_tidy_job()
+        if last and (last["status"] in ("running", "paused") or time.time() - last["created_at"] < TIDY_INTERVAL):
+            return
+        await self.strm.create_tidy()
 
     async def _run_due_subscriptions(self) -> None:
         if self.paused:
