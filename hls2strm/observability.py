@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import itertools
 import logging
 import re
@@ -16,8 +17,11 @@ from urllib.parse import urlsplit
 from pathlib import Path
 
 from .errors import RelayAborted
-from .runtime import request_id
+from .runtime import log_area, request_id, traffic
 
+LOG_AREAS = ("play", "task", "system")
+_PLAY_LOGGERS = frozenset(("play", "playback", "playback_selection", "line_speed", "health"))
+_SYSTEM_LOGGERS = frozenset(("app", "api", "auth", "config", "config_transfer", "runtime", "observability", "logs"))
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s [%(request_id)s]: %(message)s"
 _listener = None
 
@@ -68,12 +72,24 @@ def shutdown_logging():
         _listener = None
 
 
+def log_area_of(name: str) -> str:
+    """日志分在哪个区：play 播放（播放请求、线路测速、连通性检测），task 任务（抓取等后台任务、归并、订阅调度），
+    system 系统（启动、接口操作、登录等）。抓取刷屏时各区分开存，播放日志不会被挤掉。"""
+    if traffic.get() in ("play", "speed"):
+        return "play"
+    if area := log_area.get():
+        return area
+    if name in _PLAY_LOGGERS:
+        return "play"
+    return "system" if name in _SYSTEM_LOGGERS or name.startswith("uvicorn") else "task"
+
+
 class RingHandler(logging.Handler):
-    """保留最近 N 条日志，并推送给订阅者（SSE）。"""
+    """每个分区保留最近 N 条日志，并推送给订阅者（SSE）。"""
 
     def __init__(self, capacity: int = 2000) -> None:
         super().__init__()
-        self.records: deque[dict] = deque(maxlen=capacity)
+        self.records: dict[str, deque[dict]] = {area: deque(maxlen=capacity) for area in LOG_AREAS}
         self._ids = itertools.count(1)
         self.instance = secrets.token_hex(8)
         self.dropped = 0
@@ -88,15 +104,17 @@ class RingHandler(logging.Handler):
             msg = redact(record.getMessage())
             if record.exc_info:
                 msg += "\n" + logging.Formatter().formatException(record.exc_info)
+            name = record.name.removeprefix("hls2strm.")
             item = {
                 "id": next(self._ids),
                 "ts": record.created,
                 "level": record.levelname,
-                "name": record.name.removeprefix("hls2strm."),
+                "name": name,
+                "area": log_area_of(name),
                 "msg": msg,
                 "request_id": request_id.get(),
             }
-            self.records.append(item)
+            self.records[item["area"]].append(item)
             if self._loop is not None and self._subscribers:
                 for q in list(self._subscribers):
                     self._loop.call_soon_threadsafe(self._offer, q, item)
@@ -117,9 +135,16 @@ class RingHandler(logging.Handler):
     def unsubscribe(self, q: asyncio.Queue) -> None:
         self._subscribers.discard(q)
 
-    def since(self, after_id: int = 0, limit: int = 500) -> list[dict]:
-        items = [r for r in self.records if r["id"] > after_id]
-        return items[-limit:]
+    def since(self, after_id: int = 0, limit: int = 500, area: str = "") -> list[dict]:
+        """after_id 之后的日志，最多 limit 条（取最新的）；area 为空时各区合在一起按先后排，否则只取这个区。"""
+        if area:
+            return [r for r in self.records.get(area, ()) if r["id"] > after_id][-limit:]
+        return list(heapq.merge(*([r for r in q if r["id"] > after_id] for q in self.records.values()),
+                                key=lambda r: r["id"]))[-limit:]
+
+    def backlog(self, after_id: int = 0, per_area: int = 300) -> list[dict]:
+        """每个区各取最近 per_area 条，合在一起按先后排：刚打开页面时，抓取刷屏也能看到之前的播放日志。"""
+        return list(heapq.merge(*(self.since(after_id, per_area, area) for area in LOG_AREAS), key=lambda r: r["id"]))
 
 
 ring = RingHandler()

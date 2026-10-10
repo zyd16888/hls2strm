@@ -42,6 +42,7 @@ from .quality import RETRY_AFTER as QUALITY_RETRY_AFTER, SOURCE_NAMES as QUALITY
 from .quality import label as quality_label, needed as quality_needed, parse_heights, tier as quality_tier
 from .sites.hosts import MP4_HOSTS
 from .rules import describe_rule, match_rule, normalize_rule
+from .runtime import log_area
 from .sites import SITES, Site, SourceDetail, SourceItem, find_by_code, get_site
 from .strm_manage import StrmManager
 from .subscription_schedule import has_schedule, schedule_anchor, scheduled_after
@@ -1503,7 +1504,11 @@ class Engine:
         if self._health_task is not None and not self._health_task.done():
             return False
         self._health_at = time.time()
-        self._health_task = asyncio.create_task(self.check_health(), name="health-check")
+        token = log_area.set("play")  # 连通性检测的日志归播放区
+        try:
+            self._health_task = asyncio.create_task(self.check_health(), name="health-check")
+        finally:
+            log_area.reset(token)
         return True
 
     async def check_health(self) -> None:

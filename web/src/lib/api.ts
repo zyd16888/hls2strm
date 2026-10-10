@@ -510,10 +510,13 @@ export interface SettingsResponse {
 
 // ---- 日志 ----
 
+export type LogArea = "play" | "task" | "system";
+
 export interface LogItem {
   id: number;
   ts: number;
   level: string;
   name: string;
+  area?: LogArea; // 旧版本的服务端没有
   msg: string;
 }

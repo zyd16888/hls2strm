@@ -66,7 +66,7 @@ def test_play_and_resolve(tmp_path):
             with pytest.raises(RelayAborted):
                 c.get(f"/hls/{src_id}/a.ts", headers={"User-Agent": "Lavf/61"})
             assert any(r["level"] == "WARNING" and r["msg"].startswith("中转 ipzz-983：Jable 的 a.ts 传到 1 KB 时 CDN 断开")
-                       for r in ring.records)
+                       for r in ring.since(0, 2000, "play"))  # 播放请求里的日志归播放区
 
             # 日志级别现场切换，不认的级别拒绝
             assert c.get("/api/logs/level").json() == {"level": "INFO", "default": "INFO"}

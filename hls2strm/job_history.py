@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 
 from .observability import redact
+from .runtime import log_area
 
 
 async def migrate_v13(conn):
@@ -108,7 +109,7 @@ class _TaskHandler(logging.Handler):
 async def capture_task_logs(history, task):
     handler = _TaskHandler(task)
     logger = logging.getLogger("hls2strm")
-    token = _capture.set(handler)
+    token, area = _capture.set(handler), log_area.set("task")
     logger.addHandler(handler)
     stopping = asyncio.Event()
 
@@ -129,6 +130,7 @@ async def capture_task_logs(history, task):
     finally:
         logger.removeHandler(handler)
         _capture.reset(token)
+        log_area.reset(area)
         stopping.set()
         try:
             await asyncio.shield(writer)

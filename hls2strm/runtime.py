@@ -13,6 +13,7 @@ from contextvars import ContextVar
 request_id: ContextVar[str] = ContextVar("request_id", default="")
 deadline: ContextVar[float | None] = ContextVar("deadline", default=None)
 traffic: ContextVar[str] = ContextVar("traffic", default="background")
+log_area: ContextVar[str] = ContextVar("log_area", default="")  # 日志分区（见 observability.log_area_of），空的按流量和模块判断
 attempt_wait_state: ContextVar[dict | None] = ContextVar("attempt_wait_state", default=None)
 
 

@@ -5,7 +5,7 @@ strm 里写的是本服务的地址，播放时才去现取直链：同一部影
 
 - **多站点、多源择优**：同一番号在不同站点的影片并成一部作品、一个 strm；播放时按字幕偏好、画质、站点优先级挑源（画质读播放列表就知道，不用播放），挑中的源不能用自动换下一个，都不行时现场按番号去别的站找
 - **不用浏览器**：curl_cffi 模拟浏览器指纹，每个站点多个域名自动轮换（Jable 默认先走镜像 `fs1.app`，MissAV 走 `missav123.com` 等镜像）；可选接入 Byparr / FlareSolverr 兜底（SupJav 必须要）
-- **可观测**：Web 仪表盘显示各域名状态、队列、速率、失败原因和实时日志
+- **可观测**：Web 仪表盘显示各域名状态、队列、速率、失败原因和实时日志；日志分播放、任务、系统三个区，各自保留，抓取刷屏时也能看到播放日志
 - **可中断、可重试**：所有任务都存在 SQLite，进程被杀也能从断点续跑；失败按指数退避自动重试，也可以在页面上手动重试
 - **可配置**：代理、限速、并发、重试策略、输出路径模板、播放模式等都在网页上改，改完即时生效
 - **影片库**：每部影片可以查看并复制缓存的原站播放地址（CDN，显示剩余有效期）、原站页面链接、本服务地址和 strm 路径，也可以在网页里试播
@@ -421,7 +421,8 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 | POST | `/api/videos/{slug}/probe` | 到还没有源的站点按番号找一次 |
 | GET / PUT | `/api/settings` | 读取或修改设置（PUT 只需要传改动的字段） |
 | POST | `/api/engine/pause\|resume`、`/api/fetcher/test\|reset?site=` | 引擎和抓取通道控制（不带 site 是全部站点） |
-| GET | `/api/logs/stream` | 实时日志（SSE） |
+| GET | `/api/logs` | 最近的日志；`area=play\|task\|system` 只看一个区 |
+| GET | `/api/logs/stream` | 实时日志（SSE），刚连上时每个区各补最近 300 条 |
 | GET / PUT | `/api/logs/level` | 查看、现场切换日志级别（`{"level": "DEBUG"}`，不保存） |
 | GET/HEAD | `/play/{slug}.m3u8` | strm 指向的播放入口（`?proxy=1` 强制中转，`?src=站点` 只用这个站点的源，再加 `&line=线路` 只用这条线路） |
 

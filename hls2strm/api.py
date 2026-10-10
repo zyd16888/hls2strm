@@ -908,8 +908,9 @@ async def meta():
 
 
 @router.get("/logs")
-async def logs(after: int = 0, limit: int = 500):
-    return ring.since(after, min(limit, 2000))
+async def logs(after: int = 0, limit: int = 500, area: Literal["", "play", "task", "system"] = ""):
+    """最近的日志；area 只看某个区：play 播放、task 任务、system 系统。"""
+    return ring.since(after, min(limit, 2000), area)
 
 
 class LogLevel(BaseModel):
@@ -938,12 +939,14 @@ async def logs_stream(request: Request, after: int = 0, instance: str = ""):
             yield f"event: reset\ndata: {json.dumps({'instance': ring.instance})}\n\n"
         q = ring.subscribe()
         try:
-            for item in ring.since(cursor, 300):
+            for item in ring.backlog(cursor, 300):  # 每个区各补最近 300 条
                 yield f"id: {item['id']}\ndata: {json.dumps(item, ensure_ascii=False)}\n\n"
                 cursor = item["id"]
             while not await request.is_disconnected():
                 try:
                     item = await asyncio.wait_for(q.get(), 15)
+                    if item["id"] <= cursor:
+                        continue  # 补发的时候已经发过
                     if cursor and item["id"] > cursor + 1:
                         yield 'event: gap\ndata: {"message":"部分日志已超出缓冲，详情请查看日志文件"}\n\n'
                     cursor = item["id"]

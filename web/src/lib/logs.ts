@@ -1,7 +1,8 @@
-// 实时日志：整个页面共用一条 SSE 连接（概览和日志页都用），断了 3 秒后续上
+// 实时日志：整个页面共用一条 SSE 连接（概览和日志页都用），断了 3 秒后续上。
+// 每个分区（播放、任务、系统）各留最多 MAX 条：抓取刷屏时不会把播放日志挤掉
 
 import { useSyncExternalStore } from "react";
-import type { LogItem } from "./api";
+import type { LogArea, LogItem } from "./api";
 
 const MAX = 3000;
 
@@ -20,12 +21,30 @@ let instance = "";
 let cursor = 0;
 const listeners = new Set<() => void>();
 
+export const areaOf = (l: LogItem): LogArea => l.area ?? "system";
+
+/** 每个分区只留最新的 MAX 条（从后往前数），顺序不变。 */
+function trim() {
+  const counts: Record<string, number> = {};
+  let over = false;
+  for (const l of items) if ((counts[areaOf(l)] = (counts[areaOf(l)] ?? 0) + 1) > MAX) over = true;
+  if (!over) return;
+  const kept: Record<string, number> = {};
+  const out: LogItem[] = [];
+  for (let i = items.length - 1; i >= 0; i--) {
+    const a = areaOf(items[i]);
+    if ((kept[a] = (kept[a] ?? 0) + 1) <= MAX) out.push(items[i]);
+  }
+  items = out.reverse();
+}
+
 function emit() {
   // 日志多的时候（DEBUG）合并到下一帧再通知，避免每条都重渲染
   if (scheduled) return;
   scheduled = true;
   const flush = () => {
     scheduled = false;
+    trim();
     snapshot = { items: items.slice(), connected };
     listeners.forEach(l => l());
   };
@@ -47,7 +66,6 @@ function connect() {
     if (item.id <= cursor) return;
     cursor = item.id;
     items.push(item);
-    if (items.length > MAX) items.splice(0, items.length - MAX);
     emit();
   };
   es.addEventListener("reset", ev => {
@@ -57,7 +75,7 @@ function connect() {
     emit();
   });
   es.addEventListener("gap", () => {
-    items.push({ id: -Date.now(), ts: Date.now()/1000, level: "WARNING", name: "logs", msg: "部分日志已超出缓冲，详情请查看服务日志文件。" });
+    items.push({ id: -Date.now(), ts: Date.now()/1000, level: "WARNING", name: "logs", area: "system", msg: "部分日志已超出缓冲，详情请查看服务日志文件。" });
     emit();
   });
   es.onerror = () => {
