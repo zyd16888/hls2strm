@@ -78,6 +78,22 @@ def test_javmost_pages():
     assert MOST.key_from_url("https://www.javmost.ws/star/x/") is None
 
 
+def test_javmost_tag_list_uses_api():
+    """标签列表的 /page/N/ 返回 410：改走 showlist2 接口（JSON），第 1 页也走它；其他列表照旧。"""
+    source = MOST.normalize_source("https://www.javmost.ws/tag/FC2PPV/#3")
+    assert source == "/tag/FC2PPV"
+    assert MOST.page_url(source, 1) == "/showlist2/FC2PPV/1/tag/"
+    assert MOST.page_url(source, 112) == "/showlist2/FC2PPV/112/tag/"
+    assert MOST.page_url("/category/all", 2) == "/category/all/page/2/"
+    assert MOST.page_url("/star/Yua%20Mikami", 1) == "/star/Yua%20Mikami/"
+    lp = MOST.parse_list(fixture("javmost_showlist.json"))
+    assert len(lp.items) == 24 and lp.last_page == 89  # total 2133
+    it = lp.items[0]
+    assert (it.key, it.code, it.uncensored) == ("JUR-881-REDUCING-MOSAIC", "JUR-881", True)
+    assert it.duration == 7200 and it.thumb_url.startswith("https://") and it.title.startswith("JUR-881 A Two-day")
+    assert MOST.parse_list('{"success": true, "total": 2133, "result": []}').items == []
+
+
 def test_javmost_line_dooplayer():
     link = json.dumps({"api": "https://www.javmost.ws/ri3123o235r/", "group": "62", "c": ["a", "b", "c"],
                        "value": "v", "referer": "https://www.javmost.ws/START-647/"})

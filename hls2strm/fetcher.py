@@ -583,7 +583,7 @@ class SiteFetcher:
                 self.metrics.inc("fetch_error")
                 self.limiter.slow_down()
                 self._soft_error(dom)
-                errors.append(f"{dom.host}: {e}")
+                errors.append(f"{url}: {e}")
                 skipped.append(f"{dom.host} 网络错误")
                 log.info("请求失败 %s（%.1fs）：%s", url, time.monotonic() - t0, e)
                 continue
@@ -627,7 +627,7 @@ class SiteFetcher:
                 dom.last_status = f"HTTP {status}"
                 self.metrics.inc("fetch_error")
                 self._soft_error(dom)
-                errors.append(f"{dom.host}: HTTP {status}")
+                errors.append(f"{url}: HTTP {status}")  # 带上完整地址，日志里看得出请求的是哪一页
                 skipped.append(f"{dom.host} HTTP {status}")
                 continue
             dom.ok += 1

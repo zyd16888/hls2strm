@@ -4,6 +4,9 @@
   版本写在 key 里：{番号}-REDUCING-MOSAIC（无码破解）、{番号}-UNCENSORED-EDIT。
 - 列表：最新 /category/all/page/N/，类型 /category/{名称}/，女优 /star/{名字}/，发行商 /maker/{名称}/，
   标签 /tag/{X}/，搜索 /search/{关键词}/（模糊）；每页 24 条，最大页码在 /page/N 链接里。
+  标签列表的 /page/N/ 返回 410（2026-10 起），改走网页「View More」用的接口 /showlist2/{X}/{N}/tag/：
+  返回 {"success", "total"（总部数）, "result": [{"name", "url", "full_name", "cover", "length", …}]}，
+  第 1 页和网页第 1 页一样。
 - 线路：按钮 select_part('{part}','{group}',this,'parent|child','{c1}','{c2}','{c3}')，parent 是服务器，
   child 是这个服务器的分段。取嵌入页：POST {站点}/{url_source 路径}（页面脚本里 `url_source=…+'xxx/'`），
   表单 group、part、code=c1、code2=c2、code3=c3、value=页面变量、sound=av，带 Referer 和 X-Requested-With，
@@ -39,6 +42,7 @@ _VALUE_VAR_RE = re.compile(r"'value'\s*:\s*(\w+)")
 _PAGE_RE = re.compile(r"/page/(\d+)")
 _RELEASE_RE = re.compile(r"Release\s+(\d{4}-\d{2}-\d{2})")
 _TIME_RE = re.compile(r"Time\s+(\d+)")
+PER_PAGE = 24
 
 
 def split_variant(key: str) -> tuple[str, bool]:
@@ -108,9 +112,14 @@ class JavMostSite(Site):
         return "/" + "/".join(quote(p, safe="") for p in segs)
 
     def page_url(self, source: str, page: int, sort: str = "", block_id: str | None = None) -> str:
+        segs = source.strip("/").split("/")
+        if len(segs) == 2 and segs[0].lower() == "tag":
+            return f"/showlist2/{segs[1]}/{page}/tag/"  # 标签列表的 /page/N/ 返回 410
         return source + (f"/page/{page}/" if page > 1 else "/")
 
     def parse_list(self, html: str) -> ListPage:
+        if html.lstrip().startswith("{"):
+            return self._parse_list_api(html)
         doc = LexborHTMLParser(html)
         items: list[SourceItem] = []
         for card in doc.css("div.card"):
@@ -133,6 +142,28 @@ class JavMostSite(Site):
                                     uncensored=uncensored))
         pages = [int(x) for x in _PAGE_RE.findall(html)]
         return ListPage(items=items, last_page=max(pages) if pages else (1 if items else None))
+
+    def _parse_list_api(self, text: str) -> ListPage:
+        """showlist2 接口返回的 JSON 列表。"""
+        try:
+            data = json.loads(text)
+        except ValueError as e:
+            raise ParseError(f"列表接口返回的不是 JSON：{e}") from None
+        if not isinstance(data, dict) or not data.get("success"):
+            raise ParseError("列表接口没有返回成功")
+        items: list[SourceItem] = []
+        for el in data.get("result") or []:
+            key = self.key_from_url(el.get("url") or "") or self.key_from_url(f"/{el.get('name') or ''}/")
+            if not key:
+                continue
+            base, uncensored = split_variant(key)
+            code = base.upper()
+            minutes = str(el.get("length") or "")
+            items.append(SourceItem(key=key, code=code, title=f"{code} {(el.get('full_name') or '').strip()}".strip(),
+                                    duration=int(minutes) * 60 if minutes.isdigit() else None,
+                                    thumb_url=el.get("cover") or "", uncensored=uncensored))
+        total = int(data.get("total") or 0)
+        return ListPage(items=items, last_page=-(-total // PER_PAGE) if total else (1 if items else None))
 
     def parse_detail(self, html: str, key: str) -> SourceDetail:
         doc = LexborHTMLParser(html)
